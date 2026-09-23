@@ -1,0 +1,11 @@
+# Allowlist: only the module manifest and the packages the Dockerfile copies reach the build context.
+*
+!go.mod
+!go.sum
+!cmd
+!apis
+!gateway
+!peer
+!e2e
+**/*_test.go
+!e2e/cluster_test.go

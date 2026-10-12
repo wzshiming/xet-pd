@@ -357,7 +357,7 @@ func TestServeWhilePulling(t *testing.T) {
 	p := startPeer(t, fake.URL, secret, []string{"-heartbeat", "100ms"})
 	u := p.URL + "/v1/xorbs/default/" + hash.String()
 
-	payload := fmt.Sprintf(`{"namespace":"default","hash":"%s"}`, hash)
+	payload := fmt.Sprintf(`{"hash":"%s"}`, hash)
 	if resp, out := request(t, http.MethodPost, p.URL+apis.PullPath, payload, "Content-Type", "application/json"); resp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("pull without the secret = %d %q", resp.StatusCode, out)
 	}

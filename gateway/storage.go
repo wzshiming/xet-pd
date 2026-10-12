@@ -8,7 +8,6 @@ import (
 	"io"
 	"io/fs"
 	"net/http"
-	"net/url"
 	"os"
 	"path/filepath"
 	"slices"
@@ -40,9 +39,9 @@ type store struct {
 	writers map[xet.XorbHash]*writerLock
 
 	// staging hooks, set once before concurrent use; nil without a staging manager
-	onStored func(ns string, hash xet.XorbHash, size int64, inserted bool) // bytes and offsets durable, still pinned
-	onRead   func(hash xet.XorbHash)                                       // a local copy was opened
-	onIdle   func()                                                        // some xorb lost its last pin
+	onStored func(hash xet.XorbHash, size int64, inserted bool) // bytes and offsets durable, still pinned
+	onRead   func(hash xet.XorbHash)                            // a local copy was opened
+	onIdle   func()                                             // some xorb lost its last pin
 }
 
 // writerLock serializes the writers of one xorb's local bytes and sidecar.
@@ -87,28 +86,20 @@ func (s *store) lockWriter(hash xet.XorbHash) func() {
 	}
 }
 
-// nsPath is the namespace as it appears in xorb HTTP paths; the internal empty namespace is "default".
-func nsPath(ns string) string {
-	if ns == "" {
-		return "default"
-	}
-	return url.PathEscape(ns)
+func xorbURL(origin string, hash xet.XorbHash) string {
+	return origin + apis.XorbPathPrefix + hash.String()
 }
 
-func xorbURL(origin, ns string, hash xet.XorbHash) string {
-	return origin + "/v1/xorbs/" + nsPath(ns) + "/" + hash.String()
-}
-
-func (s *store) GetXorbURL(ctx context.Context, ns string, hash xet.XorbHash) (string, error) {
+func (s *store) GetXorbURL(ctx context.Context, hash xet.XorbHash) (string, error) {
 	if p, ok := s.reg.pick(hash.String()); ok {
-		return xorbURL(p.URL, ns, hash), nil
+		return xorbURL(p.URL, hash), nil
 	}
-	return s.Storage.GetXorbURL(ctx, nsPath(ns), hash)
+	return s.Storage.GetXorbURL(ctx, hash)
 }
 
 // HasXorb reports a local copy or a live holder; local errors are never masked by holders.
-func (s *store) HasXorb(ctx context.Context, ns string, hash xet.XorbHash) (bool, error) {
-	ok, err := s.Storage.HasXorb(ctx, ns, hash)
+func (s *store) HasXorb(ctx context.Context, hash xet.XorbHash) (bool, error) {
+	ok, err := s.Storage.HasXorb(ctx, hash)
 	if err != nil || ok {
 		return ok, err
 	}
@@ -147,7 +138,7 @@ func (s *store) GetShard(ctx context.Context, fileHash xet.FileHash) (*shard.Sha
 		return nil, fmt.Errorf("shard of file %s lacks its file block", fileHash)
 	}
 	for _, h := range xorbsOf(sh.Files[i:i+1], nil) {
-		ok, err := s.HasXorb(ctx, "", h)
+		ok, err := s.HasXorb(ctx, h)
 		if err != nil {
 			return nil, err
 		}
@@ -158,8 +149,8 @@ func (s *store) GetShard(ctx context.Context, fileHash xet.FileHash) (*shard.Sha
 	return sh, nil
 }
 
-func (s *store) GetFileHashBySHA256(ctx context.Context, ns string, digest [32]byte) (xet.FileHash, error) {
-	fh, err := s.Storage.GetFileHashBySHA256(ctx, ns, digest)
+func (s *store) GetFileHashBySHA256(ctx context.Context, digest [32]byte) (xet.FileHash, error) {
+	fh, err := s.Storage.GetFileHashBySHA256(ctx, digest)
 	if err == nil {
 		_, err = s.GetShard(ctx, fh)
 	}
@@ -245,8 +236,8 @@ func (s *store) writeSidecar(hash xet.XorbHash, offsets []uint64) error {
 }
 
 // saveOffsets records the offsets of the committed local bytes and reports their size; the hash does not bind their packing.
-func (s *store) saveOffsets(ctx context.Context, ns string, hash xet.XorbHash) (int64, error) {
-	f, err := s.Storage.GetXorbReadSeekCloser(ctx, ns, hash)
+func (s *store) saveOffsets(ctx context.Context, hash xet.XorbHash) (int64, error) {
+	f, err := s.Storage.GetXorbReadSeekCloser(ctx, hash)
 	if err != nil {
 		return 0, err
 	}
@@ -263,27 +254,27 @@ func (s *store) saveOffsets(ctx context.Context, ns string, hash xet.XorbHash) (
 }
 
 // PutXorb serializes writers of one hash because the local store lets a second one rename over the first.
-func (s *store) PutXorb(ctx context.Context, ns string, hash xet.XorbHash, r io.Reader) (bool, error) {
+func (s *store) PutXorb(ctx context.Context, hash xet.XorbHash, r io.Reader) (bool, error) {
 	s.pin(hash)
 	defer s.unpin(hash)
 	defer s.lockWriter(hash)()
-	inserted, err := s.Storage.PutXorb(ctx, ns, hash, r)
+	inserted, err := s.Storage.PutXorb(ctx, hash, r)
 	if err != nil {
 		return false, err
 	}
-	size, err := s.saveOffsets(ctx, ns, hash)
+	size, err := s.saveOffsets(ctx, hash)
 	if err != nil {
 		return false, err
 	}
 	if s.onStored != nil {
-		s.onStored(ns, hash, size, inserted)
+		s.onStored(hash, size, inserted)
 	}
 	return inserted, nil
 }
 
 // localOffsets answers from the local bytes, then the sidecar; a wrapped fs.ErrNotExist means neither exists.
-func (s *store) localOffsets(ctx context.Context, ns string, hash xet.XorbHash) ([]uint64, error) {
-	offsets, err := s.Storage.GetXorbChunkOffsets(ctx, ns, hash)
+func (s *store) localOffsets(ctx context.Context, hash xet.XorbHash) ([]uint64, error) {
+	offsets, err := s.Storage.GetXorbChunkOffsets(ctx, hash)
 	if err == nil || !errors.Is(err, fs.ErrNotExist) {
 		return offsets, err
 	}
@@ -291,12 +282,12 @@ func (s *store) localOffsets(ctx context.Context, ns string, hash xet.XorbHash) 
 }
 
 // GetXorbChunkOffsets tries local bytes, sidecar, then a holder, persisting what it learns unless local bytes were committed meanwhile.
-func (s *store) GetXorbChunkOffsets(ctx context.Context, ns string, hash xet.XorbHash) ([]uint64, error) {
-	offsets, err := s.localOffsets(ctx, ns, hash)
+func (s *store) GetXorbChunkOffsets(ctx context.Context, hash xet.XorbHash) ([]uint64, error) {
+	offsets, err := s.localOffsets(ctx, hash)
 	if err == nil || !errors.Is(err, fs.ErrNotExist) {
 		return offsets, err
 	}
-	sk, err := s.remote(ctx, ns, hash, 0, -1)
+	sk, err := s.remote(ctx, hash, 0, -1)
 	if err != nil {
 		return nil, err
 	}
@@ -305,14 +296,14 @@ func (s *store) GetXorbChunkOffsets(ctx context.Context, ns string, hash xet.Xor
 		return nil, fmt.Errorf("read chunk offsets of xorb %s: %w", hash, err)
 	}
 	defer s.lockWriter(hash)()
-	if local, err := s.localOffsets(ctx, ns, hash); err == nil {
+	if local, err := s.localOffsets(ctx, hash); err == nil {
 		return local, nil
 	}
 	return offsets, s.writeSidecar(hash, offsets)
 }
 
 // remote opens [start, end] of the xorb on a live holder, end -1 meaning EOF; failed holders are skipped before any handle is handed out.
-func (s *store) remote(ctx context.Context, ns string, hash xet.XorbHash, start, end int64) (*httpseek.Seeker, error) {
+func (s *store) remote(ctx context.Context, hash xet.XorbHash, start, end int64) (*httpseek.Seeker, error) {
 	holders := s.reg.holders(hash.String())
 	if len(holders) == 0 {
 		return nil, fmt.Errorf("xorb %s has no live holder: %w", hash, fs.ErrNotExist)
@@ -320,7 +311,7 @@ func (s *store) remote(ctx context.Context, ns string, hash xet.XorbHash, start,
 	var err error
 	for _, p := range holders[:min(len(holders), relayAttempts)] {
 		var sk *httpseek.Seeker
-		if sk, err = s.open(ctx, p, ns, hash, start, end); err == nil {
+		if sk, err = s.open(ctx, p, hash, start, end); err == nil {
 			return sk, nil
 		}
 		if cerr := ctx.Err(); cerr != nil {
@@ -330,8 +321,8 @@ func (s *store) remote(ctx context.Context, ns string, hash xet.XorbHash, start,
 	return nil, fmt.Errorf("xorb %s: %w", hash, err)
 }
 
-func (s *store) open(ctx context.Context, p apis.Peer, ns string, hash xet.XorbHash, start, end int64) (*httpseek.Seeker, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, xorbURL(p.URL, ns, hash), nil)
+func (s *store) open(ctx context.Context, p apis.Peer, hash xet.XorbHash, start, end int64) (*httpseek.Seeker, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, xorbURL(p.URL, hash), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -353,30 +344,30 @@ func (s *store) open(ctx context.Context, p apis.Peer, ns string, hash xet.XorbH
 	return sk, nil
 }
 
-func (s *store) GetXorbReadSeekCloser(ctx context.Context, ns string, hash xet.XorbHash) (io.ReadSeekCloser, error) {
-	f, err := s.Storage.GetXorbReadSeekCloser(ctx, ns, hash)
+func (s *store) GetXorbReadSeekCloser(ctx context.Context, hash xet.XorbHash) (io.ReadSeekCloser, error) {
+	f, err := s.Storage.GetXorbReadSeekCloser(ctx, hash)
 	if err == nil || !errors.Is(err, fs.ErrNotExist) {
 		if err == nil && s.onRead != nil {
 			s.onRead(hash)
 		}
 		return f, err
 	}
-	sk, err := s.remote(ctx, ns, hash, 0, -1)
+	sk, err := s.remote(ctx, hash, 0, -1)
 	if err != nil {
 		return nil, err
 	}
 	return sk, nil
 }
 
-func (s *store) GetXorbRangeReadCloser(ctx context.Context, ns string, hash xet.XorbHash, start, end int64) (io.ReadCloser, error) {
-	rc, err := s.Storage.GetXorbRangeReadCloser(ctx, ns, hash, start, end)
+func (s *store) GetXorbRangeReadCloser(ctx context.Context, hash xet.XorbHash, start, end int64) (io.ReadCloser, error) {
+	rc, err := s.Storage.GetXorbRangeReadCloser(ctx, hash, start, end)
 	if err == nil || !errors.Is(err, fs.ErrNotExist) {
 		if err == nil && s.onRead != nil {
 			s.onRead(hash)
 		}
 		return rc, err
 	}
-	sk, err := s.remote(ctx, ns, hash, start, end)
+	sk, err := s.remote(ctx, hash, start, end)
 	if err != nil {
 		return nil, err
 	}
@@ -384,8 +375,8 @@ func (s *store) GetXorbRangeReadCloser(ctx context.Context, ns string, hash xet.
 }
 
 // GetReconstructedFile reads through this store, so remote-only xorbs are relayed.
-func (s *store) GetReconstructedFile(ctx context.Context, ns string, digest [32]byte) (io.ReadSeekCloser, error) {
-	fh, err := s.Storage.GetFileHashBySHA256(ctx, ns, digest)
+func (s *store) GetReconstructedFile(ctx context.Context, digest [32]byte) (io.ReadSeekCloser, error) {
+	fh, err := s.Storage.GetFileHashBySHA256(ctx, digest)
 	if err != nil {
 		return nil, err
 	}
@@ -393,7 +384,7 @@ func (s *store) GetReconstructedFile(ctx context.Context, ns string, digest [32]
 	if err != nil {
 		return nil, err
 	}
-	return storage.NewReconstructedFile(ctx, s, ns, sh, digest)
+	return storage.NewReconstructedFile(ctx, s, sh, digest)
 }
 
 var errPinned = errors.New("xorb pinned by an in-flight shard verification")
@@ -424,27 +415,27 @@ func (s *store) unpin(hashes ...xet.XorbHash) {
 }
 
 // DeleteXorb drops the local copy and its offset caches; the sidecar stays for later relays.
-func (s *store) DeleteXorb(ctx context.Context, ns string, hash xet.XorbHash) error {
+func (s *store) DeleteXorb(ctx context.Context, hash xet.XorbHash) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.pins[hash] > 0 {
 		return fmt.Errorf("xorb %s: %w", hash, errPinned)
 	}
-	return s.Storage.DeleteXorb(ctx, ns, hash)
+	return s.Storage.DeleteXorb(ctx, hash)
 }
 
 // stage copies a xorb only holders have into the local store so local verification can read it.
 func (s *store) stage(ctx context.Context, hash xet.XorbHash) error {
-	ok, err := s.Storage.HasXorb(ctx, "", hash)
+	ok, err := s.Storage.HasXorb(ctx, hash)
 	if err != nil || ok {
 		return err
 	}
-	sk, err := s.remote(ctx, "", hash, 0, -1)
+	sk, err := s.remote(ctx, hash, 0, -1)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = sk.Close() }()
-	_, err = s.PutXorb(ctx, "", hash, sk)
+	_, err = s.PutXorb(ctx, hash, sk)
 	return err
 }
 
@@ -472,8 +463,8 @@ func (s *store) PutShard(ctx context.Context, sh *shard.Shard) (bool, error) {
 	return s.Storage.PutShard(ctx, sh)
 }
 
-func (s *store) GetXorbDataRange(ctx context.Context, ns string, hash xet.XorbHash, chunkStart, chunkEnd uint32) (int64, int64, error) {
-	offsets, err := s.GetXorbChunkOffsets(ctx, ns, hash)
+func (s *store) GetXorbDataRange(ctx context.Context, hash xet.XorbHash, chunkStart, chunkEnd uint32) (int64, int64, error) {
+	offsets, err := s.GetXorbChunkOffsets(ctx, hash)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -481,7 +472,7 @@ func (s *store) GetXorbDataRange(ctx context.Context, ns string, hash xet.XorbHa
 }
 
 // GetShardByChunkHash always misses: cross-file dedup would bind new files to xorbs no peer may hold anymore.
-func (s *store) GetShardByChunkHash(context.Context, string, xet.ChunkHash) (*shard.Shard, error) {
+func (s *store) GetShardByChunkHash(context.Context, xet.ChunkHash) (*shard.Shard, error) {
 	return nil, fmt.Errorf("chunk dedup disabled: %w", fs.ErrNotExist)
 }
 

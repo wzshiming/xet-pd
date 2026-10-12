@@ -464,15 +464,20 @@ func xetDownload(t *testing.T, resolveURL string) (xet.FileHash, *download.Recon
 	t.Helper()
 	ctx, cancel := context.WithTimeout(t.Context(), ingestTimeout)
 	defer cancel()
-	fh, provider, err := hf.ResolveDownload(ctx, nil, resolveURL)
-	if err != nil {
-		t.Fatalf("resolve %s: %v", resolveURL, err)
-	}
-	c, err := client.NewClient(client.WithCacheDir(t.TempDir()))
+	repo, path, err := hf.ParseResolveURL(resolveURL)
 	if err != nil {
 		t.Fatal(err)
 	}
-	v2, err := c.GetReconstructionV2WithAuthProvider(ctx, provider, fh, nil)
+	c, err := hf.NewClient(repo, hf.WithClientOptions(client.WithCache(client.NewCache(t.TempDir(), 0, 0))))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rf, err := c.Resolve(ctx, path)
+	if err != nil {
+		t.Fatalf("resolve %s: %v", resolveURL, err)
+	}
+	fh := rf.Hash
+	v2, err := c.GetReconstructionV2(ctx, fh, nil)
 	if err != nil {
 		t.Fatalf("reconstruction v2 of %s: %v", fh, err)
 	}
@@ -480,7 +485,7 @@ func xetDownload(t *testing.T, resolveURL string) (xet.FileHash, *download.Recon
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := c.DownloadFileWithAuthProvider(ctx, provider, fh, f); err != nil {
+	if err := c.DownloadFile(ctx, fh, f); err != nil {
 		t.Fatalf("xet download of %s: %v", fh, err)
 	}
 	if err := f.Close(); err != nil {

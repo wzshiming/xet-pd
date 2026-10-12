@@ -10,9 +10,11 @@ const (
 	PeerHeader   = "X-Xet-PD-Peer"
 )
 
+// XorbPathPrefix is xet-core's fixed CAS xorb route prefix, advertised by the gateway and fetched by peers.
+const XorbPathPrefix = "/v1/xorbs/default/"
+
 type PullRequest struct {
-	Namespace string `json:"namespace"`
-	Hash      string `json:"hash"`
+	Hash string `json:"hash"`
 }
 
 type Peer struct {

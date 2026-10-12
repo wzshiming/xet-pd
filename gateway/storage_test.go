@@ -167,7 +167,7 @@ func newTestStore(t *testing.T, dir string) (*store, *registry) {
 func ingest(t *testing.T, st *store, x *fixture, sh *shard.Shard) {
 	t.Helper()
 	ctx := context.Background()
-	if _, err := st.PutXorb(ctx, "default", x.hash, bytes.NewReader(x.body)); err != nil {
+	if _, err := st.PutXorb(ctx, x.hash, bytes.NewReader(x.body)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := st.PutShard(ctx, sh); err != nil {
@@ -255,20 +255,15 @@ func TestGetXorbURLPrefersLiveHolder(t *testing.T) {
 	st, reg := newTestStore(t, t.TempDir())
 	ctx := context.Background()
 	want := "/v1/xorbs/default/" + x.hash.String()
-	for _, ns := range []string{"", "default"} {
-		if u, err := st.GetXorbURL(ctx, ns, x.hash); err != nil || u != want {
-			t.Fatalf("GetXorbURL(%q) without peers = %q, %v, want relative %q", ns, u, err, want)
-		}
+	if u, err := st.GetXorbURL(ctx, x.hash); err != nil || u != want {
+		t.Fatalf("GetXorbURL without peers = %q, %v, want relative %q", u, err, want)
 	}
 	reg.announce(fullReq(testPeer(1), "e"))
 	reg.announce(fullReq(testPeer(2), "e", x.hash.String()))
-	if u, err := st.GetXorbURL(ctx, "", x.hash); err != nil || u != "http://p2"+want {
+	if u, err := st.GetXorbURL(ctx, x.hash); err != nil || u != "http://p2"+want {
 		t.Fatalf("GetXorbURL with holder = %q, %v, want holder URL", u, err)
 	}
-	if u, err := st.GetXorbURL(ctx, "a/b", x.hash); err != nil || u != "http://p2/v1/xorbs/a%2Fb/"+x.hash.String() {
-		t.Fatalf("GetXorbURL escaped namespace = %q, %v", u, err)
-	}
-	if u, err := st.GetXorbURL(ctx, "", makeXorb(t, 2, 1, 4<<10).hash); err != nil || !strings.HasPrefix(u, "http://p") {
+	if u, err := st.GetXorbURL(ctx, makeXorb(t, 2, 1, 4<<10).hash); err != nil || !strings.HasPrefix(u, "http://p") {
 		t.Fatalf("GetXorbURL without holder = %q, %v, want picked live peer", u, err)
 	}
 }
@@ -278,10 +273,10 @@ func TestChunkDedupAlwaysMisses(t *testing.T) {
 	st, _ := newTestStore(t, t.TempDir())
 	ingest(t, st, x, shard.BuildShard([]shard.FileInfo{x.file(0, 0, 2)}, x.infos(true)))
 	ctx := context.Background()
-	if _, err := st.Storage.GetShardByChunkHash(ctx, "default", x.hashes[0]); err != nil {
+	if _, err := st.Storage.GetShardByChunkHash(ctx, x.hashes[0]); err != nil {
 		t.Fatalf("local chunk index missing: %v", err)
 	}
-	if _, err := st.GetShardByChunkHash(ctx, "default", x.hashes[0]); !errors.Is(err, fs.ErrNotExist) {
+	if _, err := st.GetShardByChunkHash(ctx, x.hashes[0]); !errors.Is(err, fs.ErrNotExist) {
 		t.Fatalf("GetShardByChunkHash = %v, want fs.ErrNotExist", err)
 	}
 	var _ storage.Storage = st
@@ -296,26 +291,26 @@ func TestGetShardNeedsLocalOrHeldXorbs(t *testing.T) {
 	if _, err := st.GetShard(ctx, fi.Hash); err != nil {
 		t.Fatalf("GetShard with local xorb: %v", err)
 	}
-	if err := st.DeleteXorb(ctx, "default", x.hash); err != nil {
+	if err := st.DeleteXorb(ctx, x.hash); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := st.GetShard(ctx, fi.Hash); !errors.Is(err, fs.ErrNotExist) {
 		t.Fatalf("GetShard with all copies lost = %v, want fs.ErrNotExist", err)
 	}
-	if _, err := st.GetFileHashBySHA256(ctx, "default", fi.SHA256); !errors.Is(err, fs.ErrNotExist) {
+	if _, err := st.GetFileHashBySHA256(ctx, fi.SHA256); !errors.Is(err, fs.ErrNotExist) {
 		t.Fatalf("GetFileHashBySHA256 with all copies lost = %v, want fs.ErrNotExist", err)
 	}
-	if ok, err := st.HasXorb(ctx, "default", x.hash); err != nil || ok {
+	if ok, err := st.HasXorb(ctx, x.hash); err != nil || ok {
 		t.Fatalf("HasXorb without copies = %v, %v", ok, err)
 	}
 	reg.announce(fullReq(testPeer(1), "e", x.hash.String()))
-	if ok, err := st.HasXorb(ctx, "default", x.hash); err != nil || !ok {
+	if ok, err := st.HasXorb(ctx, x.hash); err != nil || !ok {
 		t.Fatalf("HasXorb with live holder = %v, %v", ok, err)
 	}
 	if _, err := st.GetShard(ctx, fi.Hash); err != nil {
 		t.Fatalf("GetShard with live holder: %v", err)
 	}
-	if fh, err := st.GetFileHashBySHA256(ctx, "default", fi.SHA256); err != nil || fh != fi.Hash {
+	if fh, err := st.GetFileHashBySHA256(ctx, fi.SHA256); err != nil || fh != fi.Hash {
 		t.Fatalf("GetFileHashBySHA256 with live holder = %s, %v", fh, err)
 	}
 }
@@ -326,11 +321,11 @@ func TestGetShardChecksOnlyRequestedFile(t *testing.T) {
 	ctx := context.Background()
 	a, b, empty := x.file(0, 0, 2), y.file(2, 0, 2), shard.FileInfo{}
 	sh := shard.BuildShard([]shard.FileInfo{a, b, empty}, slices.Concat(x.infos(true), y.infos(true)))
-	if _, err := st.PutXorb(ctx, "default", y.hash, bytes.NewReader(y.body)); err != nil {
+	if _, err := st.PutXorb(ctx, y.hash, bytes.NewReader(y.body)); err != nil {
 		t.Fatal(err)
 	}
 	ingest(t, st, x, sh)
-	if err := st.DeleteXorb(ctx, "default", y.hash); err != nil {
+	if err := st.DeleteXorb(ctx, y.hash); err != nil {
 		t.Fatal(err)
 	}
 	for _, fi := range []shard.FileInfo{a, empty} {
@@ -338,7 +333,7 @@ func TestGetShardChecksOnlyRequestedFile(t *testing.T) {
 			t.Fatalf("GetShard(%s) with its xorbs local: %v", fi.Hash, err)
 		}
 	}
-	if fh, err := st.GetFileHashBySHA256(ctx, "default", empty.SHA256); err != nil || fh != empty.Hash {
+	if fh, err := st.GetFileHashBySHA256(ctx, empty.SHA256); err != nil || fh != empty.Hash {
 		t.Fatalf("GetFileHashBySHA256(empty file) = %s, %v", fh, err)
 	}
 	if _, err := st.GetShard(ctx, b.Hash); !errors.Is(err, fs.ErrNotExist) {
@@ -355,30 +350,30 @@ func TestOffsetsSidecarSurvivesDeleteAndRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.PutXorb(ctx, "default", x.hash, bytes.NewReader(x.body)); err != nil {
+	if _, err := st.PutXorb(ctx, x.hash, bytes.NewReader(x.body)); err != nil {
 		t.Fatal(err)
 	}
-	if err := st.DeleteXorb(ctx, "default", x.hash); err != nil {
+	if err := st.DeleteXorb(ctx, x.hash); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.Storage.GetXorbChunkOffsets(ctx, "default", x.hash); !errors.Is(err, fs.ErrNotExist) {
+	if _, err := st.Storage.GetXorbChunkOffsets(ctx, x.hash); !errors.Is(err, fs.ErrNotExist) {
 		t.Fatalf("local offsets after delete = %v, want fs.ErrNotExist", err)
 	}
 	st, _ = newTestStore(t, dir) // restart with no peers and no network
-	if got, err := st.GetXorbChunkOffsets(ctx, "default", x.hash); err != nil || !slices.Equal(got, want) {
+	if got, err := st.GetXorbChunkOffsets(ctx, x.hash); err != nil || !slices.Equal(got, want) {
 		t.Fatalf("GetXorbChunkOffsets after delete+restart = %v, %v, want %v", got, err, want)
 	}
 	ws, we, _ := xorb.ChunkDataRangeFromOffsets(want, 1, 3)
-	if start, end, err := st.GetXorbDataRange(ctx, "default", x.hash, 1, 3); err != nil || start != ws || end != we {
+	if start, end, err := st.GetXorbDataRange(ctx, x.hash, 1, 3); err != nil || start != ws || end != we {
 		t.Fatalf("GetXorbDataRange = %d, %d, %v, want %d, %d", start, end, err, ws, we)
 	}
-	if inserted, err := st.PutXorb(ctx, "default", x.hash, bytes.NewReader(x.body)); err != nil || !inserted {
+	if inserted, err := st.PutXorb(ctx, x.hash, bytes.NewReader(x.body)); err != nil || !inserted {
 		t.Fatalf("PutXorb after delete = %v, %v, want inserted", inserted, err)
 	}
 	if err := os.Remove(st.sidecar(x.hash)); err != nil {
 		t.Fatal(err)
 	}
-	if inserted, err := st.PutXorb(ctx, "default", x.hash, bytes.NewReader(x.body)); err != nil || inserted {
+	if inserted, err := st.PutXorb(ctx, x.hash, bytes.NewReader(x.body)); err != nil || inserted {
 		t.Fatalf("dedup PutXorb = %v, %v, want existing", inserted, err)
 	}
 	if got, err := st.readSidecar(x.hash); err != nil || !slices.Equal(got, want) {
@@ -395,16 +390,16 @@ func TestOffsetsFollowReplacedEncoding(t *testing.T) {
 	ctx := context.Background()
 	fi := x.file(0, 0, 3)
 	ingest(t, st, x, shard.BuildShard([]shard.FileInfo{fi}, x.infos(true)))
-	if err := st.DeleteXorb(ctx, "default", x.hash); err != nil {
+	if err := st.DeleteXorb(ctx, x.hash); err != nil {
 		t.Fatal(err)
 	}
-	if inserted, err := st.PutXorb(ctx, "default", x.hash, bytes.NewReader(raw)); err != nil || !inserted {
+	if inserted, err := st.PutXorb(ctx, x.hash, bytes.NewReader(raw)); err != nil || !inserted {
 		t.Fatalf("PutXorb of the raw encoding = %v, %v, want inserted", inserted, err)
 	}
 	if got, err := st.readSidecar(x.hash); err != nil || !slices.Equal(got, want) {
 		t.Fatalf("sidecar after re-insertion = %v, %v, want refreshed %v", got, err, want)
 	}
-	if err := st.DeleteXorb(ctx, "default", x.hash); err != nil {
+	if err := st.DeleteXorb(ctx, x.hash); err != nil {
 		t.Fatal(err)
 	}
 	held := *x
@@ -414,14 +409,14 @@ func TestOffsetsFollowReplacedEncoding(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, err := st.GetXorbChunkOffsets(ctx, "default", x.hash); err != nil || !slices.Equal(got, want) {
+	if got, err := st.GetXorbChunkOffsets(ctx, x.hash); err != nil || !slices.Equal(got, want) {
 		t.Fatalf("GetXorbChunkOffsets after restart = %v, %v, want %v", got, err, want)
 	}
-	start, end, err := st.GetXorbDataRange(ctx, "default", x.hash, 1, 3)
+	start, end, err := st.GetXorbDataRange(ctx, x.hash, 1, 3)
 	if err != nil {
 		t.Fatal(err)
 	}
-	rc, err := st.GetXorbRangeReadCloser(ctx, "default", x.hash, start, end)
+	rc, err := st.GetXorbRangeReadCloser(ctx, x.hash, start, end)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -430,7 +425,7 @@ func TestOffsetsFollowReplacedEncoding(t *testing.T) {
 	if !bytes.Equal(plain, x.content(1, 3)) {
 		t.Fatal("relayed range does not decode to chunks 1..3 of the held encoding")
 	}
-	f, err := st.GetReconstructedFile(ctx, "default", fi.SHA256)
+	f, err := st.GetReconstructedFile(ctx, fi.SHA256)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -452,7 +447,7 @@ func TestConcurrentSameHashPutsSerialize(t *testing.T) {
 	g1, g2 := newGate(), newGate()
 	results := make(chan result, 2)
 	put := func(g *gate, body []byte) {
-		inserted, err := st.PutXorb(ctx, "default", x.hash, io.MultiReader(g, bytes.NewReader(body)))
+		inserted, err := st.PutXorb(ctx, x.hash, io.MultiReader(g, bytes.NewReader(body)))
 		results <- result{inserted, err}
 	}
 	go put(g1, x.body)
@@ -477,7 +472,7 @@ func TestConcurrentSameHashPutsSerialize(t *testing.T) {
 	if inserted != 1 {
 		t.Fatalf("%d of 2 concurrent puts inserted, want exactly 1", inserted)
 	}
-	f, err := st.Storage.GetXorbReadSeekCloser(ctx, "default", x.hash)
+	f, err := st.Storage.GetXorbReadSeekCloser(ctx, x.hash)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -508,11 +503,11 @@ func TestRemoteOffsetsYieldToLocalCommit(t *testing.T) {
 	}
 	done := make(chan result, 1)
 	go func() {
-		offsets, err := st.GetXorbChunkOffsets(ctx, "default", x.hash)
+		offsets, err := st.GetXorbChunkOffsets(ctx, x.hash)
 		done <- result{offsets, err}
 	}()
 	<-g.started // no local copy or sidecar: the holder is being asked
-	if inserted, err := st.PutXorb(ctx, "default", x.hash, bytes.NewReader(raw)); err != nil || !inserted {
+	if inserted, err := st.PutXorb(ctx, x.hash, bytes.NewReader(raw)); err != nil || !inserted {
 		t.Fatalf("PutXorb during remote discovery = %v, %v, want inserted", inserted, err)
 	}
 	close(g.release)
@@ -539,10 +534,10 @@ func TestMalformedSidecarIsRejected(t *testing.T) {
 		if err := st.writeSidecar(x.hash, offsets); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := st.GetXorbChunkOffsets(ctx, "default", x.hash); err == nil || errors.Is(err, fs.ErrNotExist) {
+		if _, err := st.GetXorbChunkOffsets(ctx, x.hash); err == nil || errors.Is(err, fs.ErrNotExist) {
 			t.Errorf("GetXorbChunkOffsets with sidecar %v... = %v, want validation error", offsets[:1], err)
 		}
-		if start, end, err := st.GetXorbDataRange(ctx, "default", x.hash, 0, 1); err == nil || start < 0 || end < 0 {
+		if start, end, err := st.GetXorbDataRange(ctx, x.hash, 0, 1); err == nil || start < 0 || end < 0 {
 			t.Errorf("GetXorbDataRange with sidecar %v... = %d, %d, %v, want an error and no negative bound", offsets[:1], start, end, err)
 		}
 	}
@@ -551,7 +546,7 @@ func TestMalformedSidecarIsRejected(t *testing.T) {
 		if err := os.WriteFile(st.sidecar(x.hash), []byte(raw), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := st.GetXorbChunkOffsets(ctx, "default", x.hash); err == nil || errors.Is(err, fs.ErrNotExist) {
+		if _, err := st.GetXorbChunkOffsets(ctx, x.hash); err == nil || errors.Is(err, fs.ErrNotExist) {
 			t.Errorf("GetXorbChunkOffsets with sidecar %.12q = %v, want decode error", raw, err)
 		}
 	}
@@ -560,7 +555,7 @@ func TestMalformedSidecarIsRejected(t *testing.T) {
 		if err := os.WriteFile(st.sidecar(x.hash), []byte(raw), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		if got, err := st.GetXorbChunkOffsets(ctx, "default", x.hash); err != nil || !slices.Equal(got, want) {
+		if got, err := st.GetXorbChunkOffsets(ctx, x.hash); err != nil || !slices.Equal(got, want) {
 			t.Errorf("GetXorbChunkOffsets with sidecar %.12q = %v, %v, want %v", raw, got, err, want)
 		}
 	}
@@ -572,7 +567,7 @@ func TestRelayReadsFromLiveHolder(t *testing.T) {
 	st, reg := newTestStore(t, t.TempDir())
 	h := newHolder(t, reg, "h1", x)
 	ctx := context.Background()
-	rs, err := st.GetXorbReadSeekCloser(ctx, "default", x.hash)
+	rs, err := st.GetXorbReadSeekCloser(ctx, x.hash)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -585,7 +580,7 @@ func TestRelayReadsFromLiveHolder(t *testing.T) {
 	if got, err := io.ReadAll(rs); err != nil || !bytes.Equal(got, x.body) {
 		t.Fatalf("relayed whole xorb differs (%d bytes, %v)", len(got), err)
 	}
-	start, end, err := st.GetXorbDataRange(ctx, "default", x.hash, 1, 3)
+	start, end, err := st.GetXorbDataRange(ctx, x.hash, 1, 3)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -597,7 +592,7 @@ func TestRelayReadsFromLiveHolder(t *testing.T) {
 		t.Fatalf("relayed seek+read differs: %v", err)
 	}
 	_ = rs.Close()
-	rc, err := st.GetXorbRangeReadCloser(ctx, "", x.hash, start, end)
+	rc, err := st.GetXorbRangeReadCloser(ctx, x.hash, start, end)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -618,7 +613,7 @@ func TestRelayReadsFromLiveHolder(t *testing.T) {
 	if got, err := st.readSidecar(x.hash); err != nil || !slices.Equal(got, want) {
 		t.Fatalf("offsets learned from holder = %v, %v, want persisted %v", got, err, want)
 	}
-	if ok, err := st.Storage.HasXorb(ctx, "default", x.hash); err != nil || ok {
+	if ok, err := st.Storage.HasXorb(ctx, x.hash); err != nil || ok {
 		t.Fatalf("relay staged the xorb locally: %v, %v", ok, err)
 	}
 }
@@ -632,7 +627,7 @@ func TestRelaySkipsStaleHolder(t *testing.T) {
 	}
 	stale.drop(x.hash)
 	ctx := context.Background()
-	rs, err := st.GetXorbReadSeekCloser(ctx, "default", x.hash)
+	rs, err := st.GetXorbReadSeekCloser(ctx, x.hash)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -641,7 +636,7 @@ func TestRelaySkipsStaleHolder(t *testing.T) {
 	if err != nil || !bytes.Equal(got, x.body) {
 		t.Fatalf("relay past stale holder differs: %v", err)
 	}
-	rc, err := st.GetXorbRangeReadCloser(ctx, "default", x.hash, 0, 15)
+	rc, err := st.GetXorbRangeReadCloser(ctx, x.hash, 0, 15)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -653,13 +648,13 @@ func TestRelaySkipsStaleHolder(t *testing.T) {
 	stale.assertRelayed(t, 2)
 	live.assertRelayed(t, 2)
 	live.drop(x.hash)
-	if _, err := st.GetXorbReadSeekCloser(ctx, "default", x.hash); err == nil {
+	if _, err := st.GetXorbReadSeekCloser(ctx, x.hash); err == nil {
 		t.Fatal("GetXorbReadSeekCloser with every holder stale must fail")
 	}
-	if _, err := st.GetXorbRangeReadCloser(ctx, "default", x.hash, 0, 15); err == nil {
+	if _, err := st.GetXorbRangeReadCloser(ctx, x.hash, 0, 15); err == nil {
 		t.Fatal("GetXorbRangeReadCloser with every holder stale must fail")
 	}
-	if ok, _ := st.Storage.HasXorb(ctx, "default", x.hash); ok {
+	if ok, _ := st.Storage.HasXorb(ctx, x.hash); ok {
 		t.Fatal("relay staged the xorb locally")
 	}
 }
@@ -685,7 +680,7 @@ func TestRelayRespectsContextCancel(t *testing.T) {
 	t.Cleanup(gate.Close)
 	reg.announce(apis.AnnounceRequest{Peer: apis.Peer{ID: "gate", URL: gate.URL}, Epoch: "e", Full: true, Add: []string{x.hash.String()}})
 	ctx, cancel := context.WithCancel(context.Background())
-	rs, err := st.GetXorbReadSeekCloser(ctx, "default", x.hash)
+	rs, err := st.GetXorbReadSeekCloser(ctx, x.hash)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -698,7 +693,7 @@ func TestRelayRespectsContextCancel(t *testing.T) {
 	if _, err := io.ReadAll(rs); !errors.Is(err, context.Canceled) {
 		t.Fatalf("read after cancel = %v, want context.Canceled", err)
 	}
-	if _, err := st.GetXorbReadSeekCloser(ctx, "default", x.hash); !errors.Is(err, context.Canceled) {
+	if _, err := st.GetXorbReadSeekCloser(ctx, x.hash); !errors.Is(err, context.Canceled) {
 		t.Fatalf("open with canceled context = %v, want context.Canceled", err)
 	}
 	close(release)
@@ -710,14 +705,14 @@ func TestReconstructedFileFromRemoteOnlyXorb(t *testing.T) {
 	fi := x.file(0, 1, 4)
 	ingest(t, st, x, shard.BuildShard([]shard.FileInfo{fi}, x.infos(true)))
 	ctx := context.Background()
-	if err := st.DeleteXorb(ctx, "default", x.hash); err != nil {
+	if err := st.DeleteXorb(ctx, x.hash); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.GetReconstructedFile(ctx, "default", fi.SHA256); !errors.Is(err, fs.ErrNotExist) {
+	if _, err := st.GetReconstructedFile(ctx, fi.SHA256); !errors.Is(err, fs.ErrNotExist) {
 		t.Fatalf("GetReconstructedFile with all copies lost = %v, want fs.ErrNotExist", err)
 	}
 	h := newHolder(t, reg, "h1", x)
-	f, err := st.GetReconstructedFile(ctx, "default", fi.SHA256)
+	f, err := st.GetReconstructedFile(ctx, fi.SHA256)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -733,7 +728,7 @@ func TestReconstructedFileFromRemoteOnlyXorb(t *testing.T) {
 		t.Fatalf("reconstructed tail differs: %v", err)
 	}
 	h.assertRelayed(t, 1)
-	if ok, _ := st.Storage.HasXorb(ctx, "default", x.hash); ok {
+	if ok, _ := st.Storage.HasXorb(ctx, x.hash); ok {
 		t.Fatal("bridge staged the xorb locally")
 	}
 }
@@ -745,7 +740,7 @@ func TestPutShardStagesRemoteOnlyXorb(t *testing.T) {
 	a := x.file(0, 0, 3)
 	first := shard.BuildShard([]shard.FileInfo{a}, x.infos(true))
 	ingest(t, st, x, first)
-	if err := st.DeleteXorb(ctx, "default", x.hash); err != nil {
+	if err := st.DeleteXorb(ctx, x.hash); err != nil {
 		t.Fatal(err)
 	}
 	b := x.file(0, 1, 3)
@@ -758,7 +753,7 @@ func TestPutShardStagesRemoteOnlyXorb(t *testing.T) {
 		t.Fatalf("PutShard over remote-only xorb = %v, %v, want inserted", inserted, err)
 	}
 	h.assertRelayed(t, 1)
-	if ok, err := st.Storage.HasXorb(ctx, "default", x.hash); err != nil || !ok {
+	if ok, err := st.Storage.HasXorb(ctx, x.hash); err != nil || !ok {
 		t.Fatalf("referenced xorb not staged locally: %v, %v", ok, err)
 	}
 	if _, err := st.GetShard(ctx, b.Hash); err != nil {
@@ -767,7 +762,7 @@ func TestPutShardStagesRemoteOnlyXorb(t *testing.T) {
 	if len(st.pins) != 0 {
 		t.Fatalf("pins held after PutShard: %v", st.pins)
 	}
-	if err := st.DeleteXorb(ctx, "default", x.hash); err != nil {
+	if err := st.DeleteXorb(ctx, x.hash); err != nil {
 		t.Fatal(err)
 	}
 	bogus := x.file(0, 0, 2)
@@ -778,7 +773,7 @@ func TestPutShardStagesRemoteOnlyXorb(t *testing.T) {
 	if len(st.pins) != 0 {
 		t.Fatalf("pins held after failed PutShard: %v", st.pins)
 	}
-	if err := st.DeleteXorb(ctx, "default", x.hash); err != nil {
+	if err := st.DeleteXorb(ctx, x.hash); err != nil {
 		t.Fatal(err)
 	}
 	h.drop(x.hash)
@@ -795,12 +790,12 @@ func TestPutShardPinsStagedXorbsDuringVerification(t *testing.T) {
 	x, y := makeXorb(t, 15, 2, 4<<10), makeXorb(t, 16, 2, 4<<10)
 	st, reg := newTestStore(t, t.TempDir())
 	ctx := context.Background()
-	if _, err := st.PutXorb(ctx, "default", x.hash, bytes.NewReader(x.body)); err != nil {
+	if _, err := st.PutXorb(ctx, x.hash, bytes.NewReader(x.body)); err != nil {
 		t.Fatal(err)
 	}
 	h := newHolder(t, reg, "h1", y)
 	errs := make(chan error, 8)
-	h.hook = func() { errs <- st.DeleteXorb(ctx, "default", x.hash) }
+	h.hook = func() { errs <- st.DeleteXorb(ctx, x.hash) }
 	files := []shard.FileInfo{x.file(0, 0, 2), y.file(2, 0, 2)}
 	sh := shard.BuildShard(files, slices.Concat(x.infos(false), y.infos(false)))
 	if inserted, err := st.PutShard(ctx, sh); err != nil || !inserted {
@@ -815,7 +810,7 @@ func TestPutShardPinsStagedXorbsDuringVerification(t *testing.T) {
 		}
 	}
 	for _, f := range []*fixture{x, y} {
-		if ok, err := st.Storage.HasXorb(ctx, "default", f.hash); err != nil || !ok {
+		if ok, err := st.Storage.HasXorb(ctx, f.hash); err != nil || !ok {
 			t.Fatalf("xorb %s not local after PutShard: %v, %v", f.hash, ok, err)
 		}
 	}
@@ -828,21 +823,21 @@ func TestDeleteXorbRefusedWhilePinned(t *testing.T) {
 	x := makeXorb(t, 14, 1, 4<<10)
 	st, _ := newTestStore(t, t.TempDir())
 	ctx := context.Background()
-	if _, err := st.PutXorb(ctx, "default", x.hash, bytes.NewReader(x.body)); err != nil {
+	if _, err := st.PutXorb(ctx, x.hash, bytes.NewReader(x.body)); err != nil {
 		t.Fatal(err)
 	}
 	st.pin(x.hash)
-	if err := st.DeleteXorb(ctx, "default", x.hash); !errors.Is(err, errPinned) {
+	if err := st.DeleteXorb(ctx, x.hash); !errors.Is(err, errPinned) {
 		t.Fatalf("DeleteXorb while pinned = %v, want errPinned", err)
 	}
-	if ok, _ := st.Storage.HasXorb(ctx, "default", x.hash); !ok {
+	if ok, _ := st.Storage.HasXorb(ctx, x.hash); !ok {
 		t.Fatal("pinned xorb was deleted")
 	}
 	st.unpin(x.hash)
-	if err := st.DeleteXorb(ctx, "default", x.hash); err != nil {
+	if err := st.DeleteXorb(ctx, x.hash); err != nil {
 		t.Fatal(err)
 	}
-	if ok, _ := st.Storage.HasXorb(ctx, "default", x.hash); ok {
+	if ok, _ := st.Storage.HasXorb(ctx, x.hash); ok {
 		t.Fatal("unpinned xorb survived DeleteXorb")
 	}
 	if _, err := st.readSidecar(x.hash); err != nil {

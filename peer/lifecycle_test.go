@@ -434,7 +434,7 @@ func TestMissingStoredObjectLeavesInventoryAndRefills(t *testing.T) {
 	fillAndSettle(t, p, srv, hash, body)
 	_, n := g.findAnnounce(t, 1, func(a announced) bool { return hasAdd(a, hash) })
 	// The stored file is lost underneath a live inventory entry.
-	if err := p.store.DeleteXorb(context.Background(), "default", hash); err != nil {
+	if err := p.store.DeleteXorb(context.Background(), hash); err != nil {
 		t.Fatal(err)
 	}
 	if resp, _, _ := do(t, http.MethodGet, xorbURL(srv, hash), apis.PeerHeader, "gw"); resp.StatusCode != http.StatusNotFound {
@@ -463,10 +463,10 @@ func TestPullRefillsMissingStoredObject(t *testing.T) {
 	gateway := newGateway(t, serveBody(body))
 	seed, _ := newTestPeer(t, gateway.URL, nil)
 	commitDirect(t, seed, hash, body)
-	if err := seed.store.DeleteXorb(context.Background(), "default", hash); err != nil {
+	if err := seed.store.DeleteXorb(context.Background(), hash); err != nil {
 		t.Fatal(err)
 	}
-	payload := `{"namespace":"default","hash":"` + hash.String() + `"}`
+	payload := `{"hash":"` + hash.String() + `"}`
 	request := httptest.NewRequest(http.MethodPost, apis.PullPath, strings.NewReader(payload))
 	response := httptest.NewRecorder()
 	seed.ServeHTTP(response, request)
@@ -491,10 +491,10 @@ func TestStaleReaderDoesNotTouchNewerGeneration(t *testing.T) {
 	if first == nil || second == nil {
 		t.Fatal("pin failed for a committed object")
 	}
-	if err := p.store.DeleteXorb(context.Background(), "default", hash); err != nil {
+	if err := p.store.DeleteXorb(context.Background(), hash); err != nil {
 		t.Fatal(err)
 	}
-	if err := p.serveStored(httptest.NewRecorder(), req, "default", first); !errors.Is(err, fs.ErrNotExist) {
+	if err := p.serveStored(httptest.NewRecorder(), req, first); !errors.Is(err, fs.ErrNotExist) {
 		t.Fatalf("read of the missing file = %v", err)
 	}
 	if usage(p) != 0 {
@@ -515,7 +515,7 @@ func TestStaleReaderDoesNotTouchNewerGeneration(t *testing.T) {
 		t.Fatalf("new generation pins = %d after the stale unpin, want 1", pins)
 	}
 	w := httptest.NewRecorder()
-	if err := p.serveStored(w, req, "default", rd); err != nil {
+	if err := p.serveStored(w, req, rd); err != nil {
 		t.Fatal(err)
 	}
 	if w.Code != http.StatusOK || !bytes.Equal(w.Body.Bytes(), body) || usage(p) != int64(len(body)) {
@@ -562,7 +562,7 @@ func TestReadyDecisionSurvivesEviction(t *testing.T) {
 	})
 	commitDirect(t, p, a, bodyA)
 	// The handler decided a is ready; LRU pressure arrives before it opens the file.
-	f, rd, err := p.acquire("default", a, false)
+	f, rd, err := p.acquire(a, false)
 	if err != nil || f != nil || rd == nil {
 		t.Fatalf("acquire = %v, %v, %v, want a reserved ready", f, rd, err)
 	}
@@ -572,7 +572,7 @@ func TestReadyDecisionSurvivesEviction(t *testing.T) {
 	}
 	req := httptest.NewRequest(http.MethodGet, "/v1/xorbs/default/"+a.String(), nil)
 	w := httptest.NewRecorder()
-	if err := p.serveStored(w, req, "default", rd); err != nil || w.Code != http.StatusOK || !bytes.Equal(w.Body.Bytes(), bodyA) {
+	if err := p.serveStored(w, req, rd); err != nil || w.Code != http.StatusOK || !bytes.Equal(w.Body.Bytes(), bodyA) {
 		t.Fatalf("read after the ready decision = %d, %v", w.Code, err)
 	}
 	// The read released its pin and the cache fits its cap again, without any gateway fetch.

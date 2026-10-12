@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"os"
 	"time"
 
@@ -29,7 +28,6 @@ var (
 // fill downloads one xorb from the gateway into a spool, validates it into the store and serves attached readers meanwhile.
 type fill struct {
 	p     *Peer
-	ns    string
 	hash  xet.XorbHash
 	ready chan struct{} // closed once spool is set or err is set
 	done  chan struct{}
@@ -45,7 +43,7 @@ type cooled struct {
 }
 
 // acquire returns exactly one of a joined or new fill (release it) or a pinned committed xorb (unpin it); force clears a failure cooldown.
-func (p *Peer) acquire(ns string, hash xet.XorbHash, force bool) (*fill, *ready, error) {
+func (p *Peer) acquire(hash xet.XorbHash, force bool) (*fill, *ready, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if f := p.fills[hash]; f != nil {
@@ -56,7 +54,7 @@ func (p *Peer) acquire(ns string, hash xet.XorbHash, force bool) (*fill, *ready,
 		return nil, nil, errClosed
 	}
 	if entry := p.index[hash]; entry != nil {
-		exists, err := p.store.HasXorb(p.ctx, ns, hash)
+		exists, err := p.store.HasXorb(p.ctx, hash)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -77,7 +75,7 @@ func (p *Peer) acquire(ns string, hash xet.XorbHash, force bool) (*fill, *ready,
 		}
 		delete(p.cooldown, hash)
 	}
-	f := &fill{p: p, ns: ns, hash: hash, ready: make(chan struct{}), done: make(chan struct{}), refs: 2}
+	f := &fill{p: p, hash: hash, ready: make(chan struct{}), done: make(chan struct{}), refs: 2}
 	p.fills[hash] = f
 	p.wg.Add(1)
 	go f.run()
@@ -154,7 +152,7 @@ func (f *fill) fetch(ctx context.Context) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, p.cfg.Gateway+"/v1/xorbs/"+url.PathEscape(f.ns)+"/"+f.hash.String(), nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, p.cfg.Gateway+apis.XorbPathPrefix+f.hash.String(), nil)
 	if err != nil {
 		return err
 	}
@@ -188,7 +186,7 @@ func (f *fill) fetch(ctx context.Context) error {
 		return fmt.Errorf("short body: %d of %d bytes", n, resp.ContentLength)
 	}
 	f.size = n
-	stored, err := p.store.PutXorb(ctx, f.ns, f.hash, io.NewSectionReader(tmp, 0, n))
+	stored, err := p.store.PutXorb(ctx, f.hash, io.NewSectionReader(tmp, 0, n))
 	if err != nil || stored {
 		return err
 	}

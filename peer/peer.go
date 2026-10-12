@@ -159,7 +159,7 @@ func New(cfg Config) (*Peer, error) {
 	}
 	p.wg.Add(1)
 	go p.announceLoop()
-	p.mux.HandleFunc("GET /v1/xorbs/{namespace}/{hash}", p.serveXorb)
+	p.mux.HandleFunc("GET /v1/xorbs/{prefix}/{hash}", p.serveXorb)
 	p.mux.HandleFunc("POST "+apis.PullPath, p.servePull)
 	p.mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
 	return p, nil
@@ -181,19 +181,6 @@ func (p *Peer) Close() error {
 	return nil
 }
 
-// validSegment accepts one URL-safe path segment.
-func validSegment(s string) bool {
-	if s == "" || len(s) > 128 || strings.Trim(s, ".") == "" {
-		return false
-	}
-	for _, c := range []byte(s) {
-		if c != '-' && c != '_' && c != '.' && (c < '0' || c > '9') && (c < 'a' || c > 'z') && (c < 'A' || c > 'Z') {
-			return false
-		}
-	}
-	return true
-}
-
 func serveContent(w http.ResponseWriter, r *http.Request, hash xet.XorbHash, content io.ReadSeeker) {
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("ETag", `"`+hash.String()+`"`)
@@ -201,9 +188,9 @@ func serveContent(w http.ResponseWriter, r *http.Request, hash xet.XorbHash, con
 }
 
 // serveStored serves a pinned committed xorb and releases the pin; a missing file leaves the inventory so the next request fills again.
-func (p *Peer) serveStored(w http.ResponseWriter, r *http.Request, ns string, rd *ready) error {
+func (p *Peer) serveStored(w http.ResponseWriter, r *http.Request, rd *ready) error {
 	defer p.unpin(rd)
-	obj, err := p.store.GetXorbReadSeekCloser(r.Context(), ns, rd.hash)
+	obj, err := p.store.GetXorbReadSeekCloser(r.Context(), rd.hash)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			p.drop(rd)
@@ -217,14 +204,13 @@ func (p *Peer) serveStored(w http.ResponseWriter, r *http.Request, ns string, rd
 
 // serveXorb serves a committed xorb or streams it from a fill; requests carrying apis.PeerHeader are relays and never fill.
 func (p *Peer) serveXorb(w http.ResponseWriter, r *http.Request) {
-	ns := r.PathValue("namespace")
 	hash, err := xet.ParseXorbHash(r.PathValue("hash"))
-	if err != nil || !validSegment(ns) {
+	if err != nil {
 		http.Error(w, "invalid xorb path", http.StatusBadRequest)
 		return
 	}
 	if stored := p.pin(hash); stored != nil {
-		err := p.serveStored(w, r, ns, stored)
+		err := p.serveStored(w, r, stored)
 		if err == nil {
 			return
 		}
@@ -237,13 +223,13 @@ func (p *Peer) serveXorb(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	f, stored, err := p.acquire(ns, hash, false)
+	f, stored, err := p.acquire(hash, false)
 	if err != nil {
 		http.Error(w, err.Error(), statusOf(err))
 		return
 	}
 	if stored != nil {
-		if err := p.serveStored(w, r, ns, stored); err != nil {
+		if err := p.serveStored(w, r, stored); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 		}
 		return
@@ -284,11 +270,11 @@ func (p *Peer) servePull(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	hash, err := xet.ParseXorbHash(req.Hash)
-	if err != nil || !validSegment(req.Namespace) {
+	if err != nil {
 		http.Error(w, "invalid pull request", http.StatusBadRequest)
 		return
 	}
-	f, stored, err := p.acquire(req.Namespace, hash, true)
+	f, stored, err := p.acquire(hash, true)
 	if err != nil {
 		http.Error(w, err.Error(), statusOf(err))
 		return

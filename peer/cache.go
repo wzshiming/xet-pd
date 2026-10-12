@@ -28,14 +28,14 @@ func (p *Peer) scan() error {
 	}
 	var objs []found
 	ctx := context.Background()
-	err := p.store.WalkXorbs(ctx, "", func(name string, size int64, mtime time.Time) error {
+	err := p.store.WalkXorbs(ctx, func(name string, size int64, mtime time.Time) error {
 		hash, err := xet.ParseXorbHash(name)
 		if err != nil {
 			return nil
 		}
 		if err := p.validateStored(ctx, hash); err != nil {
 			slog.Warn("peer: dropping invalid xorb", "hash", name, "err", err)
-			return p.store.DeleteXorb(ctx, "", hash)
+			return p.store.DeleteXorb(ctx, hash)
 		}
 		objs = append(objs, found{ready{hash: hash, size: size}, mtime})
 		return nil
@@ -56,7 +56,7 @@ func (p *Peer) scan() error {
 }
 
 func (p *Peer) validateStored(ctx context.Context, hash xet.XorbHash) error {
-	obj, err := p.store.GetXorbReadSeekCloser(ctx, "", hash)
+	obj, err := p.store.GetXorbReadSeekCloser(ctx, hash)
 	if err != nil {
 		return err
 	}
@@ -85,7 +85,7 @@ func (p *Peer) evict() {
 		next := e.Next()
 		r := e.Value.(*ready)
 		if r.pins == 0 && (r.fill == nil || r.fill.refs == 0) {
-			if err := p.store.DeleteXorb(context.Background(), "", r.hash); err != nil {
+			if err := p.store.DeleteXorb(context.Background(), r.hash); err != nil {
 				slog.Warn("peer: evict", "hash", r.hash, "err", err)
 			} else {
 				p.forget(e)

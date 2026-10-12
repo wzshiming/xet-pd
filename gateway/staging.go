@@ -36,7 +36,6 @@ type stagingConfig struct {
 // staged is one durable local xorb; its LRU position is its recency.
 type staged struct {
 	hash  xet.XorbHash
-	ns    string
 	size  int64
 	asked map[string]time.Time // seed ID -> when it may be asked again
 }
@@ -99,7 +98,7 @@ func (m *staging) scan() error {
 		mtime time.Time
 	}
 	var objs []found
-	err := m.st.WalkXorbs(context.Background(), "", func(name string, size int64, mtime time.Time) error {
+	err := m.st.WalkXorbs(context.Background(), func(name string, size int64, mtime time.Time) error {
 		if hash, err := xet.ParseXorbHash(name); err == nil {
 			objs = append(objs, found{hash, size, mtime})
 		}
@@ -112,14 +111,14 @@ func (m *staging) scan() error {
 		return cmp.Or(a.mtime.Compare(b.mtime), cmp.Compare(a.hash.String(), b.hash.String()))
 	})
 	for _, o := range objs {
-		m.add(o.hash, "", o.size)
+		m.add(o.hash, o.size)
 	}
 	return nil
 }
 
 // add tracks a new local copy as most recently used; caller holds m.mu or owns m alone.
-func (m *staging) add(hash xet.XorbHash, ns string, size int64) {
-	m.index[hash] = m.lru.PushBack(&staged{hash: hash, ns: cmp.Or(ns, "default"), size: size, asked: map[string]time.Time{}})
+func (m *staging) add(hash xet.XorbHash, size int64) {
+	m.index[hash] = m.lru.PushBack(&staged{hash: hash, size: size, asked: map[string]time.Time{}})
 	m.usage += size
 }
 
@@ -131,7 +130,7 @@ func (m *staging) forget(e *list.Element) {
 }
 
 // stored records a durable local xorb; inserted bytes supersede any copy tracked under the hash.
-func (m *staging) stored(ns string, hash xet.XorbHash, size int64, inserted bool) {
+func (m *staging) stored(hash xet.XorbHash, size int64, inserted bool) {
 	m.mu.Lock()
 	if e := m.index[hash]; e != nil {
 		if !inserted {
@@ -140,7 +139,7 @@ func (m *staging) stored(ns string, hash xet.XorbHash, size int64, inserted bool
 		}
 		m.forget(e)
 	}
-	m.add(hash, ns, size)
+	m.add(hash, size)
 	m.mu.Unlock()
 	m.kick()
 }
@@ -225,7 +224,7 @@ func (m *staging) evict() {
 		}
 		s := victim.Value.(*staged)
 		m.mu.Unlock()
-		err := m.st.DeleteXorb(context.Background(), s.ns, s.hash)
+		err := m.st.DeleteXorb(context.Background(), s.hash)
 		m.mu.Lock()
 		switch {
 		case err != nil:
@@ -261,23 +260,23 @@ func (m *staging) seed() {
 			}
 			s.asked[p.ID] = now.Add(m.cfg.retry)
 			m.wg.Add(1)
-			go m.pull(p.Peer, s.ns, s.hash)
+			go m.pull(p.Peer, s.hash)
 		}
 	}
 }
 
-func (m *staging) pull(p apis.Peer, ns string, hash xet.XorbHash) {
+func (m *staging) pull(p apis.Peer, hash xet.XorbHash) {
 	defer m.wg.Done()
 	defer m.kick()
 	defer func() { <-m.sem }()
-	if err := m.request(p, ns, hash); err != nil && m.ctx.Err() == nil {
+	if err := m.request(p, hash); err != nil && m.ctx.Err() == nil {
 		slog.Warn("gateway: pull request", "peer", p.ID, "hash", hash, "err", err)
 	}
 }
 
 // request asks one seed to pull the xorb; only a 202 counts as accepted.
-func (m *staging) request(p apis.Peer, ns string, hash xet.XorbHash) error {
-	body, err := json.Marshal(apis.PullRequest{Namespace: ns, Hash: hash.String()})
+func (m *staging) request(p apis.Peer, hash xet.XorbHash) error {
+	body, err := json.Marshal(apis.PullRequest{Hash: hash.String()})
 	if err != nil {
 		return err
 	}

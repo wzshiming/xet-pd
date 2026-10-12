@@ -177,7 +177,7 @@ func seedStore(t *testing.T, dir string, hash xet.XorbHash, body []byte) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.PutXorb(context.Background(), "default", hash, bytes.NewReader(body)); err != nil {
+	if _, err := store.PutXorb(context.Background(), hash, bytes.NewReader(body)); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -189,7 +189,7 @@ func xorbPath(dir string, hash xet.XorbHash) string {
 // commitDirect stores body underneath a running peer and registers it as a finished fill would.
 func commitDirect(t *testing.T, p *Peer, hash xet.XorbHash, body []byte) {
 	t.Helper()
-	if _, err := p.store.PutXorb(context.Background(), "default", hash, bytes.NewReader(body)); err != nil {
+	if _, err := p.store.PutXorb(context.Background(), hash, bytes.NewReader(body)); err != nil {
 		t.Fatal(err)
 	}
 	p.mu.Lock()
@@ -280,7 +280,7 @@ func spoolEmpty(p *Peer) func() bool {
 
 func hasXorb(t *testing.T, p *Peer, hash xet.XorbHash) bool {
 	t.Helper()
-	ok, err := p.store.HasXorb(context.Background(), "default", hash)
+	ok, err := p.store.HasXorb(context.Background(), hash)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -509,6 +509,21 @@ func TestWarmServe(t *testing.T) {
 	}
 }
 
+// Like xet's CAS server, the route accepts any prefix segment and selects the xorb by hash alone.
+func TestXorbRouteIgnoresPrefix(t *testing.T) {
+	hash, body := makeXorb(t, 12, 2, 8<<10)
+	g := newGateway(t, func(w http.ResponseWriter, _ *http.Request) {
+		t.Error("stored object reached the gateway")
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+	p, srv := newTestPeer(t, g.URL, nil)
+	commitDirect(t, p, hash, body)
+	resp, got, err := do(t, http.MethodGet, srv.URL+"/v1/xorbs/x/"+hash.String())
+	if err != nil || resp.StatusCode != http.StatusOK || !bytes.Equal(got, body) {
+		t.Fatalf("GET under a foreign prefix = %d, %d bytes, %v", resp.StatusCode, len(got), err)
+	}
+}
+
 type result struct {
 	resp *http.Response
 	body []byte
@@ -716,7 +731,7 @@ func TestPullAndLocalOnlyRelay(t *testing.T) {
 		_ = resp.Body.Close()
 		return resp.StatusCode
 	}
-	payload := fmt.Sprintf(`{"namespace":"default","hash":"%s"}`, hash)
+	payload := fmt.Sprintf(`{"hash":"%s"}`, hash)
 
 	if resp, _, _ := do(t, http.MethodGet, u, apis.PeerHeader, "gw"); resp.StatusCode != http.StatusNotFound {
 		t.Fatalf("relay miss = %d", resp.StatusCode)
@@ -727,7 +742,7 @@ func TestPullAndLocalOnlyRelay(t *testing.T) {
 	if code := pull("Bearer wrong", payload); code != http.StatusUnauthorized {
 		t.Fatalf("pull with wrong secret = %d", code)
 	}
-	if code := pull("Bearer s3cret", `{"namespace":"default","hash":"zz"}`); code != http.StatusBadRequest {
+	if code := pull("Bearer s3cret", `{"hash":"zz"}`); code != http.StatusBadRequest {
 		t.Fatalf("pull with bad hash = %d", code)
 	}
 	if code := pull("Bearer s3cret", payload+`{}`); code != http.StatusBadRequest {
@@ -775,7 +790,7 @@ func TestUnknownContentLengthWaitsForValidation(t *testing.T) {
 	if err != nil || resp.StatusCode != http.StatusOK || !bytes.Equal(got, body) || resp.ContentLength != int64(len(body)) {
 		t.Fatalf("GET = %d, %d bytes, length %d, %v", resp.StatusCode, len(got), resp.ContentLength, err)
 	}
-	req, _ := http.NewRequest(http.MethodPost, srv.URL+apis.PullPath, strings.NewReader(fmt.Sprintf(`{"namespace":"default","hash":"%s"}`, hash)))
+	req, _ := http.NewRequest(http.MethodPost, srv.URL+apis.PullPath, strings.NewReader(fmt.Sprintf(`{"hash":"%s"}`, hash)))
 	pr, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
@@ -834,7 +849,7 @@ func TestAcquireAfterCommitReportsReady(t *testing.T) {
 		return len(p.fills) == 0
 	})
 	// A handler that missed the store before that commit now takes its fill decision.
-	f, rd, err := p.acquire("default", hash, false)
+	f, rd, err := p.acquire(hash, false)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -410,22 +410,27 @@ func TestGatewayIntegration(t *testing.T) {
 	// A fresh xet client downloads straight from the seeds.
 	download := func() {
 		t.Helper()
-		fh, provider, err := hf.ResolveDownload(ctx, nil, resolveURL)
+		repo, path, err := hf.ParseResolveURL(resolveURL)
 		if err != nil {
 			t.Fatal(err)
 		}
+		c, err := hf.NewClient(repo, hf.WithClientOptions(client.WithCache(client.NewCache(t.TempDir(), 0, 0))))
+		if err != nil {
+			t.Fatal(err)
+		}
+		rf, err := c.Resolve(ctx, path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		fh := rf.Hash
 		if fh.String() != fileHash {
 			t.Fatalf("resolved hash %s, want %s", fh, fileHash)
-		}
-		c, err := client.NewClient(client.WithCacheDir(t.TempDir()))
-		if err != nil {
-			t.Fatal(err)
 		}
 		f, err := os.Create(filepath.Join(t.TempDir(), "out"))
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := c.DownloadFileWithAuthProvider(ctx, provider, fh, f); err != nil {
+		if err := c.DownloadFile(ctx, fh, f); err != nil {
 			t.Fatal(err)
 		}
 		if err := f.Close(); err != nil {
@@ -435,15 +440,15 @@ func TestGatewayIntegration(t *testing.T) {
 		if err != nil || sha(out) != sha(data) {
 			t.Fatalf("xet download: %v, %d bytes", err, len(out))
 		}
-		v1, err := c.GetReconstructionV1WithAuthProvider(ctx, provider, fh, nil)
+		v1, err := c.GetReconstructionV1(ctx, fh, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
-		v2, err := c.GetReconstructionV2WithAuthProvider(ctx, provider, fh, nil)
+		v2, err := c.GetReconstructionV2(ctx, fh, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
-		batch, err := c.GetBatchReconstructionWithAuthProvider(ctx, provider, []xet.FileHash{fh})
+		batch, err := c.GetBatchReconstruction(ctx, []xet.FileHash{fh})
 		if err != nil {
 			t.Fatal(err)
 		}

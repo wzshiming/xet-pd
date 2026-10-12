@@ -20,11 +20,14 @@ func TestWireConstants(t *testing.T) {
 	if PeersPath != "/xet-pd/v1/peers" {
 		t.Fatalf("PeersPath = %q", PeersPath)
 	}
+	if XorbPathPrefix != "/v1/xorbs/default/" {
+		t.Fatalf("XorbPathPrefix = %q", XorbPathPrefix)
+	}
 }
 
 func TestPullRequestWire(t *testing.T) {
-	in := PullRequest{Namespace: "default", Hash: "xorb-hash"}
-	want := `{"namespace":"default","hash":"xorb-hash"}`
+	in := PullRequest{Hash: "xorb-hash"}
+	want := `{"hash":"xorb-hash"}`
 	encoded, err := json.Marshal(in)
 	if err != nil {
 		t.Fatal(err)

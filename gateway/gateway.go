@@ -24,9 +24,6 @@ import (
 	"github.com/wzshiming/xet-pd/apis"
 )
 
-// chunkCacheSize bounds the chunk cache of upstream xet downloads; the gateway keeps no xorb bytes of its own.
-const chunkCacheSize = 64 << 20
-
 // Config configures New; zero values take the noted defaults.
 type Config struct {
 	StorageDir    string // required: data/ holds the store, mirror/ the index, spools and chunk cache
@@ -134,30 +131,18 @@ func build(cfg Config) (*Gateway, error) {
 	}
 	mirrorDir := filepath.Join(cfg.StorageDir, "mirror")
 	transport := http.DefaultTransport.(*http.Transport).Clone()
-	xetClient, err := client.NewClient(
-		client.WithCacheDir(filepath.Join(mirrorDir, "chunks")),
-		client.WithCacheSize(chunkCacheSize),
-		client.WithHTTPClient(&http.Client{Transport: transport}),
-	)
-	if err != nil {
-		return nil, err
-	}
-	proxy, err := hf.NewUpstreamProxy(cfg.Upstream, cfg.UpstreamToken)
-	if err != nil {
-		return nil, err
-	}
+	provider := client.StaticUpstreamProvider(cfg.Upstream, cfg.UpstreamToken)
 	mir, err := mirror.NewMirror(
 		mirror.WithStorage(st),
-		mirror.WithUpstream(cfg.Upstream),
-		mirror.WithUpstreamToken(cfg.UpstreamToken),
 		mirror.WithCacheDir(mirrorDir),
-		mirror.WithClient(xetClient),
+		mirror.WithTransport(transport),
 	)
 	if err != nil {
 		return nil, err
 	}
 	hub := hf.NewHandler(
 		hf.WithMirror(mir),
+		hf.WithUpstreamProvider(provider),
 		hf.WithExternalURL(cfg.ExternalURL),
 		hf.WithMinter(hf.MinterFunc(func(_ *http.Request, req hf.TokenRequest) (string, int64, error) {
 			if req.Permission != auth.Read {
@@ -165,7 +150,7 @@ func build(cfg Config) (*Gateway, error) {
 			}
 			return issuer.Sign(auth.Grant{Permission: auth.Read, File: req.File})
 		})),
-		hf.WithNext(proxy),
+		hf.WithNext(hf.NewUpstreamProxy(provider)),
 	)
 	var authorizer auth.Authorizer
 	if cfg.SigningKey != "" {

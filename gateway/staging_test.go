@@ -61,7 +61,7 @@ func (s *seed) serve(w http.ResponseWriter, r *http.Request) {
 	var req apis.PullRequest
 	_ = json.Unmarshal(body, &req)
 	hash, _ := xet.ParseXorbHash(req.Hash)
-	ok, _ := s.st.Storage.HasXorb(r.Context(), "", hash)
+	ok, _ := s.st.Storage.HasXorb(r.Context(), hash)
 	_, serr := s.st.readSidecar(hash)
 	s.mu.Lock()
 	s.pulls = append(s.pulls, pull{r.Header.Get("Authorization"), r.Header.Get("Content-Type"), string(body), ok && serr == nil})
@@ -143,7 +143,7 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 
 func hasLocal(t *testing.T, st *store, hash xet.XorbHash) bool {
 	t.Helper()
-	ok, err := st.Storage.HasXorb(context.Background(), "", hash)
+	ok, err := st.Storage.HasXorb(context.Background(), hash)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -159,19 +159,19 @@ func TestPutSeedsReplicasOnce(t *testing.T) {
 	}
 	m := newTestStaging(t, st, stagingConfig{secret: "tok"})
 	ctx := context.Background()
-	if _, err := st.PutXorb(ctx, "", x.hash, bytes.NewReader(x.body)); err != nil {
+	if _, err := st.PutXorb(ctx, x.hash, bytes.NewReader(x.body)); err != nil {
 		t.Fatal(err)
 	}
 	selected := reg.seeds(x.hash.String(), 2)
 	for _, p := range selected {
 		waitFor(t, "pull at "+p.ID, func() bool { return len(seeds[p.ID].requests()) == 1 })
 	}
-	if inserted, err := st.PutXorb(ctx, "default", x.hash, bytes.NewReader(x.body)); err != nil || inserted {
+	if inserted, err := st.PutXorb(ctx, x.hash, bytes.NewReader(x.body)); err != nil || inserted {
 		t.Fatalf("dedup PutXorb = %v, %v", inserted, err)
 	}
 	m.kick()
 	time.Sleep(30 * time.Millisecond)
-	want, _ := json.Marshal(apis.PullRequest{Namespace: "default", Hash: x.hash.String()})
+	want, _ := json.Marshal(apis.PullRequest{Hash: x.hash.String()})
 	for id, s := range seeds {
 		reqs := s.requests()
 		if !slices.ContainsFunc(selected, func(p apis.Peer) bool { return p.ID == id }) {
@@ -191,10 +191,10 @@ func TestPutSeedsReplicasOnce(t *testing.T) {
 		t.Fatalf("usage = %d, want %d", got, len(x.body))
 	}
 	// Bytes re-inserted after an out-of-band delete are a new copy: counted once and seeded again.
-	if err := st.DeleteXorb(ctx, "", x.hash); err != nil {
+	if err := st.DeleteXorb(ctx, x.hash); err != nil {
 		t.Fatal(err)
 	}
-	if inserted, err := st.PutXorb(ctx, "", x.hash, bytes.NewReader(x.body)); err != nil || !inserted {
+	if inserted, err := st.PutXorb(ctx, x.hash, bytes.NewReader(x.body)); err != nil || !inserted {
 		t.Fatalf("PutXorb after delete = %v, %v, want inserted", inserted, err)
 	}
 	if got := m.snapshot(); got != int64(len(x.body)) {
@@ -214,7 +214,7 @@ func TestAcceptedIsNotAHolding(t *testing.T) {
 			s1, s2 := newSeed(t, st, "s1"), newSeed(t, st, "s2")
 			m := newTestStaging(t, st, stagingConfig{cacheSize: 1, minSeeds: minSeeds})
 			ctx := context.Background()
-			if _, err := st.PutXorb(ctx, "default", x.hash, bytes.NewReader(x.body)); err != nil {
+			if _, err := st.PutXorb(ctx, x.hash, bytes.NewReader(x.body)); err != nil {
 				t.Fatal(err)
 			}
 			for _, s := range []*seed{s1, s2} {
@@ -246,7 +246,7 @@ func TestAcceptedIsNotAHolding(t *testing.T) {
 			if _, err := st.readSidecar(x.hash); err != nil {
 				t.Fatalf("sidecar must survive eviction: %v", err)
 			}
-			if start, end, err := st.GetXorbDataRange(ctx, "default", x.hash, 0, 2); err != nil || end <= start {
+			if start, end, err := st.GetXorbDataRange(ctx, x.hash, 0, 2); err != nil || end <= start {
 				t.Fatalf("GetXorbDataRange after eviction = %d, %d, %v", start, end, err)
 			}
 		})
@@ -257,7 +257,7 @@ func TestNoPeersRetainsUntilRegistered(t *testing.T) {
 	x := makeXorb(t, 23, 2, 4<<10)
 	st, _ := newTestStore(t, t.TempDir())
 	m := newTestStaging(t, st, stagingConfig{cacheSize: 1})
-	if _, err := st.PutXorb(context.Background(), "default", x.hash, bytes.NewReader(x.body)); err != nil {
+	if _, err := st.PutXorb(context.Background(), x.hash, bytes.NewReader(x.body)); err != nil {
 		t.Fatal(err)
 	}
 	time.Sleep(30 * time.Millisecond)
@@ -282,7 +282,7 @@ func TestFailedPullRetriesAfterBackoff(t *testing.T) {
 	s := newSeed(t, st, "s1")
 	s.answer(http.StatusInternalServerError, "")
 	newTestStaging(t, st, stagingConfig{secret: "tok", retry: 150 * time.Millisecond, tick: 5 * time.Millisecond})
-	if _, err := st.PutXorb(context.Background(), "default", x.hash, bytes.NewReader(x.body)); err != nil {
+	if _, err := st.PutXorb(context.Background(), x.hash, bytes.NewReader(x.body)); err != nil {
 		t.Fatal(err)
 	}
 	waitFor(t, "first pull", func() bool { return len(s.requests()) == 1 })
@@ -316,16 +316,16 @@ func TestEvictionIsLRU(t *testing.T) {
 				first, second = b, a
 			}
 			for _, x := range []*fixture{first, second} {
-				if _, err := st.PutXorb(ctx, "default", x.hash, bytes.NewReader(x.body)); err != nil {
+				if _, err := st.PutXorb(ctx, x.hash, bytes.NewReader(x.body)); err != nil {
 					t.Fatal(err)
 				}
 			}
 			var rd io.Closer
 			var err error
 			if rangeRead {
-				rd, err = st.GetXorbRangeReadCloser(ctx, "default", first.hash, 0, 15)
+				rd, err = st.GetXorbRangeReadCloser(ctx, first.hash, 0, 15)
 			} else {
-				rd, err = st.GetXorbReadSeekCloser(ctx, "default", first.hash)
+				rd, err = st.GetXorbReadSeekCloser(ctx, first.hash)
 			}
 			if err != nil {
 				t.Fatal(err)
@@ -355,7 +355,7 @@ func TestPinnedXorbEvictedAfterUnpin(t *testing.T) {
 	s := newSeed(t, st, "s1")
 	m := newTestStaging(t, st, stagingConfig{cacheSize: 1})
 	st.pin(x.hash)
-	if _, err := st.PutXorb(context.Background(), "default", x.hash, bytes.NewReader(x.body)); err != nil {
+	if _, err := st.PutXorb(context.Background(), x.hash, bytes.NewReader(x.body)); err != nil {
 		t.Fatal(err)
 	}
 	s.holds(x.hash)
@@ -378,7 +378,7 @@ func TestRestartScansExistingObjects(t *testing.T) {
 	m := newTestStaging(t, st, stagingConfig{})
 	ctx := context.Background()
 	for _, x := range []*fixture{a, b} {
-		if _, err := st.PutXorb(ctx, "default", x.hash, bytes.NewReader(x.body)); err != nil {
+		if _, err := st.PutXorb(ctx, x.hash, bytes.NewReader(x.body)); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -415,7 +415,7 @@ func TestCloseCancelsHungPull(t *testing.T) {
 	s.hang()
 	m := newTestStaging(t, st, stagingConfig{})
 	ctx := context.Background()
-	if _, err := st.PutXorb(ctx, "default", x.hash, bytes.NewReader(x.body)); err != nil {
+	if _, err := st.PutXorb(ctx, x.hash, bytes.NewReader(x.body)); err != nil {
 		t.Fatal(err)
 	}
 	waitFor(t, "hung pull", func() bool { return len(s.requests()) == 1 })
@@ -432,7 +432,7 @@ func TestCloseCancelsHungPull(t *testing.T) {
 	waitFor(t, "seed to see the cancellation", func() bool { return s.cancellations() == 1 })
 	s2 := newSeed(t, st, "s2")
 	m.kick()
-	if _, err := st.PutXorb(ctx, "default", y.hash, bytes.NewReader(y.body)); err != nil {
+	if _, err := st.PutXorb(ctx, y.hash, bytes.NewReader(y.body)); err != nil {
 		t.Fatal(err)
 	}
 	time.Sleep(30 * time.Millisecond)

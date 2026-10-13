@@ -1,25 +1,26 @@
 package peer
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math/rand/v2"
 	"mime"
 	"mime/multipart"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"runtime"
 	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"testing"
 	"time"
 
@@ -573,7 +574,7 @@ func TestGatedFillServesPrefixBeforeUpstreamCompletes(t *testing.T) {
 	if err != nil || resp.StatusCode != http.StatusOK || !bytes.Equal(got, body) || resp.ContentLength != int64(len(body)) {
 		t.Fatalf("whole GET = %d, %d bytes, length %d, %v", resp.StatusCode, len(got), resp.ContentLength, err)
 	}
-	waitFor(t, "commit", func() bool { return hasXorb(t, p, hash) })
+	settled(t, p)
 	resp, got, _ = do(t, http.MethodGet, u, apis.PeerHeader, "gw")
 	if resp.StatusCode != http.StatusOK || !bytes.Equal(got, body) {
 		t.Fatalf("relay GET after commit = %d", resp.StatusCode)
@@ -586,6 +587,58 @@ func TestGatedFillServesPrefixBeforeUpstreamCompletes(t *testing.T) {
 		t.Fatalf("upstream request headers = %v", h)
 	}
 	waitFor(t, "spool cleanup", spoolEmpty(p))
+}
+
+// Readers are not held back for validation: a mismatching body reaches the client as a clean 200, only the pull fails.
+func TestStreamDoesNotWaitForValidation(t *testing.T) {
+	hash, _ := makeXorb(t, 13, 4, 16<<10)
+	_, served := makeXorb(t, 14, 4, 16<<10)
+	release := make(chan struct{})
+	g := newGateway(t, gatedBody(served, 4<<10, release))
+	p, srv := newTestPeer(t, g.URL, nil)
+	u := xorbURL(srv, hash)
+
+	resp, err := http.Get(u)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	// The client is streaming before the pull can fail validation.
+	close(release)
+	got, err := io.ReadAll(resp.Body)
+	if err != nil || resp.StatusCode != http.StatusOK || !bytes.Equal(got, served) {
+		t.Fatalf("stream of a body failing validation = %d, %d of %d bytes, %v, want 200 with every byte", resp.StatusCode, len(got), len(served), err)
+	}
+	waitFor(t, "spool cleanup", spoolEmpty(p))
+	if hasXorb(t, p, hash) {
+		t.Fatal("xorb failing validation published")
+	}
+	p.mu.Lock()
+	_, cooling := p.cooldown[hash]
+	p.mu.Unlock()
+	if !cooling {
+		t.Fatal("failed pull left no cooldown")
+	}
+	if resp, _, _ := do(t, http.MethodGet, u); resp.StatusCode != http.StatusBadGateway || g.gets.Load() != 1 {
+		t.Fatalf("GET in cooldown = %d, gateway GETs = %d, want 502 and 1", resp.StatusCode, g.gets.Load())
+	}
+	pr, err := http.Post(srv.URL+apis.PullPath, "application/json", strings.NewReader(`{"hash":"`+hash.String()+`"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = pr.Body.Close()
+	if pr.StatusCode != http.StatusAccepted {
+		t.Fatalf("pull in cooldown = %d, want 202", pr.StatusCode)
+	}
+	waitFor(t, "forced pull exit", func() bool {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		return len(p.pulls) == 0
+	})
+	waitFor(t, "spool cleanup", spoolEmpty(p))
+	if n := g.gets.Load(); n != 2 {
+		t.Fatalf("gateway GETs after the forced pull = %d, want 2", n)
+	}
 }
 
 func TestConcurrentColdRequestsShareOneFill(t *testing.T) {
@@ -670,19 +723,56 @@ func TestUpstreamFailures(t *testing.T) {
 		if resp, _, _ := do(t, http.MethodGet, xorbURL(srv, hash)); resp.StatusCode != http.StatusBadGateway {
 			t.Fatalf("GET = %d", resp.StatusCode)
 		}
+		if n := g.gets.Load(); n != 1 {
+			t.Fatalf("gateway GETs = %d, want 1", n)
+		}
+	})
+	t.Run("empty body", func(t *testing.T) {
+		g := newGateway(t, serveBody(nil))
+		p, srv := newTestPeer(t, g.URL, nil)
+		if resp, _, _ := do(t, http.MethodGet, xorbURL(srv, hash)); resp.StatusCode == http.StatusOK {
+			t.Fatal("empty body served as 200")
+		}
+		waitFor(t, "spool cleanup", spoolEmpty(p))
+		if hasXorb(t, p, hash) {
+			t.Fatal("empty xorb published")
+		}
+		p.mu.Lock()
+		err := p.cooldown[hash].err
+		p.mu.Unlock()
+		if !errors.Is(err, errEmpty) {
+			t.Fatalf("cooldown error = %v, want %v", err, errEmpty)
+		}
+	})
+	t.Run("empty chunked body", func(t *testing.T) {
+		g := newGateway(t, func(w http.ResponseWriter, _ *http.Request) {
+			// An early flush commits to chunked encoding, so the peer sees no Content-Length.
+			w.(http.Flusher).Flush()
+		})
+		p, srv := newTestPeer(t, g.URL, nil)
+		if resp, _, _ := do(t, http.MethodGet, xorbURL(srv, hash)); resp.StatusCode == http.StatusOK {
+			t.Fatal("empty chunked body served as 200")
+		}
+		waitFor(t, "spool cleanup", spoolEmpty(p))
+		if hasXorb(t, p, hash) {
+			t.Fatal("empty xorb published")
+		}
+		p.mu.Lock()
+		err := p.cooldown[hash].err
+		p.mu.Unlock()
+		if !errors.Is(err, errEmpty) {
+			t.Fatalf("cooldown error = %v, want %v", err, errEmpty)
+		}
 	})
 	t.Run("hash mismatch", func(t *testing.T) {
 		g := newGateway(t, serveBody(body))
 		p, srv := newTestPeer(t, g.URL, nil)
 		u := xorbURL(srv, other)
-		resp, got, err := do(t, http.MethodGet, u)
-		if resp.StatusCode == http.StatusOK && err == nil {
-			t.Fatalf("invalid body served as a clean %d bytes", len(got))
-		}
+		_, _, _ = do(t, http.MethodGet, u)
+		waitFor(t, "spool cleanup", spoolEmpty(p))
 		if hasXorb(t, p, other) {
 			t.Fatal("invalid xorb published")
 		}
-		waitFor(t, "spool cleanup", spoolEmpty(p))
 		if resp, _, _ := do(t, http.MethodGet, u); resp.StatusCode != http.StatusBadGateway {
 			t.Fatalf("GET in cooldown = %d", resp.StatusCode)
 		}
@@ -694,19 +784,35 @@ func TestUpstreamFailures(t *testing.T) {
 		}
 	})
 	t.Run("short body", func(t *testing.T) {
-		g := newGateway(t, func(w http.ResponseWriter, _ *http.Request) {
+		release := make(chan struct{})
+		g := newGateway(t, func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Length", strconv.Itoa(len(body)))
-			_, _ = w.Write(body[:len(body)-100])
+			_, _ = w.Write(body[:4<<10])
+			w.(http.Flusher).Flush()
+			select {
+			case <-release:
+			case <-r.Context().Done():
+			}
 		})
 		p, srv := newTestPeer(t, g.URL, nil)
-		resp, got, err := do(t, http.MethodGet, xorbURL(srv, hash))
-		if resp.StatusCode == http.StatusOK && err == nil {
-			t.Fatalf("short body served as a clean %d bytes", len(got))
+		u := xorbURL(srv, hash)
+		resp, err := http.Get(u)
+		if err != nil {
+			t.Fatal(err)
 		}
+		defer func() { _ = resp.Body.Close() }()
+		// The upstream ends short only once this client is streaming.
+		close(release)
+		if got, err := io.ReadAll(resp.Body); err == nil {
+			t.Fatalf("short body ended cleanly = %d, %d bytes, want a read error", resp.StatusCode, len(got))
+		}
+		waitFor(t, "spool cleanup", spoolEmpty(p))
 		if hasXorb(t, p, hash) {
 			t.Fatal("short xorb published")
 		}
-		waitFor(t, "spool cleanup", spoolEmpty(p))
+		if resp, _, _ := do(t, http.MethodGet, u); resp.StatusCode != http.StatusBadGateway || g.gets.Load() != 1 {
+			t.Fatalf("GET in cooldown = %d, gateway GETs = %d, want 502 and 1", resp.StatusCode, g.gets.Load())
+		}
 	})
 }
 
@@ -766,7 +872,7 @@ func TestPullAndLocalOnlyRelay(t *testing.T) {
 	if err != nil || resp.StatusCode != http.StatusOK || !bytes.Equal(got, body) {
 		t.Fatalf("public GET sharing the pull fill = %d, %d bytes, %v", resp.StatusCode, len(got), err)
 	}
-	waitFor(t, "commit", func() bool { return hasXorb(t, p, hash) })
+	settled(t, p)
 	if resp, _, _ := do(t, http.MethodGet, u, apis.PeerHeader, "gw"); resp.StatusCode != http.StatusOK {
 		t.Fatalf("relay hit = %d", resp.StatusCode)
 	}
@@ -846,8 +952,9 @@ func TestAcquireAfterCommitReportsReady(t *testing.T) {
 	waitFor(t, "fill exit", func() bool {
 		p.mu.Lock()
 		defer p.mu.Unlock()
-		return len(p.fills) == 0
+		return len(p.pulls) == 0
 	})
+	waitFor(t, "spool cleanup", spoolEmpty(p))
 	// A handler that missed the store before that commit now takes its fill decision.
 	f, rd, err := p.acquire(hash, false)
 	if err != nil {
@@ -880,11 +987,17 @@ func TestDeduplicatedSpoolStillValidates(t *testing.T) {
 	// A valid copy is committed underneath the running fill, so its PutXorb deduplicates.
 	commitDirect(t, p, hash, body)
 	close(release)
-	r := <-late
-	if r.err == nil && r.resp.StatusCode == http.StatusOK {
-		t.Fatalf("corrupt spool served as a clean %d bytes, matches body: %v", len(r.body), bytes.Equal(r.body, body))
-	}
+	<-late
 	waitFor(t, "spool cleanup", spoolEmpty(p))
+	p.mu.Lock()
+	_, cooling := p.cooldown[hash]
+	p.mu.Unlock()
+	if !cooling {
+		t.Fatal("corrupt pull passed on the deduplicated copy: no cooldown")
+	}
+	if !hasXorb(t, p, hash) {
+		t.Fatal("failed pull removed the committed copy")
+	}
 	resp, got, err := do(t, http.MethodGet, u)
 	if err != nil || resp.StatusCode != http.StatusOK || !bytes.Equal(got, body) {
 		t.Fatalf("committed xorb after the failed fill = %d, %d bytes, %v", resp.StatusCode, len(got), err)
@@ -894,63 +1007,41 @@ func TestDeduplicatedSpoolStillValidates(t *testing.T) {
 	}
 }
 
-// deadClient is a ResponseWriter whose connection breaks after writes successful writes.
-type deadClient struct {
-	hdr    http.Header
-	code   int
-	writes int
-}
-
-func (d *deadClient) Header() http.Header  { return d.hdr }
-func (d *deadClient) WriteHeader(code int) { d.code = code }
-func (d *deadClient) Write(p []byte) (int, error) {
-	if d.writes == 0 {
-		return 0, syscall.EPIPE
-	}
-	d.writes--
-	return len(p), nil
-}
-
-// blockedReaders counts goroutines parked inside spoolReader.Read.
-func blockedReaders() int {
-	buf := make([]byte, 1<<20)
-	n := 0
-	for g := range strings.SplitSeq(string(buf[:runtime.Stack(buf, true)]), "\n\n") {
-		if strings.Contains(g, "[select]") && strings.Contains(g, "(*spoolReader).Read(") {
-			n++
-		}
-	}
-	return n
-}
-
-func TestDeadClientMultipartReleasesReaderAndKeepsFill(t *testing.T) {
+func TestDeadClientReleasesReaderAndKeepsPull(t *testing.T) {
 	hash, body := makeXorb(t, 11, 4, 16<<10)
 	release := make(chan struct{})
 	const prefix = 4 << 10
 	g := newGateway(t, gatedBody(body, prefix, release))
 	p, srv := newTestPeer(t, g.URL, nil)
-	req := httptest.NewRequest(http.MethodGet, "/v1/xorbs/default/"+hash.String(), nil)
-	req.Header.Set("Range", fmt.Sprintf("bytes=0-1,%d-%d", prefix, prefix))
-	// The connection breaks on the second part boundary while that part is blocked on upstream.
-	w := &deadClient{hdr: http.Header{}, writes: 2}
-	func() {
-		defer func() {
-			if r := recover(); r != nil && r != http.ErrAbortHandler {
-				panic(r)
-			}
-		}()
-		p.ServeHTTP(w, req)
-	}()
-	if w.code != http.StatusPartialContent {
-		t.Fatalf("status = %d", w.code)
+	conn, err := net.Dial("tcp", srv.Listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
 	}
-	settle := time.Now().Add(200 * time.Millisecond)
-	for time.Now().Before(settle) {
-		if n := blockedReaders(); n != 0 {
-			t.Fatalf("%d multipart reader(s) still blocked after the handler returned", n)
-		}
-		time.Sleep(5 * time.Millisecond)
+	req, err := http.NewRequest(http.MethodGet, xorbURL(srv, hash), nil)
+	if err != nil {
+		t.Fatal(err)
 	}
+	// The first part is long enough to flush the headers; the second blocks on upstream.
+	req.Header.Set("Range", fmt.Sprintf("bytes=0-1023,%d-%d", prefix, prefix))
+	if err := req.Write(conn); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.ReadResponse(bufio.NewReader(conn), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.mu.Lock()
+	held := p.pulls[hash] != nil && p.pulls[hash].refs == 2
+	p.mu.Unlock()
+	if resp.StatusCode != http.StatusPartialContent || !held {
+		t.Fatalf("multi range = %d, streaming client holds a pull reference %v, want 206 and true", resp.StatusCode, held)
+	}
+	_ = conn.Close()
+	waitFor(t, "dead client release", func() bool {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		return p.pulls[hash] != nil && p.pulls[hash].refs == 1
+	})
 	close(release)
 	waitFor(t, "commit", func() bool { return hasXorb(t, p, hash) })
 	waitFor(t, "spool cleanup", spoolEmpty(p))

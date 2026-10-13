@@ -50,7 +50,7 @@ func settled(t *testing.T, p *Peer) {
 				return false
 			}
 		}
-		return len(p.fills) == 0
+		return len(p.pulls) == 0
 	})
 }
 
@@ -628,7 +628,12 @@ func TestLRUProtectsActiveReadersAndConvergesOnRelease(t *testing.T) {
 	// a is read from the store, b streams from its fill; both readers are held mid-body.
 	wa, doneA := serveHeld(t, p, a)
 	wb, doneB := serveHeld(t, p, b)
-	waitFor(t, "b commit", func() bool { return hasXorb(t, p, b) })
+	// The pull leaves p.pulls under the lock that admits b; the store file lands earlier.
+	waitFor(t, "b commit", func() bool {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		return p.pulls[b] == nil
+	})
 	if !hasXorb(t, p, a) || usage(p) != int64(len(bodyA)+len(bodyB)) {
 		t.Fatal("object with an active reader was evicted")
 	}

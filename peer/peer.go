@@ -102,8 +102,8 @@ type Peer struct {
 	sem    chan struct{} // bounds parallel upstream fills
 	once   sync.Once
 
-	mu       sync.Mutex // guards fills, cooldown, the inventory and cancel-vs-acquire
-	fills    map[xet.XorbHash]*fill
+	mu       sync.Mutex // guards pulls, cooldown, the inventory and cancel-vs-acquire
+	pulls    map[xet.XorbHash]*pull
 	cooldown map[xet.XorbHash]cooled
 	index    map[xet.XorbHash]*list.Element // committed xorbs, element value *ready
 	lru      *list.List                     // front is least recently used
@@ -148,7 +148,7 @@ func New(cfg Config) (*Peer, error) {
 		ctx:      ctx,
 		cancel:   cancel,
 		sem:      make(chan struct{}, cfg.MaxFills),
-		fills:    map[xet.XorbHash]*fill{},
+		pulls:    map[xet.XorbHash]*pull{},
 		cooldown: map[xet.XorbHash]cooled{},
 		index:    map[xet.XorbHash]*list.Element{},
 		lru:      list.New(),
@@ -202,7 +202,7 @@ func (p *Peer) serveStored(w http.ResponseWriter, r *http.Request, rd *ready) er
 	return nil
 }
 
-// serveXorb serves a committed xorb or streams it from a fill; requests carrying apis.PeerHeader are relays and never fill.
+// serveXorb serves a committed xorb or streams it from a pull; requests carrying apis.PeerHeader are relays and never pull.
 func (p *Peer) serveXorb(w http.ResponseWriter, r *http.Request) {
 	hash, err := xet.ParseXorbHash(r.PathValue("hash"))
 	if err != nil {
@@ -235,19 +235,21 @@ func (p *Peer) serveXorb(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer f.release()
-	s, err := f.wait(r.Context())
+	stream, size, err := f.wait(r.Context())
 	if err != nil {
 		http.Error(w, err.Error(), statusOf(err))
 		return
 	}
-	rd := s.reader(r.Context())
-	defer func() {
-		// Headers are out, so a failed body must tear the connection down instead of ending cleanly.
-		if rd.Close() != nil {
-			panic(http.ErrAbortHandler)
-		}
-	}()
-	serveContent(w, r, hash, rd)
+	rs, err := stream.NewReadSeeker(0, int(size))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer func() { _ = rs.Close() }()
+	// Reads block on the upstream regardless of the client; closing wakes them.
+	stop := context.AfterFunc(r.Context(), func() { _ = rs.Close() })
+	defer stop()
+	serveContent(w, r, hash, rs)
 }
 
 // servePull starts (or joins) a fill on behalf of the gateway and answers 202 at once.

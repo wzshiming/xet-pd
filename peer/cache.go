@@ -17,7 +17,7 @@ type ready struct {
 	hash xet.XorbHash
 	size int64
 	pins int   // open readers of the stored file
-	fill *fill // readers still streaming from the spool hold fill.refs
+	pull *pull // readers still streaming from the spool hold pull.refs
 }
 
 // scan indexes the committed xorbs oldest first, deleting any that fail validation.
@@ -65,15 +65,15 @@ func (p *Peer) validateStored(ctx context.Context, hash xet.XorbHash) error {
 }
 
 // admit records a committed xorb as most recently used and trims the cache; caller holds p.mu.
-func (p *Peer) admit(hash xet.XorbHash, size int64, f *fill) {
+func (p *Peer) admit(hash xet.XorbHash, size int64, f *pull) {
 	if e := p.index[hash]; e != nil {
 		if f != nil {
-			e.Value.(*ready).fill = f
+			e.Value.(*ready).pull = f
 		}
 		p.lru.MoveToBack(e)
 		return
 	}
-	p.index[hash] = p.lru.PushBack(&ready{hash: hash, size: size, fill: f})
+	p.index[hash] = p.lru.PushBack(&ready{hash: hash, size: size, pull: f})
 	p.usage += size
 	p.notify()
 	p.evict()
@@ -84,7 +84,7 @@ func (p *Peer) evict() {
 	for e := p.lru.Front(); e != nil && p.cfg.CacheSize > 0 && p.usage > p.cfg.CacheSize; {
 		next := e.Next()
 		r := e.Value.(*ready)
-		if r.pins == 0 && (r.fill == nil || r.fill.refs == 0) {
+		if r.pins == 0 && (r.pull == nil || r.pull.refs == 0) {
 			if err := p.store.DeleteXorb(context.Background(), r.hash); err != nil {
 				slog.Warn("peer: evict", "hash", r.hash, "err", err)
 			} else {

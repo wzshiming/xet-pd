@@ -1,4 +1,5 @@
-# Local test cluster: one gateway, two seed peers and an optional in-network verifier (profile "verify").
+# Local test cluster: one gateway and two seed peers.
+# Peers advertise their service names, so hub clients join this network and use HF_ENDPOINT=http://gateway:8080.
 name: xet-pd-cluster
 
 x-app: &app
@@ -85,25 +86,6 @@ services:
     healthcheck:
       <<: *healthcheck
       test: [CMD, wget, -q, -O-, "http://127.0.0.1:8081/healthz"]
-
-  verify:
-    profiles: [verify]
-    build:
-      context: .
-      target: verify
-    image: xet-pd-verify:local
-    depends_on:
-      gateway:
-        condition: service_healthy
-      peer-1:
-        condition: service_healthy
-      peer-2:
-        condition: service_healthy
-    environment:
-      HF_ENDPOINT: http://gateway:8080
-    read_only: true
-    tmpfs:
-      - /tmp
 
 volumes:
   gateway-data:

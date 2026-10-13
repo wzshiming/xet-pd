@@ -116,7 +116,8 @@ func TestAnnounceRejectsInvalidRequestsAtomically(t *testing.T) {
 
 // A body padded with whitespace to the limit is accepted; one byte more is 413 whether the overflow surfaces on the value or on the trailing check.
 func TestAnnounceBodyLimit(t *testing.T) {
-	g, srv := newTestGateway(t, hubtest.New(t), nil)
+	// The 32 MiB posts can outlast the default TTL under -race load.
+	g, srv := newTestGateway(t, hubtest.New(t), func(cfg *Config, _ string) { cfg.PeerTTL = time.Hour })
 	pad := func(req apis.AnnounceRequest, n int) string {
 		body := announceJSON(t, req)
 		return body + strings.Repeat(" ", n-len(body))

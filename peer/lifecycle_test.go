@@ -742,7 +742,8 @@ func TestCloseCancelsHungAnnounceAndPull(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("gateway never saw the announce canceled")
 	}
-	if r := <-late; r.err == nil {
+	// Close may cancel the pull before the gateway's headers arrive; the reader then gets a complete 502.
+	if r := <-late; r.err == nil && r.resp.StatusCode == http.StatusOK {
 		t.Fatal("reader completed after Close")
 	}
 	if hasXorb(t, p, hash) {

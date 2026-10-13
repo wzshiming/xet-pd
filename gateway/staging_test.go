@@ -231,7 +231,7 @@ func TestAcceptedIsNotAHolding(t *testing.T) {
 				s2.holds(x.hash)
 				m.kick()
 			}
-			clustertest.WaitFor(t, waitTimeout, "eviction", func() bool { return !hasLocal(t, st, x.hash) })
+			clustertest.WaitFor(t, waitTimeout, "eviction", func() bool { return !hasLocal(t, st, x.hash) && m.snapshot() == 0 })
 			if got := m.snapshot(); got != 0 {
 				t.Fatalf("usage after eviction = %d, want 0", got)
 			}
@@ -329,7 +329,9 @@ func TestEvictionIsLRU(t *testing.T) {
 			}
 			s.holds(a.hash, b.hash)
 			m.kick()
-			clustertest.WaitFor(t, waitTimeout, "eviction of the untouched copy", func() bool { return !hasLocal(t, st, second.hash) })
+			clustertest.WaitFor(t, waitTimeout, "eviction of the untouched copy", func() bool {
+				return !hasLocal(t, st, second.hash) && m.snapshot() == int64(len(first.body))
+			})
 			if !hasLocal(t, st, first.hash) {
 				t.Fatal("recently read copy evicted")
 			}
@@ -357,7 +359,7 @@ func TestPinnedXorbEvictedAfterUnpin(t *testing.T) {
 		t.Fatal("pinned xorb evicted")
 	}
 	st.unpin(x.hash)
-	clustertest.WaitFor(t, waitTimeout, "eviction after unpin", func() bool { return !hasLocal(t, st, x.hash) })
+	clustertest.WaitFor(t, waitTimeout, "eviction after unpin", func() bool { return !hasLocal(t, st, x.hash) && m.snapshot() == 0 })
 	if got := m.snapshot(); got != 0 {
 		t.Fatalf("usage = %d, want 0", got)
 	}
@@ -391,7 +393,9 @@ func TestRestartScansExistingObjects(t *testing.T) {
 	clustertest.WaitFor(t, waitTimeout, "pulls at the late seed", func() bool { return len(s2.requests()) == 2 })
 	s1.holds(a.hash, b.hash)
 	m.kick()
-	clustertest.WaitFor(t, waitTimeout, "eviction of the oldest copy", func() bool { return !hasLocal(t, st, a.hash) })
+	clustertest.WaitFor(t, waitTimeout, "eviction of the oldest copy", func() bool {
+		return !hasLocal(t, st, a.hash) && m.snapshot() == int64(len(b.body))
+	})
 	if !hasLocal(t, st, b.hash) {
 		t.Fatal("newer copy evicted before the older one")
 	}

@@ -189,31 +189,6 @@ func TestConfigValidation(t *testing.T) {
 	}
 }
 
-func TestOrigin(t *testing.T) {
-	good := map[string]string{
-		"http://h":             "http://h",
-		"https://h:65535/":     "https://h:65535",
-		"http://127.0.0.1:1":   "http://127.0.0.1:1",
-		"http://[::1]":         "http://[::1]",
-		"http://[::1]:8080":    "http://[::1]:8080",
-		"http://gw.test:08080": "http://gw.test:08080",
-	}
-	for raw, want := range good {
-		if got, err := origin(raw); err != nil || got != want {
-			t.Errorf("origin(%q) = %q, %v, want %q", raw, got, err, want)
-		}
-	}
-	bad := []string{"", "h", "//h", "ftp://h", "http:h", "http://", "http://:1", "http://[]:1", "http://h:", "http://[::1]:", "http://h:0", "http://h:65536", "http://h:1x", "http://h/p", "http://h?q", "http://h#f", "http://bob:hunter2@h", "http://bob:hunter2@h/%zz", "hunter2://h"}
-	for _, raw := range bad {
-		got, err := origin(raw)
-		if err == nil {
-			t.Errorf("origin(%q) = %q, want error", raw, got)
-		} else if strings.Contains(err.Error(), "hunter2") || strings.Contains(err.Error(), "@") {
-			t.Errorf("origin(%q) error echoes the input: %v", raw, err)
-		}
-	}
-}
-
 func TestControlRoutes(t *testing.T) {
 	hub := hubtest.New(t)
 	_, srv := newTestGateway(t, hub, nil)

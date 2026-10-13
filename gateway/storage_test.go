@@ -529,7 +529,7 @@ func TestMalformedSidecarIsRejected(t *testing.T) {
 	for i := range long {
 		long[i] = uint64(i+1) * 8
 	}
-	bad := [][]uint64{{16, 8}, {4}, long, {math.MaxUint64}, {math.MaxUint64 - 3, 4}, {maxPackedBytes + 1}, {8, maxPackedBytes + 1}}
+	bad := [][]uint64{{16, 8}, {4}, long, {math.MaxUint64}, {math.MaxUint64 - 3, 4}, {apis.MaxXorbBytes + 1}, {8, apis.MaxXorbBytes + 1}}
 	for _, offsets := range bad {
 		if err := st.writeSidecar(x.hash, offsets); err != nil {
 			t.Fatal(err)
@@ -550,7 +550,7 @@ func TestMalformedSidecarIsRejected(t *testing.T) {
 			t.Errorf("GetXorbChunkOffsets with sidecar %.12q = %v, want decode error", raw, err)
 		}
 	}
-	accepted := map[string][]uint64{"[]": {}, "null": nil, "[8]": {8}, "[8]" + strings.Repeat(" ", maxSidecarBytes-3): {8}, fmt.Sprintf("[%d]", maxPackedBytes): {maxPackedBytes}}
+	accepted := map[string][]uint64{"[]": {}, "null": nil, "[8]": {8}, "[8]" + strings.Repeat(" ", maxSidecarBytes-3): {8}, fmt.Sprintf("[%d]", apis.MaxXorbBytes): {apis.MaxXorbBytes}}
 	for raw, want := range accepted {
 		if err := os.WriteFile(st.sidecar(x.hash), []byte(raw), 0o644); err != nil {
 			t.Fatal(err)

@@ -1,17 +1,15 @@
 package gateway
 
 import (
-	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 
 	"github.com/wzshiming/xet"
-	"github.com/wzshiming/xet/auth"
 
 	"github.com/wzshiming/xet-pd/apis"
+	"github.com/wzshiming/xet-pd/internal/control"
 )
 
 // maxAnnounceBytes bounds one announce body, a Full inventory of about 500k xorbs.
@@ -19,33 +17,15 @@ const maxAnnounceBytes = 32 << 20
 
 // serveAnnounce registers a peer inventory; the registry changes only once the whole request validated.
 func (g *Gateway) serveAnnounce(w http.ResponseWriter, r *http.Request) {
-	if g.secret != "" {
-		tok, ok := auth.BearerToken(r)
-		if !ok || subtle.ConstantTimeCompare([]byte(tok), []byte(g.secret)) != 1 {
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
-			return
-		}
-	}
-	var req apis.AnnounceRequest
-	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxAnnounceBytes))
-	err := dec.Decode(&req)
-	if err == nil {
-		switch err = dec.Decode(&struct{}{}); err {
-		case io.EOF:
-			err = nil
-		case nil:
-			err = errors.New("trailing data")
-		}
-	}
-	if err != nil {
-		status := http.StatusBadRequest
-		if _, ok := errors.AsType[*http.MaxBytesError](err); ok { // the limit may hit while draining trailing whitespace
-			status = http.StatusRequestEntityTooLarge
-		}
-		http.Error(w, err.Error(), status)
+	if !control.Authorized(r, g.secret) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
-	req, err = canonical(req)
+	var req apis.AnnounceRequest
+	if !control.ReadJSON(w, r, maxAnnounceBytes, &req) {
+		return
+	}
+	req, err := canonical(req)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -76,7 +56,7 @@ func canonical(req apis.AnnounceRequest) (apis.AnnounceRequest, error) {
 	if !validID(req.Peer.ID) || !validID(req.Epoch) {
 		return req, errors.New("invalid peer id or epoch")
 	}
-	u, err := origin(req.Peer.URL)
+	u, err := control.Origin(req.Peer.URL)
 	if err != nil {
 		return req, fmt.Errorf("peer url: %w", err)
 	}

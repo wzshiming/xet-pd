@@ -366,31 +366,6 @@ func TestConfigValidation(t *testing.T) {
 	}
 }
 
-func TestNormalizeOrigin(t *testing.T) {
-	good := map[string]string{
-		"http://h":             "http://h",
-		"https://h:65535/":     "https://h:65535",
-		"http://127.0.0.1:1":   "http://127.0.0.1:1",
-		"http://[::1]":         "http://[::1]",
-		"http://[::1]:8080":    "http://[::1]:8080",
-		"http://gw.test:08080": "http://gw.test:08080",
-	}
-	for raw, want := range good {
-		if got, err := normalizeOrigin(raw); err != nil || got != want {
-			t.Errorf("normalizeOrigin(%q) = %q, %v, want %q", raw, got, err, want)
-		}
-	}
-	bad := []string{"", "h", "//h", "ftp://h", "http:h", "http://", "http://:1", "http://[]:1", "http://h:", "http://[::1]:", "http://h:0", "http://h:65536", "http://h:1x", "http://h/p", "http://h?q", "http://h#f", "http://bob:hunter2@h", "http://bob:hunter2@h/%zz", "hunter2://h"}
-	for _, raw := range bad {
-		got, err := normalizeOrigin(raw)
-		if err == nil {
-			t.Errorf("normalizeOrigin(%q) = %q, want error", raw, got)
-		} else if strings.Contains(err.Error(), "hunter2") || strings.Contains(err.Error(), "@") {
-			t.Errorf("normalizeOrigin(%q) error echoes the input: %v", raw, err)
-		}
-	}
-}
-
 func TestNewIdentityAndSpoolCleanup(t *testing.T) {
 	dir := t.TempDir()
 	stale := filepath.Join(dir, "spool", "deadbeef-123.part")
@@ -853,6 +828,9 @@ func TestPullAndLocalOnlyRelay(t *testing.T) {
 	}
 	if code := pull("Bearer s3cret", payload+`{}`); code != http.StatusBadRequest {
 		t.Fatalf("pull with trailing data = %d", code)
+	}
+	if code := pull("Bearer s3cret", payload+strings.Repeat(" ", maxPullBytes+1-len(payload))); code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("pull over the body limit = %d, want 413", code)
 	}
 	if n := g.gets.Load(); n != 0 {
 		t.Fatalf("gateway GETs before any accepted pull = %d", n)

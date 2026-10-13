@@ -8,19 +8,14 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
-	"crypto/subtle"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"io/fs"
 	"net/http"
-	"net/url"
 	"os"
 	"path/filepath"
-	"strconv"
-	"strings"
 	"sync"
 	"time"
 
@@ -28,6 +23,7 @@ import (
 	"github.com/wzshiming/xet/storage/local"
 
 	"github.com/wzshiming/xet-pd/apis"
+	"github.com/wzshiming/xet-pd/internal/control"
 )
 
 type Config struct {
@@ -43,10 +39,10 @@ type Config struct {
 
 func (c *Config) normalize() error {
 	var err error
-	if c.Advertise, err = normalizeOrigin(c.Advertise); err != nil {
+	if c.Advertise, err = control.Origin(c.Advertise); err != nil {
 		return fmt.Errorf("advertise: %w", err)
 	}
-	if c.Gateway, err = normalizeOrigin(c.Gateway); err != nil {
+	if c.Gateway, err = control.Origin(c.Gateway); err != nil {
 		return fmt.Errorf("gateway: %w", err)
 	}
 	if c.Dir == "" {
@@ -59,30 +55,6 @@ func (c *Config) normalize() error {
 	c.FillTimeout = cmp.Or(c.FillTimeout, 10*time.Minute)
 	c.Heartbeat = cmp.Or(c.Heartbeat, 10*time.Second)
 	return nil
-}
-
-// normalizeOrigin accepts an absolute http(s) origin: a host, an optional port 1..65535 ("host:" is rejected) and no userinfo, path, query or fragment.
-func normalizeOrigin(raw string) (string, error) {
-	u, err := url.Parse(raw)
-	if err != nil {
-		return "", errors.New("invalid url") // the parse error quotes raw, credentials included
-	}
-	port, err := strconv.Atoi(u.Port())
-	switch {
-	case u.Scheme != "http" && u.Scheme != "https":
-		return "", errors.New("scheme is not http(s)")
-	case u.Hostname() == "" || u.Opaque != "":
-		return "", errors.New("missing host")
-	case strings.HasSuffix(u.Host, ":"+u.Port()) && (err != nil || port < 1 || port > 65535):
-		return "", errors.New("invalid port")
-	case u.User != nil:
-		return "", errors.New("userinfo not allowed")
-	case u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || u.RawFragment != "":
-		return "", errors.New("query and fragment not allowed")
-	case u.Path != "" && u.Path != "/":
-		return "", errors.New("base path not supported")
-	}
-	return u.Scheme + "://" + u.Host, nil
 }
 
 type Peer struct {
@@ -131,9 +103,7 @@ func New(cfg Config) (*Peer, error) {
 		return nil, err
 	}
 	sum := sha256.Sum256([]byte(cfg.Advertise))
-	transport := http.DefaultTransport.(*http.Transport).Clone()
-	transport.DisableCompression = true
-	transport.ResponseHeaderTimeout = 30 * time.Second
+	transport := control.NewTransport()
 	ctx, cancel := context.WithCancel(context.Background())
 	p := &Peer{
 		cfg:      cfg,
@@ -142,7 +112,7 @@ func New(cfg Config) (*Peer, error) {
 		store:    store,
 		spoolDir: spoolDir,
 		client:   &http.Client{Transport: transport},
-		control:  &http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }},
+		control:  control.NewClient(transport),
 		mux:      http.NewServeMux(),
 		wake:     make(chan struct{}, 1),
 		ctx:      ctx,
@@ -252,23 +222,17 @@ func (p *Peer) serveXorb(w http.ResponseWriter, r *http.Request) {
 	serveContent(w, r, hash, rs)
 }
 
+// maxPullBytes bounds one pull body, which names a single xorb.
+const maxPullBytes = 4096
+
 // servePull starts (or joins) a fill on behalf of the gateway and answers 202 at once.
 func (p *Peer) servePull(w http.ResponseWriter, r *http.Request) {
-	if p.cfg.Secret != "" {
-		token, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
-		if !ok || subtle.ConstantTimeCompare([]byte(token), []byte(p.cfg.Secret)) != 1 {
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
-			return
-		}
-	}
-	var req apis.PullRequest
-	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096))
-	if err := dec.Decode(&req); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+	if !control.Authorized(r, p.cfg.Secret) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
-	if dec.Decode(&struct{}{}) != io.EOF {
-		http.Error(w, "trailing data", http.StatusBadRequest)
+	var req apis.PullRequest
+	if !control.ReadJSON(w, r, maxPullBytes, &req) {
 		return
 	}
 	hash, err := xet.ParseXorbHash(req.Hash)

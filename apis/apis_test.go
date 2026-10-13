@@ -23,6 +23,9 @@ func TestWireConstants(t *testing.T) {
 	if XorbPathPrefix != "/v1/xorbs/default/" {
 		t.Fatalf("XorbPathPrefix = %q", XorbPathPrefix)
 	}
+	if MaxXorbBytes != 128<<20 {
+		t.Fatalf("MaxXorbBytes = %d", MaxXorbBytes)
+	}
 }
 
 func TestPullRequestWire(t *testing.T) {

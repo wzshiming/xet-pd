@@ -1,18 +1,14 @@
 package peer
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
-	"errors"
 	"fmt"
-	"io"
 	"log/slog"
-	"net/http"
 	"slices"
 	"time"
 
 	"github.com/wzshiming/xet-pd/apis"
+	"github.com/wzshiming/xet-pd/internal/control"
 )
 
 const (
@@ -87,21 +83,9 @@ func (a *announcer) announce() bool {
 func (a *announcer) send(req apis.AnnounceRequest) (apis.AnnounceResponse, error) {
 	p := a.p
 	var out apis.AnnounceResponse
-	body, err := json.Marshal(req)
-	if err != nil {
-		return out, err
-	}
 	ctx, cancel := context.WithTimeout(p.ctx, announceTimeout)
 	defer cancel()
-	hreq, err := http.NewRequestWithContext(ctx, http.MethodPost, p.cfg.Gateway+apis.AnnouncePath, bytes.NewReader(body))
-	if err != nil {
-		return out, err
-	}
-	hreq.Header.Set("Content-Type", "application/json")
-	if p.cfg.Secret != "" {
-		hreq.Header.Set("Authorization", "Bearer "+p.cfg.Secret)
-	}
-	resp, err := p.control.Do(hreq)
+	resp, err := control.PostJSON(ctx, p.control, p.cfg.Gateway+apis.AnnouncePath, p.cfg.Secret, req)
 	if err != nil {
 		return out, err
 	}
@@ -109,19 +93,8 @@ func (a *announcer) send(req apis.AnnounceRequest) (apis.AnnounceResponse, error
 	if resp.StatusCode/100 != 2 {
 		return out, fmt.Errorf("gateway status %s", resp.Status)
 	}
-	body, err = io.ReadAll(io.LimitReader(resp.Body, maxReplyBytes+1))
-	if err != nil {
-		return out, err
-	}
-	if len(body) > maxReplyBytes {
-		return out, errors.New("gateway reply too large")
-	}
-	dec := json.NewDecoder(bytes.NewReader(body))
-	if err := dec.Decode(&out); err != nil {
-		return out, err
-	}
-	if dec.Decode(&struct{}{}) != io.EOF {
-		return out, errors.New("trailing data in gateway reply")
+	if err := control.DecodeJSON(resp.Body, maxReplyBytes, &out); err != nil {
+		return out, fmt.Errorf("gateway reply: %w", err)
 	}
 	return out, nil
 }

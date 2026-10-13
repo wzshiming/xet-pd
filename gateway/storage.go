@@ -12,7 +12,6 @@ import (
 	"path/filepath"
 	"slices"
 	"sync"
-	"time"
 
 	"github.com/wzshiming/httpseek"
 	"github.com/wzshiming/xet"
@@ -22,6 +21,7 @@ import (
 	"github.com/wzshiming/xet/xorb"
 
 	"github.com/wzshiming/xet-pd/apis"
+	"github.com/wzshiming/xet-pd/internal/control"
 )
 
 // relayAttempts bounds the holders tried per remote open.
@@ -59,10 +59,7 @@ func newStore(dir string, reg *registry) (*store, error) {
 	if err := os.MkdirAll(offsetDir, 0o755); err != nil {
 		return nil, err
 	}
-	transport := http.DefaultTransport.(*http.Transport).Clone()
-	transport.DisableCompression = true
-	transport.ResponseHeaderTimeout = 30 * time.Second
-	return &store{Storage: st, reg: reg, offsetDir: offsetDir, transport: transport, pins: map[xet.XorbHash]int{}, writers: map[xet.XorbHash]*writerLock{}}, nil
+	return &store{Storage: st, reg: reg, offsetDir: offsetDir, transport: control.NewTransport(), pins: map[xet.XorbHash]int{}, writers: map[xet.XorbHash]*writerLock{}}, nil
 }
 
 // lockWriter blocks until this caller is the only writer of hash; the result releases it.
@@ -163,9 +160,6 @@ func (s *store) GetFileHashBySHA256(ctx context.Context, digest [32]byte) (xet.F
 // maxSidecarBytes bounds a JSON array of xet.MaxChunksPerXorb 20-digit offsets.
 const maxSidecarBytes = (xet.MaxChunksPerXorb + 1) * 21
 
-// maxPackedBytes is the largest packed xorb the peers accept, so no larger offset can be served.
-const maxPackedBytes = 128 << 20
-
 func (s *store) sidecar(hash xet.XorbHash) string {
 	return filepath.Join(s.offsetDir, filepath.FromSlash(storage.ObjectKey("", hash.String())))
 }
@@ -177,8 +171,8 @@ func validOffsets(offsets []uint64) error {
 	}
 	prev := uint64(0)
 	for _, off := range offsets {
-		if off > maxPackedBytes {
-			return fmt.Errorf("chunk offset %d exceeds %d", off, maxPackedBytes)
+		if off > apis.MaxXorbBytes {
+			return fmt.Errorf("chunk offset %d exceeds %d", off, apis.MaxXorbBytes)
 		}
 		if off < prev || off-prev < 8 {
 			return fmt.Errorf("chunk offset %d does not follow %d", off, prev)

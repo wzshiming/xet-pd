@@ -6,4 +6,5 @@
 !apis
 !gateway
 !peer
+!internal
 **/*_test.go

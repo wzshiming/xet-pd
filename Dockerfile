@@ -8,6 +8,7 @@ COPY cmd/ cmd/
 COPY apis/ apis/
 COPY gateway/ gateway/
 COPY peer/ peer/
+COPY internal/ internal/
 
 FROM builder AS build-app
 RUN --mount=type=cache,target=/root/.cache/go-build \

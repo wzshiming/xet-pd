@@ -6,10 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"net/url"
 	"path/filepath"
 	"regexp"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -22,6 +20,7 @@ import (
 	"github.com/wzshiming/xet/server/hf"
 
 	"github.com/wzshiming/xet-pd/apis"
+	"github.com/wzshiming/xet-pd/internal/control"
 )
 
 // Config configures New; zero values take the noted defaults.
@@ -46,11 +45,11 @@ func (c *Config) normalize() error {
 	if c.Upstream == "" {
 		return errors.New("upstream is required")
 	}
-	if c.Upstream, err = origin(c.Upstream); err != nil {
+	if c.Upstream, err = control.Origin(c.Upstream); err != nil {
 		return fmt.Errorf("upstream: %w", err)
 	}
 	if c.ExternalURL != "" {
-		if c.ExternalURL, err = origin(c.ExternalURL); err != nil {
+		if c.ExternalURL, err = control.Origin(c.ExternalURL); err != nil {
 			return fmt.Errorf("external url: %w", err)
 		}
 	}
@@ -67,30 +66,6 @@ func (c *Config) normalize() error {
 		return errors.New("min seeds exceed replicas")
 	}
 	return nil
-}
-
-// origin accepts an absolute http(s) origin: a host, an optional port 1..65535 ("host:" is rejected) and no userinfo, path, query or fragment.
-func origin(raw string) (string, error) {
-	u, err := url.Parse(raw)
-	if err != nil {
-		return "", errors.New("invalid url") // the parse error quotes raw, credentials included
-	}
-	port, err := strconv.Atoi(u.Port())
-	switch {
-	case u.Scheme != "http" && u.Scheme != "https":
-		return "", errors.New("scheme is not http(s)")
-	case u.Hostname() == "" || u.Opaque != "":
-		return "", errors.New("missing host")
-	case strings.HasSuffix(u.Host, ":"+u.Port()) && (err != nil || port < 1 || port > 65535):
-		return "", errors.New("invalid port")
-	case u.User != nil:
-		return "", errors.New("userinfo not allowed")
-	case u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || u.RawFragment != "":
-		return "", errors.New("query and fragment not allowed")
-	case u.Path != "" && u.Path != "/":
-		return "", errors.New("base path not supported")
-	}
-	return u.Scheme + "://" + u.Host, nil
 }
 
 // Gateway is the xet-pd central service: a hub mirror whose xorb bytes live on registered peers.
@@ -162,9 +137,9 @@ func build(cfg Config) (*Gateway, error) {
 		return nil, err
 	}
 	g := &Gateway{mux: http.NewServeMux(), cas: cas, reg: reg, st: st, manager: manager, secret: cfg.Secret, transport: transport}
-	g.mux.HandleFunc("/healthz", control(http.MethodGet, func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) }))
-	g.mux.HandleFunc(apis.AnnouncePath, control(http.MethodPost, g.serveAnnounce))
-	g.mux.HandleFunc(apis.PeersPath, control(http.MethodGet, g.servePeers))
+	g.mux.HandleFunc("/healthz", route(http.MethodGet, func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) }))
+	g.mux.HandleFunc(apis.AnnouncePath, route(http.MethodPost, g.serveAnnounce))
+	g.mux.HandleFunc(apis.PeersPath, route(http.MethodGet, g.servePeers))
 	g.mux.Handle("/xet-pd/", http.NotFoundHandler()) // unknown control paths never reach the upstream
 	g.mux.HandleFunc("/", g.servePublic)
 	return g, nil
@@ -184,8 +159,8 @@ func (g *Gateway) Close() error {
 	return nil
 }
 
-// control answers a control route for one method and 405 otherwise.
-func control(method string, h http.HandlerFunc) http.HandlerFunc {
+// route answers a control route for one method and 405 otherwise.
+func route(method string, h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != method {
 			w.Header().Set("Allow", method)

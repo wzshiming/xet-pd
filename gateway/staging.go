@@ -1,11 +1,9 @@
 package gateway
 
 import (
-	"bytes"
 	"cmp"
 	"container/list"
 	"context"
-	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
@@ -17,6 +15,7 @@ import (
 	"github.com/wzshiming/xet"
 
 	"github.com/wzshiming/xet-pd/apis"
+	"github.com/wzshiming/xet-pd/internal/control"
 )
 
 // pullTimeout bounds one control request to a seed.
@@ -72,7 +71,7 @@ func newStaging(st *store, cfg stagingConfig) (*staging, error) {
 		cfg:    cfg,
 		st:     st,
 		reg:    st.reg,
-		client: &http.Client{Transport: http.DefaultTransport.(*http.Transport).Clone(), CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }},
+		client: control.NewClient(control.NewTransport()),
 		wake:   make(chan struct{}, 1),
 		sem:    make(chan struct{}, cfg.jobs),
 		ctx:    ctx,
@@ -276,21 +275,9 @@ func (m *staging) pull(p apis.Peer, hash xet.XorbHash) {
 
 // request asks one seed to pull the xorb; only a 202 counts as accepted.
 func (m *staging) request(p apis.Peer, hash xet.XorbHash) error {
-	body, err := json.Marshal(apis.PullRequest{Hash: hash.String()})
-	if err != nil {
-		return err
-	}
 	ctx, cancel := context.WithTimeout(m.ctx, pullTimeout)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.URL+apis.PullPath, bytes.NewReader(body))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	if m.cfg.secret != "" {
-		req.Header.Set("Authorization", "Bearer "+m.cfg.secret)
-	}
-	resp, err := m.client.Do(req)
+	resp, err := control.PostJSON(ctx, m.client, p.URL+apis.PullPath, m.cfg.secret, apis.PullRequest{Hash: hash.String()})
 	if err != nil {
 		return err
 	}

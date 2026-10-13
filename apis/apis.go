@@ -13,6 +13,9 @@ const (
 // XorbPathPrefix is xet-core's fixed CAS xorb route prefix, advertised by the gateway and fetched by peers.
 const XorbPathPrefix = "/v1/xorbs/default/"
 
+// MaxXorbBytes caps a packed xorb, chunk headers and footer included: peers pull nothing larger and the gateway trusts no offset beyond it.
+const MaxXorbBytes = 128 << 20
+
 type PullRequest struct {
 	Hash string `json:"hash"`
 }

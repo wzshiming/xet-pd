@@ -16,10 +16,7 @@ import (
 	"github.com/wzshiming/xet-pd/apis"
 )
 
-const (
-	maxXorbBytes   = 128 << 20 // packed xorb cap, leaves room for chunk headers and footer
-	failedCooldown = 15 * time.Second
-)
+const failedCooldown = 15 * time.Second
 
 var (
 	errNotFound = errors.New("xorb not found at gateway")
@@ -171,7 +168,7 @@ func (f *pull) fetch(ctx context.Context) error {
 		return errNotFound
 	case resp.StatusCode != http.StatusOK:
 		return fmt.Errorf("gateway status %s", resp.Status)
-	case resp.ContentLength > maxXorbBytes:
+	case resp.ContentLength > apis.MaxXorbBytes:
 		return fmt.Errorf("xorb of %d bytes exceeds cap", resp.ContentLength)
 	}
 	f.stream = ioswmr.NewSWMR(ioswmr.NewTemporaryFileBuffer(func() (*os.File, error) {
@@ -180,11 +177,11 @@ func (f *pull) fetch(ctx context.Context) error {
 	f.hold, _ = f.stream.NewReader(0)
 	f.length = resp.ContentLength
 	close(f.started)
-	n, err := io.Copy(f.stream.Writer(), io.LimitReader(resp.Body, maxXorbBytes+1))
+	n, err := io.Copy(f.stream.Writer(), io.LimitReader(resp.Body, apis.MaxXorbBytes+1))
 	switch {
 	case err != nil:
 		return err
-	case n > maxXorbBytes:
+	case n > apis.MaxXorbBytes:
 		return errors.New("xorb exceeds cap")
 	case n == 0:
 		return errEmpty

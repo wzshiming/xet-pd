@@ -54,7 +54,7 @@ func startPeer(t *testing.T, gw, secret, addr string) (string, func()) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	p, err := peer.New(peer.Config{Advertise: "http://" + ln.Addr().String(), Gateway: gw, Dir: t.TempDir(), Secret: secret})
+	p, err := peer.New(peer.Config{Advertise: "http://" + ln.Addr().String(), Gateway: gw, CacheDir: t.TempDir(), Secret: secret})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -177,8 +177,8 @@ func TestConfigValidation(t *testing.T) {
 			if tt.mod != nil {
 				wantTTL, wantSeeds = 2*time.Second, 2
 			}
-			if g.reg.ttl != wantTTL || g.manager.cfg.replicas != wantReplicas || g.manager.cfg.minSeeds != wantSeeds || g.manager.cfg.cacheSize != cfg.XorbCacheSize {
-				t.Fatalf("effective ttl %v replicas %d minSeeds %d cache %d", g.reg.ttl, g.manager.cfg.replicas, g.manager.cfg.minSeeds, g.manager.cfg.cacheSize)
+			if g.reg.ttl != wantTTL || g.staging.cfg.replicas != wantReplicas || g.staging.cfg.minSeeds != wantSeeds || g.staging.cfg.cacheSize != cfg.XorbCacheSize {
+				t.Fatalf("effective ttl %v replicas %d minSeeds %d cache %d", g.reg.ttl, g.staging.cfg.replicas, g.staging.cfg.minSeeds, g.staging.cfg.cacheSize)
 			}
 			for _, dir := range []string{"data/offsets", "mirror/index"} {
 				if _, err := os.Stat(filepath.Join(cfg.StorageDir, dir)); err != nil {

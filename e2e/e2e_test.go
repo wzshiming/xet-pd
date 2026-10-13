@@ -73,7 +73,7 @@ func TestSeedsPulledAfterIngest(t *testing.T) {
 	}
 	before := diag(t, gw.URL)
 	if before.XorbGets != (apis.XorbGets{Peer: 2}) {
-		t.Fatalf("xorb gets after seeding = %+v, want two seed fills", before.XorbGets)
+		t.Fatalf("xorb gets after seeding = %+v, want two seed pulls", before.XorbGets)
 	}
 	cdnGets, cdnBytes := hub.CDN()
 	if cdnGets != 1 || cdnBytes != int64(len(data)) {
@@ -161,7 +161,7 @@ func TestAllSeedsEvictedReingests(t *testing.T) {
 	a, b := randomData(3, 1<<20), randomData(4, 1<<20)
 	hub.Set("/org/repo/resolve/main/a.bin", a)
 	hub.Set("/org/repo/resolve/main/b.bin", b)
-	gw, peers := startCluster(t, hub, 1, "-cache-size", strconv.Itoa(5<<18)) // 1.25MiB: one 1MiB xorb plus headers, never two
+	gw, peers := startCluster(t, hub, 1, "-xorb-cache-size", strconv.Itoa(5<<18)) // 1.25MiB: one 1MiB xorb plus headers, never two
 	urlA, urlB := gw.URL+"/org/repo/resolve/main/a.bin", gw.URL+"/org/repo/resolve/main/b.bin"
 	cdn := func(gets int) func() bool {
 		return func() bool {
@@ -364,7 +364,7 @@ func TestServeWhilePulling(t *testing.T) {
 	if resp, out := request(t, http.MethodPost, p.URL+apis.PullPath, payload, "Content-Type", "application/json", "Authorization", "Bearer "+secret); resp.StatusCode != http.StatusAccepted {
 		t.Fatalf("pull = %d %q", resp.StatusCode, out)
 	}
-	waitFor(t, readyTimeout, "the fill to reach the gateway", func() bool { return fake.getCount() == 1 })
+	waitFor(t, readyTimeout, "the pull to reach the gateway", func() bool { return fake.getCount() == 1 })
 
 	resp, got := request(t, http.MethodGet, u, "", "Range", fmt.Sprintf("bytes=0-%d", prefix-1))
 	if resp.StatusCode != http.StatusPartialContent || !bytes.Equal(got, body[:prefix]) {

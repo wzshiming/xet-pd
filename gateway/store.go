@@ -38,7 +38,7 @@ type store struct {
 	pins    map[xet.XorbHash]int
 	writers map[xet.XorbHash]*writerLock
 
-	// staging hooks, set once before concurrent use; nil without a staging manager
+	// staging hooks, set once before concurrent use; nil without staging
 	onStored func(hash xet.XorbHash, size int64, inserted bool) // bytes and offsets durable, still pinned
 	onRead   func(hash xet.XorbHash)                            // a local copy was opened
 	onIdle   func()                                             // some xorb lost its last pin
@@ -392,7 +392,7 @@ func (s *store) pin(hashes ...xet.XorbHash) {
 	}
 }
 
-// unpin releases pins and, once any hash is free, wakes the staging manager outside s.mu.
+// unpin releases pins and, once any hash is free, wakes staging outside s.mu.
 func (s *store) unpin(hashes ...xet.XorbHash) {
 	s.mu.Lock()
 	idle := false

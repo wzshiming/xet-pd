@@ -187,7 +187,7 @@ func xorbPath(dir string, hash xet.XorbHash) string {
 	return filepath.Join(dir, filepath.FromSlash(storage.ObjectKey("xorbs", hash.String())))
 }
 
-// commitDirect stores body underneath a running peer and registers it as a finished fill would.
+// commitDirect stores body underneath a running peer and registers it as a finished pull would.
 func commitDirect(t *testing.T, p *Peer, hash xet.XorbHash, body []byte) {
 	t.Helper()
 	if _, err := p.store.PutXorb(context.Background(), hash, bytes.NewReader(body)); err != nil {
@@ -222,7 +222,7 @@ func gatedBody(body []byte, prefix int, release <-chan struct{}) http.HandlerFun
 
 func newTestPeer(t *testing.T, gw string, mod func(*Config)) (*Peer, *httptest.Server) {
 	t.Helper()
-	cfg := Config{Advertise: "http://seed.test", Gateway: gw, Dir: t.TempDir()}
+	cfg := Config{Advertise: "http://seed.test", Gateway: gw, CacheDir: t.TempDir()}
 	if mod != nil {
 		mod(&cfg)
 	}
@@ -300,7 +300,7 @@ func TestStartupFullAnnouncesSeededInventory(t *testing.T) {
 		w.WriteHeader(http.StatusInternalServerError)
 	})
 	p, srv := newTestPeer(t, g.URL, func(c *Config) {
-		c.Dir, c.Heartbeat, c.Secret = dir, time.Hour, "s3cret"
+		c.CacheDir, c.Heartbeat, c.Secret = dir, time.Hour, "s3cret"
 	})
 	first := g.announce(t, 0)
 	want := apis.AnnounceRequest{Peer: apis.Peer{ID: p.id, URL: "http://seed.test"}, Epoch: p.epoch, Full: true, Add: hashes(a, b)}
@@ -320,9 +320,9 @@ func TestStartupFullAnnouncesSeededInventory(t *testing.T) {
 }
 
 func TestConfigValidation(t *testing.T) {
-	base := Config{Advertise: "http://seed:8080/", Gateway: "https://gw.example/", Dir: t.TempDir()}
+	base := Config{Advertise: "http://seed:8080/", Gateway: "https://gw.example/", CacheDir: t.TempDir()}
 	bad := map[string]func(*Config){
-		"missing dir":           func(c *Config) { c.Dir = "" },
+		"missing cache dir":     func(c *Config) { c.CacheDir = "" },
 		"gateway userinfo":      func(c *Config) { c.Gateway = "http://u:p@gw" },
 		"gateway query":         func(c *Config) { c.Gateway = "http://gw?x=1" },
 		"gateway fragment":      func(c *Config) { c.Gateway = "http://gw#f" },
@@ -337,10 +337,10 @@ func TestConfigValidation(t *testing.T) {
 		"advertise empty port":  func(c *Config) { c.Advertise = "http://seed:" },
 		"advertise port zero":   func(c *Config) { c.Advertise = "http://seed:0" },
 		"advertise credentials": func(c *Config) { c.Advertise = "http://bob:hunter2@seed/%zz" },
-		"negative max fills":    func(c *Config) { c.MaxFills = -1 },
-		"negative timeout":      func(c *Config) { c.FillTimeout = -time.Second },
+		"negative max pulls":    func(c *Config) { c.MaxPulls = -1 },
+		"negative timeout":      func(c *Config) { c.PullTimeout = -time.Second },
 		"negative heartbeat":    func(c *Config) { c.Heartbeat = -time.Second },
-		"negative cache size":   func(c *Config) { c.CacheSize = -1 },
+		"negative cache size":   func(c *Config) { c.XorbCacheSize = -1 },
 	}
 	for name, mutate := range bad {
 		cfg := base
@@ -361,7 +361,7 @@ func TestConfigValidation(t *testing.T) {
 	if p.cfg.Advertise != "http://seed:8080" || p.cfg.Gateway != "https://gw.example" {
 		t.Fatalf("normalized URLs = %q %q", p.cfg.Advertise, p.cfg.Gateway)
 	}
-	if p.cfg.MaxFills != 8 || p.cfg.FillTimeout != 10*time.Minute || p.cfg.Heartbeat != 10*time.Second {
+	if p.cfg.MaxPulls != 8 || p.cfg.PullTimeout != 10*time.Minute || p.cfg.Heartbeat != 10*time.Second {
 		t.Fatalf("defaults = %+v", p.cfg)
 	}
 }
@@ -379,7 +379,7 @@ func TestNewIdentityAndSpoolCleanup(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	a, err := New(Config{Advertise: "http://seed:8080", Gateway: "http://gw", Dir: dir})
+	a, err := New(Config{Advertise: "http://seed:8080", Gateway: "http://gw", CacheDir: dir})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -392,7 +392,7 @@ func TestNewIdentityAndSpoolCleanup(t *testing.T) {
 			t.Fatalf("New removed %s: %v", f, err)
 		}
 	}
-	b, err := New(Config{Advertise: "http://seed:8080/", Gateway: "http://gw2", Dir: t.TempDir()})
+	b, err := New(Config{Advertise: "http://seed:8080/", Gateway: "http://gw2", CacheDir: t.TempDir()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -400,7 +400,7 @@ func TestNewIdentityAndSpoolCleanup(t *testing.T) {
 	if a.id == "" || a.id != b.id {
 		t.Fatalf("id not stable for the same advertise: %q vs %q", a.id, b.id)
 	}
-	c, err := New(Config{Advertise: "http://other:8080", Gateway: "http://gw", Dir: t.TempDir()})
+	c, err := New(Config{Advertise: "http://other:8080", Gateway: "http://gw", CacheDir: t.TempDir()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -516,7 +516,7 @@ func doAsync(t *testing.T, url string, hdr ...string) <-chan result {
 	return out
 }
 
-func TestGatedFillServesPrefixBeforeUpstreamCompletes(t *testing.T) {
+func TestGatedPullServesPrefixBeforeUpstreamCompletes(t *testing.T) {
 	hash, body := makeXorb(t, 2, 4, 16<<10)
 	release := make(chan struct{})
 	const prefix = 20 << 10
@@ -616,7 +616,7 @@ func TestStreamDoesNotWaitForValidation(t *testing.T) {
 	}
 }
 
-func TestConcurrentColdRequestsShareOneFill(t *testing.T) {
+func TestConcurrentColdRequestsShareOnePull(t *testing.T) {
 	hash, body := makeXorb(t, 3, 4, 16<<10)
 	release := make(chan struct{})
 	g := newGateway(t, gatedBody(body, 4<<10, release))
@@ -754,7 +754,7 @@ func TestUpstreamFailures(t *testing.T) {
 		if n := g.gets.Load(); n != 1 {
 			t.Fatalf("gateway GETs = %d, want 1 (cooldown)", n)
 		}
-		if ok, _ := filepath.Glob(filepath.Join(p.cfg.Dir, "xorbs", "*", "*", ".xorb-*")); len(ok) != 0 {
+		if ok, _ := filepath.Glob(filepath.Join(p.cfg.CacheDir, "xorbs", "*", "*", ".xorb-*")); len(ok) != 0 {
 			t.Fatalf("storage temp files left: %v", ok)
 		}
 	})
@@ -838,9 +838,9 @@ func TestPullAndLocalOnlyRelay(t *testing.T) {
 	if code := pull("Bearer s3cret", payload); code != http.StatusAccepted {
 		t.Fatalf("pull = %d", code)
 	}
-	waitFor(t, "fill start", func() bool { return g.gets.Load() == 1 })
+	waitFor(t, "pull start", func() bool { return g.gets.Load() == 1 })
 	if resp, _, _ := do(t, http.MethodGet, u, apis.PeerHeader, "gw"); resp.StatusCode != http.StatusNotFound {
-		t.Fatalf("relay miss while filling = %d", resp.StatusCode)
+		t.Fatalf("relay miss while pulling = %d", resp.StatusCode)
 	}
 	if code := pull("Bearer s3cret", payload); code != http.StatusAccepted {
 		t.Fatalf("repeated pull = %d", code)
@@ -848,7 +848,7 @@ func TestPullAndLocalOnlyRelay(t *testing.T) {
 	close(release)
 	resp, got, err := do(t, http.MethodGet, u)
 	if err != nil || resp.StatusCode != http.StatusOK || !bytes.Equal(got, body) {
-		t.Fatalf("public GET sharing the pull fill = %d, %d bytes, %v", resp.StatusCode, len(got), err)
+		t.Fatalf("public GET sharing the pull = %d, %d bytes, %v", resp.StatusCode, len(got), err)
 	}
 	settled(t, p)
 	if resp, _, _ := do(t, http.MethodGet, u, apis.PeerHeader, "gw"); resp.StatusCode != http.StatusOK {
@@ -885,7 +885,7 @@ func TestUnknownContentLengthWaitsForValidation(t *testing.T) {
 	}
 }
 
-func TestCloseCancelsFillAndReaders(t *testing.T) {
+func TestCloseCancelsPullAndReaders(t *testing.T) {
 	hash, body := makeXorb(t, 8, 4, 16<<10)
 	g := newGateway(t, gatedBody(body, 4<<10, make(chan struct{})))
 	p, srv := newTestPeer(t, g.URL, nil)
@@ -903,13 +903,13 @@ func TestCloseCancelsFillAndReaders(t *testing.T) {
 			t.Fatal(err)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("Close did not drain the blocked fill")
+		t.Fatal("Close did not drain the blocked pull")
 	}
 	if _, err := io.ReadAll(resp.Body); err == nil {
 		t.Fatal("reader completed after Close")
 	}
 	if hasXorb(t, p, hash) {
-		t.Fatal("canceled fill published the xorb")
+		t.Fatal("canceled pull published the xorb")
 	}
 	waitFor(t, "spool cleanup", spoolEmpty(p))
 	if resp, _, _ := do(t, http.MethodGet, u); resp.StatusCode != http.StatusServiceUnavailable {
@@ -927,20 +927,20 @@ func TestAcquireAfterCommitReportsReady(t *testing.T) {
 	if resp, got, err := do(t, http.MethodGet, xorbURL(srv, hash)); err != nil || resp.StatusCode != http.StatusOK || !bytes.Equal(got, body) {
 		t.Fatalf("cold GET = %d, %d bytes, %v", resp.StatusCode, len(got), err)
 	}
-	waitFor(t, "fill exit", func() bool {
+	waitFor(t, "pull exit", func() bool {
 		p.mu.Lock()
 		defer p.mu.Unlock()
 		return len(p.pulls) == 0
 	})
 	waitFor(t, "spool cleanup", spoolEmpty(p))
-	// A handler that missed the store before that commit now takes its fill decision.
+	// A handler that missed the store before that commit now takes its pull decision.
 	f, rd, err := p.acquire(hash, false)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if f != nil {
 		f.release()
-		t.Fatal("acquire started a redundant fill for a committed xorb")
+		t.Fatal("acquire started a redundant pull for a committed xorb")
 	}
 	if rd == nil || rd.hash != hash {
 		t.Fatalf("acquire did not reserve the committed xorb: %+v", rd)
@@ -961,8 +961,8 @@ func TestDeduplicatedSpoolStillValidates(t *testing.T) {
 	u := xorbURL(srv, hash)
 
 	late := doAsync(t, u)
-	waitFor(t, "fill start", func() bool { return g.gets.Load() == 1 })
-	// A valid copy is committed underneath the running fill, so its PutXorb deduplicates.
+	waitFor(t, "pull start", func() bool { return g.gets.Load() == 1 })
+	// A valid copy is committed underneath the running pull, so its PutXorb deduplicates.
 	commitDirect(t, p, hash, body)
 	close(release)
 	<-late
@@ -978,7 +978,7 @@ func TestDeduplicatedSpoolStillValidates(t *testing.T) {
 	}
 	resp, got, err := do(t, http.MethodGet, u)
 	if err != nil || resp.StatusCode != http.StatusOK || !bytes.Equal(got, body) {
-		t.Fatalf("committed xorb after the failed fill = %d, %d bytes, %v", resp.StatusCode, len(got), err)
+		t.Fatalf("committed xorb after the failed pull = %d, %d bytes, %v", resp.StatusCode, len(got), err)
 	}
 	if n := g.gets.Load(); n != 1 {
 		t.Fatalf("gateway GETs = %d, want 1", n)

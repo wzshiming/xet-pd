@@ -109,7 +109,7 @@ func (s *seed) cancellations() int {
 	return s.canceled
 }
 
-// holds announces hashes as held by this seed, as the peer does after a fill commits.
+// holds announces hashes as held by this seed, as the peer does after a pull commits.
 func (s *seed) holds(hashes ...xet.XorbHash) {
 	var add []string
 	for _, h := range hashes {
@@ -162,7 +162,7 @@ func TestPutSeedsReplicasOnce(t *testing.T) {
 	if _, err := st.PutXorb(ctx, x.hash, bytes.NewReader(x.body)); err != nil {
 		t.Fatal(err)
 	}
-	selected := reg.seeds(x.hash.String(), 2)
+	selected := reg.rank(x.hash.String())[:2]
 	for _, p := range selected {
 		waitFor(t, "pull at "+p.ID, func() bool { return len(seeds[p.ID].requests()) == 1 })
 	}
@@ -174,7 +174,7 @@ func TestPutSeedsReplicasOnce(t *testing.T) {
 	want, _ := json.Marshal(apis.PullRequest{Hash: x.hash.String()})
 	for id, s := range seeds {
 		reqs := s.requests()
-		if !slices.ContainsFunc(selected, func(p apis.Peer) bool { return p.ID == id }) {
+		if !slices.ContainsFunc(selected, func(p ranked) bool { return p.ID == id }) {
 			if len(reqs) != 0 {
 				t.Fatalf("unselected seed %s was asked: %+v", id, reqs)
 			}

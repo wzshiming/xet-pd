@@ -124,7 +124,7 @@ func (f *pull) wait(ctx context.Context) (ioswmr.SWMR, int64, error) {
 func (f *pull) run() {
 	p := f.p
 	defer p.wg.Done()
-	ctx, cancel := context.WithTimeout(p.ctx, p.cfg.FillTimeout)
+	ctx, cancel := context.WithTimeout(p.ctx, p.cfg.PullTimeout)
 	defer cancel()
 	err := f.fetch(ctx)
 	if f.stream == nil {

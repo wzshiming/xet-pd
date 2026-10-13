@@ -55,7 +55,7 @@ services:
       - -advertise=http://peer-1:8081
       - -gateway=http://gateway:8080
       - -cache-dir=/data
-      - "-cache-size=${XET_PD_PEER_CACHE_SIZE:-128MiB}"
+      - "-xorb-cache-size=${XET_PD_PEER_CACHE_SIZE:-128MiB}"
       - -heartbeat=1s
     environment: *secret
     depends_on:
@@ -75,7 +75,7 @@ services:
       - -advertise=http://peer-2:8081
       - -gateway=http://gateway:8080
       - -cache-dir=/data
-      - "-cache-size=${XET_PD_PEER_CACHE_SIZE:-128MiB}"
+      - "-xorb-cache-size=${XET_PD_PEER_CACHE_SIZE:-128MiB}"
       - -heartbeat=1s
     environment: *secret
     depends_on:

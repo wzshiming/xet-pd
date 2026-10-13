@@ -1,5 +1,5 @@
 // Package peer implements an xet-pd seed: it caches whole xorbs pulled through
-// the gateway and serves them, with range support, while they are still filling.
+// the gateway and serves them, with range support, while they are still being pulled.
 package peer
 
 import (
@@ -27,14 +27,14 @@ import (
 )
 
 type Config struct {
-	Advertise   string        // public origin of this peer, scheme://host[:port]
-	Gateway     string        // upstream gateway origin
-	Dir         string        // data directory: xorbs/ ready objects, spool/ in-flight fills
-	CacheSize   int64         // bytes of committed xorbs to keep, 0 unlimited; spools are extra
-	MaxFills    int           // parallel upstream fills, default 8
-	FillTimeout time.Duration // per fill including queueing, default 10m
-	Heartbeat   time.Duration // announce interval, default 10s
-	Secret      string        // optional bearer token shared with the gateway for pull and announce
+	Advertise     string        // public origin of this peer, scheme://host[:port]
+	Gateway       string        // upstream gateway origin
+	CacheDir      string        // data directory: xorbs/ committed objects, spool/ in-flight pulls
+	XorbCacheSize int64         // bytes of committed xorbs to keep, 0 unlimited; spools are extra
+	MaxPulls      int           // parallel pulls from the gateway, default 8
+	PullTimeout   time.Duration // per pull including queueing, default 10m
+	Heartbeat     time.Duration // announce interval, default 10s
+	Secret        string        // optional bearer token shared with the gateway for pull and announce
 }
 
 func (c *Config) normalize() error {
@@ -45,14 +45,14 @@ func (c *Config) normalize() error {
 	if c.Gateway, err = control.Origin(c.Gateway); err != nil {
 		return fmt.Errorf("gateway: %w", err)
 	}
-	if c.Dir == "" {
-		return errors.New("dir is required")
+	if c.CacheDir == "" {
+		return errors.New("cache dir is required")
 	}
-	if c.CacheSize < 0 || c.MaxFills < 0 || c.FillTimeout < 0 || c.Heartbeat < 0 {
+	if c.XorbCacheSize < 0 || c.MaxPulls < 0 || c.PullTimeout < 0 || c.Heartbeat < 0 {
 		return errors.New("negative config value")
 	}
-	c.MaxFills = cmp.Or(c.MaxFills, 8)
-	c.FillTimeout = cmp.Or(c.FillTimeout, 10*time.Minute)
+	c.MaxPulls = cmp.Or(c.MaxPulls, 8)
+	c.PullTimeout = cmp.Or(c.PullTimeout, 10*time.Minute)
 	c.Heartbeat = cmp.Or(c.Heartbeat, 10*time.Second)
 	return nil
 }
@@ -71,7 +71,7 @@ type Peer struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
-	sem    chan struct{} // bounds parallel upstream fills
+	sem    chan struct{} // bounds parallel upstream pulls
 	once   sync.Once
 
 	mu       sync.Mutex // guards pulls, cooldown, the inventory and cancel-vs-acquire
@@ -86,11 +86,11 @@ func New(cfg Config) (*Peer, error) {
 	if err := cfg.normalize(); err != nil {
 		return nil, err
 	}
-	store, err := local.NewStorage(local.WithBasePath(cfg.Dir))
+	store, err := local.NewStorage(local.WithBasePath(cfg.CacheDir))
 	if err != nil {
 		return nil, err
 	}
-	spoolDir := filepath.Join(cfg.Dir, "spool")
+	spoolDir := filepath.Join(cfg.CacheDir, "spool")
 	if err := os.MkdirAll(spoolDir, 0o755); err != nil {
 		return nil, err
 	}
@@ -117,7 +117,7 @@ func New(cfg Config) (*Peer, error) {
 		wake:     make(chan struct{}, 1),
 		ctx:      ctx,
 		cancel:   cancel,
-		sem:      make(chan struct{}, cfg.MaxFills),
+		sem:      make(chan struct{}, cfg.MaxPulls),
 		pulls:    map[xet.XorbHash]*pull{},
 		cooldown: map[xet.XorbHash]cooled{},
 		index:    map[xet.XorbHash]*list.Element{},
@@ -139,7 +139,7 @@ func (p *Peer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	p.mux.ServeHTTP(w, r)
 }
 
-// Close stops the announcer, cancels in-flight fills, waits for them and drops idle upstream connections.
+// Close stops the announcer, cancels in-flight pulls, waits for them and drops idle upstream connections.
 func (p *Peer) Close() error {
 	p.once.Do(func() {
 		p.mu.Lock()
@@ -157,7 +157,7 @@ func serveContent(w http.ResponseWriter, r *http.Request, hash xet.XorbHash, con
 	http.ServeContent(w, r, "", time.Time{}, content)
 }
 
-// serveStored serves a pinned committed xorb and releases the pin; a missing file leaves the inventory so the next request fills again.
+// serveStored serves a pinned committed xorb and releases the pin; a missing file leaves the inventory so the next request pulls again.
 func (p *Peer) serveStored(w http.ResponseWriter, r *http.Request, rd *ready) error {
 	defer p.unpin(rd)
 	obj, err := p.store.GetXorbReadSeekCloser(r.Context(), rd.hash)
@@ -225,7 +225,7 @@ func (p *Peer) serveXorb(w http.ResponseWriter, r *http.Request) {
 // maxPullBytes bounds one pull body, which names a single xorb.
 const maxPullBytes = 4096
 
-// servePull starts (or joins) a fill on behalf of the gateway and answers 202 at once.
+// servePull starts (or joins) a pull on behalf of the gateway and answers 202 at once.
 func (p *Peer) servePull(w http.ResponseWriter, r *http.Request) {
 	if !control.Authorized(r, p.cfg.Secret) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)

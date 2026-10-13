@@ -31,7 +31,7 @@ func (g *Gateway) serveAnnounce(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	resp := g.reg.announce(req)
-	g.manager.kick()
+	g.staging.kick()
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(resp)
 }

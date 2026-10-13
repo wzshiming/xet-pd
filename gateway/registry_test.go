@@ -28,8 +28,8 @@ func TestPickEmptyRegistry(t *testing.T) {
 	if p, ok := r.pick("h1"); ok {
 		t.Fatalf("pick on empty registry = %v, want !ok", p)
 	}
-	if got := r.seeds("h1", 2); len(got) != 0 {
-		t.Fatalf("seeds on empty registry = %v", got)
+	if got := r.rank("h1"); len(got) != 0 {
+		t.Fatalf("rank on empty registry = %v", got)
 	}
 	if got := r.holders("h1"); len(got) != 0 || r.aliveHolders("h1") != 0 {
 		t.Fatalf("holders on empty registry = %v", got)
@@ -38,7 +38,7 @@ func TestPickEmptyRegistry(t *testing.T) {
 
 func TestRankingIndependentOfRegistrationOrder(t *testing.T) {
 	const n = 5
-	var want []apis.Peer
+	var want []ranked
 	for order := range 2 {
 		r := newRegistry(time.Minute)
 		for i := range n {
@@ -48,19 +48,19 @@ func TestRankingIndependentOfRegistrationOrder(t *testing.T) {
 				r.announce(fullReq(testPeer(n-1-i), "e"))
 			}
 		}
-		got := r.seeds("h1", 3)
-		if len(got) != 3 {
-			t.Fatalf("seeds count = %d, want 3", len(got))
+		got := r.rank("h1")
+		if len(got) != n {
+			t.Fatalf("rank count = %d, want %d", len(got), n)
 		}
-		if p, ok := r.pick("h1"); !ok || p != got[0] {
-			t.Fatalf("pick without holders = %v, want top seed %v", p, got[0])
+		if p, ok := r.pick("h1"); !ok || p != got[0].Peer {
+			t.Fatalf("pick without holders = %v, want top seed %v", p, got[0].Peer)
 		}
 		if order == 0 {
 			want = got
 			continue
 		}
 		if !slices.Equal(got, want) {
-			t.Fatalf("seeds depend on registration order: %v vs %v", got, want)
+			t.Fatalf("rank depends on registration order: %v vs %v", got, want)
 		}
 	}
 }
@@ -70,16 +70,16 @@ func TestSeedsDistinctAndSpread(t *testing.T) {
 	for i := range 5 {
 		r.announce(fullReq(testPeer(i), "e"))
 	}
-	all := r.seeds("h1", 10)
+	all := r.rank("h1")
 	if len(all) != 5 {
-		t.Fatalf("seeds(10) = %v, want all 5 peers", all)
+		t.Fatalf("rank = %v, want all 5 peers", all)
 	}
 	seen := map[apis.Peer]bool{}
 	for _, p := range all {
-		if seen[p] {
-			t.Fatalf("duplicate seed %v in %v", p, all)
+		if seen[p.Peer] {
+			t.Fatalf("duplicate seed %v in %v", p.Peer, all)
 		}
-		seen[p] = true
+		seen[p.Peer] = true
 	}
 	tops := map[apis.Peer]bool{}
 	for i := range 50 {
@@ -96,8 +96,8 @@ func TestPickPrefersLiveHolder(t *testing.T) {
 	for i := range 5 {
 		r.announce(fullReq(testPeer(i), "e"))
 	}
-	ranked := r.seeds("h1", 5)
-	low, lower := ranked[3], ranked[4]
+	ranking := r.rank("h1")
+	low, lower := ranking[3].Peer, ranking[4].Peer
 	r.announce(deltaReq(lower, "e", []string{"h1"}, nil))
 	if p, ok := r.pick("h1"); !ok || p != lower {
 		t.Fatalf("pick = %v, want lowest-ranked holder %v", p, lower)
@@ -112,11 +112,11 @@ func TestPickPrefersLiveHolder(t *testing.T) {
 	if n := r.aliveHolders("h1"); n != 2 {
 		t.Fatalf("aliveHolders = %d, want 2", n)
 	}
-	if got := r.seeds("h1", 5); !slices.Equal(got, ranked) {
-		t.Fatalf("seeds changed with holdings: %v, want %v", got, ranked)
+	if got := r.rank("h1"); !slices.EqualFunc(got, ranking, func(a, b ranked) bool { return a.Peer == b.Peer }) {
+		t.Fatalf("rank changed with holdings: %v, want %v", got, ranking)
 	}
-	if p, _ := r.pick("h2"); p != r.seeds("h2", 1)[0] || r.aliveHolders("h2") != 0 {
-		t.Fatalf("other hash affected: pick = %v, want %v", p, r.seeds("h2", 1)[0])
+	if p, _ := r.pick("h2"); p != r.rank("h2")[0].Peer || r.aliveHolders("h2") != 0 {
+		t.Fatalf("other hash affected: pick = %v, want %v", p, r.rank("h2")[0].Peer)
 	}
 }
 
@@ -131,7 +131,7 @@ func TestConcurrentAnnounceAndLookup(t *testing.T) {
 				h := fmt.Sprintf("h%d", j%10)
 				r.announce(deltaReq(p, "e", []string{h}, []string{fmt.Sprintf("h%d", (j+5)%10)}))
 				r.pick(h)
-				r.seeds(h, 2)
+				r.rank(h)
 				r.holders(h)
 				r.aliveHolders(h)
 				r.snapshot()
@@ -139,7 +139,7 @@ func TestConcurrentAnnounceAndLookup(t *testing.T) {
 		})
 	}
 	wg.Wait()
-	if got := r.seeds("h1", 10); len(got) != 8 {
+	if got := r.rank("h1"); len(got) != 8 {
 		t.Fatalf("live peers = %d, want 8", len(got))
 	}
 }
@@ -165,8 +165,8 @@ func TestTTLExpiryIsStrict(t *testing.T) {
 	if _, ok := r.pick("h1"); ok {
 		t.Fatal("pick at expiry must report !ok")
 	}
-	if r.aliveHolders("h1") != 0 || len(r.seeds("h1", 1)) != 0 || len(r.holders("h1")) != 0 {
-		t.Fatal("expired peer must be excluded from holders and seeds")
+	if r.aliveHolders("h1") != 0 || len(r.rank("h1")) != 0 || len(r.holders("h1")) != 0 {
+		t.Fatal("expired peer must be excluded from holders and rank")
 	}
 }
 

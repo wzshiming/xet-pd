@@ -108,17 +108,6 @@ func (r *registry) pick(hash string) (apis.Peer, bool) {
 	return list[0].Peer, true
 }
 
-func (r *registry) seeds(hash string, count int) []apis.Peer {
-	var out []apis.Peer
-	for _, p := range r.rank(hash) {
-		if len(out) >= count {
-			break
-		}
-		out = append(out, p.Peer)
-	}
-	return out
-}
-
 func (r *registry) holders(hash string) []apis.Peer {
 	var out []apis.Peer
 	for _, p := range r.rank(hash) {

@@ -38,7 +38,7 @@ func serveByHash(bodies map[xet.XorbHash][]byte) http.HandlerFunc {
 	}
 }
 
-// settled waits until no fill, spool or pinned reader is left.
+// settled waits until no pull, spool or pinned reader is left.
 func settled(t *testing.T, p *Peer) {
 	t.Helper()
 	waitFor(t, "spool cleanup", spoolEmpty(p))
@@ -54,8 +54,8 @@ func settled(t *testing.T, p *Peer) {
 	})
 }
 
-// fillAndSettle pulls hash through the peer and waits for the fill to drain.
-func fillAndSettle(t *testing.T, p *Peer, srv *httptest.Server, hash xet.XorbHash, body []byte) {
+// pullAndSettle pulls hash through the peer and waits for the pull to drain.
+func pullAndSettle(t *testing.T, p *Peer, srv *httptest.Server, hash xet.XorbHash, body []byte) {
 	t.Helper()
 	resp, got, err := do(t, http.MethodGet, xorbURL(srv, hash))
 	if err != nil || resp.StatusCode != http.StatusOK || !bytes.Equal(got, body) {
@@ -132,7 +132,7 @@ func TestStartupDropsCorruptObject(t *testing.T) {
 		t.Fatal(err)
 	}
 	g := newGateway(t, serveByHash(nil))
-	p, _ := newTestPeer(t, g.URL, func(c *Config) { c.Dir, c.Heartbeat = dir, time.Hour })
+	p, _ := newTestPeer(t, g.URL, func(c *Config) { c.CacheDir, c.Heartbeat = dir, time.Hour })
 	if got := g.announce(t, 0).req; !got.Full || !slices.Equal(got.Add, hashes(a)) {
 		t.Fatalf("startup announce = %+v, want only %s", got, a)
 	}
@@ -144,14 +144,14 @@ func TestStartupDropsCorruptObject(t *testing.T) {
 	}
 }
 
-func TestFillEntersInventoryOnlyAfterValidation(t *testing.T) {
+func TestPullEntersInventoryOnlyAfterValidation(t *testing.T) {
 	hash, body := makeXorb(t, 24, 4, 16<<10)
 	release := make(chan struct{})
 	g := newGateway(t, gatedBody(body, 4<<10, release))
 	p, srv := newTestPeer(t, g.URL, func(c *Config) { c.Heartbeat = 20 * time.Millisecond })
 	late := doAsync(t, xorbURL(srv, hash))
-	waitFor(t, "fill start", func() bool { return g.gets.Load() == 1 })
-	// Heartbeats keep flowing while the fill is gated; none may carry the object.
+	waitFor(t, "pull start", func() bool { return g.gets.Load() == 1 })
+	// Heartbeats keep flowing while the pull is gated; none may carry the object.
 	before := g.announceCount()
 	waitFor(t, "heartbeats", func() bool { return g.announceCount() >= before+3 })
 	g.mu.Lock()
@@ -185,7 +185,7 @@ func TestAnnounceFailureRetriesAsFull(t *testing.T) {
 	})
 	p, srv := newTestPeer(t, g.URL, func(c *Config) { c.Heartbeat = 20 * time.Millisecond })
 	g.announce(t, 0)
-	fillAndSettle(t, p, srv, hash, body)
+	pullAndSettle(t, p, srv, hash, body)
 	acked, i := g.findAnnounce(t, 1, func(a announced) bool { return hasAdd(a, hash) && a.code == http.StatusOK })
 	// A failed delta may have been applied, so every retry carries the exact inventory.
 	if !acked.req.Full || !slices.Equal(acked.req.Add, hashes(hash)) {
@@ -264,7 +264,7 @@ func TestAmbiguousAnnounceReplyForcesFullReconciliation(t *testing.T) {
 			}))
 			t.Cleanup(gw.Close)
 			p, srv := newTestPeer(t, gw.URL, func(c *Config) {
-				c.Heartbeat, c.CacheSize = time.Hour, int64(len(bodyA)+len(bodyB)/2)
+				c.Heartbeat, c.XorbCacheSize = time.Hour, int64(len(bodyA)+len(bodyB)/2)
 			})
 			count := func() int {
 				mu.Lock()
@@ -283,15 +283,15 @@ func TestAmbiguousAnnounceReplyForcesFullReconciliation(t *testing.T) {
 			waitFor(t, "startup ack", func() bool { return count() == 1 })
 			// Add a is applied but its reply is lost; a is evicted before the retry.
 			loseNext.Store(true)
-			fillAndSettle(t, p, srv, a, bodyA)
+			pullAndSettle(t, p, srv, a, bodyA)
 			waitFor(t, "lost delta", func() bool { return count() == 2 })
-			fillAndSettle(t, p, srv, b, bodyB)
+			pullAndSettle(t, p, srv, b, bodyB)
 			check(2, b)
-			// Remove b is applied but its reply is lost; b is refilled before the retry.
+			// Remove b is applied but its reply is lost; b is pulled again before the retry.
 			loseNext.Store(true)
-			fillAndSettle(t, p, srv, a, bodyA)
+			pullAndSettle(t, p, srv, a, bodyA)
 			waitFor(t, "lost delta", func() bool { return count() == 4 })
-			fillAndSettle(t, p, srv, b, bodyB)
+			pullAndSettle(t, p, srv, b, bodyB)
 			check(4, b)
 		})
 	}
@@ -312,7 +312,7 @@ func TestInFlightAnnounceKeepsConcurrentCommitForNextDelta(t *testing.T) {
 	if first := g.announce(t, 0); !first.req.Full || len(first.req.Add) != 0 {
 		t.Fatalf("startup announce = %+v", first.req)
 	}
-	fillAndSettle(t, p, srv, hash, body)
+	pullAndSettle(t, p, srv, hash, body)
 	g.setReply(nil)
 	close(hold)
 	if second := g.announce(t, 1); second.req.Full || !slices.Equal(second.req.Add, hashes(hash)) {
@@ -336,22 +336,22 @@ func TestResyncSendsFullWithCurrentInventory(t *testing.T) {
 		return http.StatusOK, apis.AnnounceResponse{TTL: 30}
 	})
 	p, srv := newTestPeer(t, g.URL, func(c *Config) {
-		c.Heartbeat, c.CacheSize = time.Hour, int64(len(bodyA)+len(bodyB))
+		c.Heartbeat, c.XorbCacheSize = time.Hour, int64(len(bodyA)+len(bodyB))
 	})
 	g.announce(t, 0)
-	fillAndSettle(t, p, srv, a, bodyA)
-	fillAndSettle(t, p, srv, b, bodyB)
+	pullAndSettle(t, p, srv, a, bodyA)
+	pullAndSettle(t, p, srv, b, bodyB)
 	g.findAnnounce(t, 1, func(x announced) bool { return hasAdd(x, b) && x.code == http.StatusOK })
 	n := g.announceCount()
 	// The eviction of a is lost with this delta; the retry is a Full with the exact inventory.
 	mode.Store(1)
-	fillAndSettle(t, p, srv, c, bodyC)
+	pullAndSettle(t, p, srv, c, bodyC)
 	lost := g.announce(t, n)
 	if lost.code != http.StatusInternalServerError || !hasAdd(lost, c) || !hasRemove(lost, a) {
 		t.Fatalf("lost delta = %d %+v", lost.code, lost.req)
 	}
 	p.mu.Lock()
-	p.notify()
+	p.kick()
 	p.mu.Unlock()
 	retry := g.announce(t, n+1)
 	if !retry.req.Full || !slices.Equal(retry.req.Add, hashes(b, c)) || len(retry.req.Remove) != 0 {
@@ -360,7 +360,7 @@ func TestResyncSendsFullWithCurrentInventory(t *testing.T) {
 	// A resync demanded on a delta is answered with a Full at once.
 	mode.Store(2)
 	p.mu.Lock()
-	p.notify()
+	p.kick()
 	p.mu.Unlock()
 	demanded := g.announce(t, n+2)
 	if demanded.req.Full || len(demanded.req.Add)+len(demanded.req.Remove) != 0 {
@@ -426,12 +426,12 @@ func TestAnnounceRejectsMalformedReply(t *testing.T) {
 	}
 }
 
-func TestMissingStoredObjectLeavesInventoryAndRefills(t *testing.T) {
+func TestMissingStoredObjectLeavesInventoryAndPullsAgain(t *testing.T) {
 	hash, body := makeXorb(t, 46, 2, 8<<10)
 	g := newGateway(t, serveBody(body))
 	p, srv := newTestPeer(t, g.URL, func(c *Config) { c.Heartbeat = time.Hour })
 	g.announce(t, 0)
-	fillAndSettle(t, p, srv, hash, body)
+	pullAndSettle(t, p, srv, hash, body)
 	_, n := g.findAnnounce(t, 1, func(a announced) bool { return hasAdd(a, hash) })
 	// The stored file is lost underneath a live inventory entry.
 	if err := p.store.DeleteXorb(context.Background(), hash); err != nil {
@@ -446,19 +446,19 @@ func TestMissingStoredObjectLeavesInventoryAndRefills(t *testing.T) {
 	if removed := g.announce(t, n+1); removed.req.Full || !slices.Equal(removed.req.Remove, hashes(hash)) || len(removed.req.Add) != 0 {
 		t.Fatalf("announce after the confirmed miss = %+v, want Remove %s", removed.req, hash)
 	}
-	fillAndSettle(t, p, srv, hash, body)
+	pullAndSettle(t, p, srv, hash, body)
 	if n := g.gets.Load(); n != 2 {
-		t.Fatalf("gateway GETs = %d, want 2 (refill)", n)
+		t.Fatalf("gateway GETs = %d, want 2 (second pull)", n)
 	}
 	if u := usage(p); u != int64(len(body)) || !hasXorb(t, p, hash) {
-		t.Fatalf("usage after the refill = %d, present %v", u, hasXorb(t, p, hash))
+		t.Fatalf("usage after the second pull = %d, present %v", u, hasXorb(t, p, hash))
 	}
 	if added := g.announce(t, n+2); added.req.Full || !slices.Equal(added.req.Add, hashes(hash)) || len(added.req.Remove) != 0 {
-		t.Fatalf("announce after the refill = %+v, want Add %s", added.req, hash)
+		t.Fatalf("announce after the second pull = %+v, want Add %s", added.req, hash)
 	}
 }
 
-func TestPullRefillsMissingStoredObject(t *testing.T) {
+func TestPullRestoresMissingStoredObject(t *testing.T) {
 	hash, body := makeXorb(t, 49, 2, 8<<10)
 	gateway := newGateway(t, serveBody(body))
 	seed, _ := newTestPeer(t, gateway.URL, nil)
@@ -473,7 +473,7 @@ func TestPullRefillsMissingStoredObject(t *testing.T) {
 	if response.Code != http.StatusAccepted {
 		t.Fatalf("pull status = %d, want %d", response.Code, http.StatusAccepted)
 	}
-	waitFor(t, "missing object refill", func() bool { return gateway.gets.Load() == 1 })
+	waitFor(t, "pull of the missing object", func() bool { return gateway.gets.Load() == 1 })
 	settled(t, seed)
 	if !hasXorb(t, seed, hash) {
 		t.Fatal("accepted pull did not restore the missing object")
@@ -500,7 +500,7 @@ func TestStaleReaderDoesNotTouchNewerGeneration(t *testing.T) {
 	if usage(p) != 0 {
 		t.Fatalf("usage after the confirmed miss = %d", usage(p))
 	}
-	// A refill admits a new generation; the stale reader confirming the same miss must not remove it.
+	// A second pull admits a new generation; the stale reader confirming the same miss must not remove it.
 	commitDirect(t, p, hash, body)
 	p.drop(second)
 	p.unpin(second)
@@ -532,12 +532,12 @@ func TestUnreadableStoredObjectIsNotDropped(t *testing.T) {
 	g := newGateway(t, serveByHash(nil))
 	p, srv := newTestPeer(t, g.URL, func(c *Config) { c.Heartbeat = time.Hour })
 	commitDirect(t, p, hash, body)
-	path := xorbPath(p.cfg.Dir, hash)
+	path := xorbPath(p.cfg.CacheDir, hash)
 	if err := os.Chmod(path, 0); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.Chmod(path, 0o644) })
-	// A transient read failure is not absence: no refill, the inventory stands.
+	// A transient read failure is not absence: no pull, the inventory stands.
 	if resp, _, _ := do(t, http.MethodGet, xorbURL(srv, hash)); resp.StatusCode != http.StatusInternalServerError {
 		t.Fatalf("GET of an unreadable object = %d", resp.StatusCode)
 	}
@@ -558,7 +558,7 @@ func TestReadyDecisionSurvivesEviction(t *testing.T) {
 	b, bodyB := makeXorb(t, 50, 2, 8<<10)
 	g := newGateway(t, serveByHash(nil))
 	p, _ := newTestPeer(t, g.URL, func(c *Config) {
-		c.Heartbeat, c.CacheSize = time.Hour, int64(len(bodyA)+len(bodyB)/2)
+		c.Heartbeat, c.XorbCacheSize = time.Hour, int64(len(bodyA)+len(bodyB)/2)
 	})
 	commitDirect(t, p, a, bodyA)
 	// The handler decided a is ready; LRU pressure arrives before it opens the file.
@@ -579,7 +579,7 @@ func TestReadyDecisionSurvivesEviction(t *testing.T) {
 	p.mu.Lock()
 	u, pins := p.usage, rd.pins
 	p.mu.Unlock()
-	if u > p.cfg.CacheSize || pins != 0 || g.gets.Load() != 0 {
+	if u > p.cfg.XorbCacheSize || pins != 0 || g.gets.Load() != 0 {
 		t.Fatalf("after release: usage %d, pins %d, gateway GETs %d", u, pins, g.gets.Load())
 	}
 }
@@ -590,13 +590,13 @@ func TestLRUEvictsLeastRecentlyUsed(t *testing.T) {
 	c, bodyC := makeXorb(t, 32, 2, 8<<10)
 	g := newGateway(t, serveByHash(map[xet.XorbHash][]byte{a: bodyA, b: bodyB, c: bodyC}))
 	p, srv := newTestPeer(t, g.URL, func(cfg *Config) {
-		cfg.Heartbeat, cfg.CacheSize = time.Hour, int64(len(bodyA)+len(bodyB))
+		cfg.Heartbeat, cfg.XorbCacheSize = time.Hour, int64(len(bodyA)+len(bodyB))
 	})
-	fillAndSettle(t, p, srv, a, bodyA)
-	fillAndSettle(t, p, srv, b, bodyB)
+	pullAndSettle(t, p, srv, a, bodyA)
+	pullAndSettle(t, p, srv, b, bodyB)
 	// Reading a makes b the eviction candidate.
-	fillAndSettle(t, p, srv, a, bodyA)
-	fillAndSettle(t, p, srv, c, bodyC)
+	pullAndSettle(t, p, srv, a, bodyA)
+	pullAndSettle(t, p, srv, c, bodyC)
 	if hasXorb(t, p, b) || !hasXorb(t, p, a) || !hasXorb(t, p, c) {
 		t.Fatal("expected b evicted, a and c kept")
 	}
@@ -610,10 +610,10 @@ func TestLRUEvictsLeastRecentlyUsed(t *testing.T) {
 	if n := g.gets.Load(); n != 3 {
 		t.Fatalf("gateway GETs = %d, want 3", n)
 	}
-	// A pull for the evicted object fills again instead of trusting stale state.
-	fillAndSettle(t, p, srv, b, bodyB)
+	// A GET for the evicted object pulls again instead of trusting stale state.
+	pullAndSettle(t, p, srv, b, bodyB)
 	if hasXorb(t, p, a) || !hasXorb(t, p, b) || !hasXorb(t, p, c) {
-		t.Fatal("expected a evicted after refilling b")
+		t.Fatal("expected a evicted after pulling b again")
 	}
 }
 
@@ -622,10 +622,10 @@ func TestLRUProtectsActiveReadersAndConvergesOnRelease(t *testing.T) {
 	b, bodyB := makeXorb(t, 34, 2, 8<<10)
 	g := newGateway(t, serveByHash(map[xet.XorbHash][]byte{a: bodyA, b: bodyB}))
 	p, srv := newTestPeer(t, g.URL, func(cfg *Config) {
-		cfg.Heartbeat, cfg.CacheSize = time.Hour, int64(len(bodyA)+len(bodyB)/2)
+		cfg.Heartbeat, cfg.XorbCacheSize = time.Hour, int64(len(bodyA)+len(bodyB)/2)
 	})
-	fillAndSettle(t, p, srv, a, bodyA)
-	// a is read from the store, b streams from its fill; both readers are held mid-body.
+	pullAndSettle(t, p, srv, a, bodyA)
+	// a is read from the store, b streams from its pull; both readers are held mid-body.
 	wa, doneA := serveHeld(t, p, a)
 	wb, doneB := serveHeld(t, p, b)
 	// The pull leaves p.pulls under the lock that admits b; the store file lands earlier.
@@ -660,9 +660,9 @@ func TestOversizedObjectServedThenEvicted(t *testing.T) {
 		return http.StatusOK, apis.AnnounceResponse{Resync: resync.Swap(false), TTL: 30}
 	})
 	p, srv := newTestPeer(t, g.URL, func(c *Config) {
-		c.Heartbeat, c.CacheSize = 20*time.Millisecond, int64(len(body)/2)
+		c.Heartbeat, c.XorbCacheSize = 20*time.Millisecond, int64(len(body)/2)
 	})
-	fillAndSettle(t, p, srv, hash, body)
+	pullAndSettle(t, p, srv, hash, body)
 	if hasXorb(t, p, hash) || usage(p) != 0 {
 		t.Fatalf("oversized object kept, usage %d", usage(p))
 	}
@@ -672,8 +672,8 @@ func TestOversizedObjectServedThenEvicted(t *testing.T) {
 	if len(full.req.Add) != 0 {
 		t.Fatalf("Full after eviction = %+v", full.req)
 	}
-	// Repeated demand refills each time; no fill is left behind.
-	fillAndSettle(t, p, srv, hash, body)
+	// Repeated demand pulls again each time; no pull is left behind.
+	pullAndSettle(t, p, srv, hash, body)
 	if n := g.gets.Load(); n != 2 {
 		t.Fatalf("gateway GETs = %d, want 2", n)
 	}
@@ -698,7 +698,7 @@ func TestRestartRebuildsUsageAndOrder(t *testing.T) {
 	}
 	g := newGateway(t, serveByHash(map[xet.XorbHash][]byte{d: bodyD}))
 	p, srv := newTestPeer(t, g.URL, func(cfg *Config) {
-		cfg.Dir, cfg.Heartbeat, cfg.CacheSize = dir, time.Hour, int64(len(bodyA)+len(bodyC))
+		cfg.CacheDir, cfg.Heartbeat, cfg.XorbCacheSize = dir, time.Hour, int64(len(bodyA)+len(bodyC))
 	})
 	// Oldest by mtime goes first at startup, and the Full matches what survived.
 	if got := g.announce(t, 0).req; !got.Full || !slices.Equal(got.Add, hashes(a, c)) {
@@ -707,13 +707,13 @@ func TestRestartRebuildsUsageAndOrder(t *testing.T) {
 	if hasXorb(t, p, b) || usage(p) != int64(len(bodyA)+len(bodyC)) {
 		t.Fatalf("startup eviction: b present %v, usage %d", hasXorb(t, p, b), usage(p))
 	}
-	fillAndSettle(t, p, srv, d, bodyD)
+	pullAndSettle(t, p, srv, d, bodyD)
 	if hasXorb(t, p, c) || !hasXorb(t, p, a) || !hasXorb(t, p, d) {
 		t.Fatal("expected c evicted next, a and d kept")
 	}
 }
 
-func TestCloseCancelsHungAnnounceAndFill(t *testing.T) {
+func TestCloseCancelsHungAnnounceAndPull(t *testing.T) {
 	hash, body := makeXorb(t, 40, 4, 16<<10)
 	g := newGateway(t, gatedBody(body, 4<<10, make(chan struct{})))
 	unblocked := make(chan struct{})
@@ -725,7 +725,7 @@ func TestCloseCancelsHungAnnounceAndFill(t *testing.T) {
 	p, srv := newTestPeer(t, g.URL, func(c *Config) { c.Heartbeat = time.Hour })
 	g.announce(t, 0)
 	late := doAsync(t, xorbURL(srv, hash))
-	waitFor(t, "fill start", func() bool { return g.gets.Load() == 1 })
+	waitFor(t, "pull start", func() bool { return g.gets.Load() == 1 })
 	closed := make(chan error, 1)
 	go func() { closed <- p.Close() }()
 	select {
@@ -734,7 +734,7 @@ func TestCloseCancelsHungAnnounceAndFill(t *testing.T) {
 			t.Fatal(err)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("Close did not cancel the hung announce and fill")
+		t.Fatal("Close did not cancel the hung announce and pull")
 	}
 	select {
 	case <-unblocked:
@@ -745,7 +745,7 @@ func TestCloseCancelsHungAnnounceAndFill(t *testing.T) {
 		t.Fatal("reader completed after Close")
 	}
 	if hasXorb(t, p, hash) {
-		t.Fatal("canceled fill published the xorb")
+		t.Fatal("canceled pull published the xorb")
 	}
 	if n := g.announceCount(); n != 1 {
 		t.Fatalf("announces after Close = %d, want 1", n)

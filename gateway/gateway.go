@@ -74,7 +74,7 @@ type Gateway struct {
 	cas       http.Handler
 	reg       *registry
 	st        *store
-	manager   *staging
+	staging   *staging
 	secret    string
 	transport *http.Transport // upstream xet downloads
 
@@ -82,7 +82,7 @@ type Gateway struct {
 	once                 sync.Once
 }
 
-// New composes the store, hub mirror, CAS server and staging manager behind one read-only handler.
+// New composes the store, hub mirror, CAS server and staging behind one read-only handler.
 func New(cfg Config) (*Gateway, error) {
 	g, err := build(cfg)
 	if err != nil {
@@ -132,11 +132,11 @@ func build(cfg Config) (*Gateway, error) {
 		authorizer = issuer
 	}
 	cas := server.NewHandler(server.WithStorage(st), server.WithAuthorizer(authorizer), server.WithNext(hub))
-	manager, err := newStaging(st, stagingConfig{replicas: cfg.Replicas, minSeeds: cfg.MinSeeds, cacheSize: cfg.XorbCacheSize, secret: cfg.Secret})
+	staging, err := newStaging(st, stagingConfig{replicas: cfg.Replicas, minSeeds: cfg.MinSeeds, cacheSize: cfg.XorbCacheSize, secret: cfg.Secret})
 	if err != nil {
 		return nil, err
 	}
-	g := &Gateway{mux: http.NewServeMux(), cas: cas, reg: reg, st: st, manager: manager, secret: cfg.Secret, transport: transport}
+	g := &Gateway{mux: http.NewServeMux(), cas: cas, reg: reg, st: st, staging: staging, secret: cfg.Secret, transport: transport}
 	g.mux.HandleFunc("/healthz", route(http.MethodGet, func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) }))
 	g.mux.HandleFunc(apis.AnnouncePath, route(http.MethodPost, g.serveAnnounce))
 	g.mux.HandleFunc(apis.PeersPath, route(http.MethodGet, g.servePeers))
@@ -152,7 +152,7 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // Close stops seeding and drops idle connections; ingests the mirror runs in the background finish on their own.
 func (g *Gateway) Close() error {
 	g.once.Do(func() {
-		_ = g.manager.Close()
+		_ = g.staging.Close()
 		g.transport.CloseIdleConnections()
 		g.st.transport.CloseIdleConnections()
 	})
@@ -174,7 +174,7 @@ func route(method string, h http.HandlerFunc) http.HandlerFunc {
 // pathsInfoRe admits the one hub POST that only reads: /api/{type}s/{repo}/paths-info/{rev}.
 var pathsInfoRe = regexp.MustCompile(`^/api/(models|datasets|spaces)/.+/paths-info/[^/]+$`)
 
-// servePublic keeps the CAS and hub surface read-only and tallies xorb GETs; peer fills carry apis.PeerHeader.
+// servePublic keeps the CAS and hub surface read-only and tallies xorb GETs; peer pulls carry apis.PeerHeader.
 func (g *Gateway) servePublic(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case r.Method == http.MethodGet, r.Method == http.MethodHead:
@@ -194,7 +194,7 @@ func (g *Gateway) servePublic(w http.ResponseWriter, r *http.Request) {
 }
 
 func (g *Gateway) servePeers(w http.ResponseWriter, _ *http.Request) {
-	d := apis.PeersResponse{Peers: g.reg.snapshot(), XorbBytes: g.manager.snapshot(), XorbGets: apis.XorbGets{Peer: g.peerGets.Load(), Direct: g.directGets.Load()}}
+	d := apis.PeersResponse{Peers: g.reg.snapshot(), XorbBytes: g.staging.snapshot(), XorbGets: apis.XorbGets{Peer: g.peerGets.Load(), Direct: g.directGets.Load()}}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(d)
 }

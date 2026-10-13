@@ -29,7 +29,7 @@ type stagingConfig struct {
 	secret    string        // bearer token of control requests; never sent on data requests
 	retry     time.Duration // pause per (xorb, seed) after a pull request, default 1m
 	tick      time.Duration // maintenance period besides wakes, default 1s
-	jobs      int           // parallel pull requests, default 8
+	maxPulls  int           // parallel pull requests, default 8
 }
 
 // staged is one durable local xorb; its LRU position is its recency.
@@ -65,7 +65,7 @@ func newStaging(st *store, cfg stagingConfig) (*staging, error) {
 	cfg.minSeeds = cmp.Or(cfg.minSeeds, 1)
 	cfg.retry = cmp.Or(cfg.retry, time.Minute)
 	cfg.tick = cmp.Or(cfg.tick, time.Second)
-	cfg.jobs = cmp.Or(cfg.jobs, 8)
+	cfg.maxPulls = cmp.Or(cfg.maxPulls, 8)
 	ctx, cancel := context.WithCancel(context.Background())
 	m := &staging{
 		cfg:    cfg,
@@ -73,7 +73,7 @@ func newStaging(st *store, cfg stagingConfig) (*staging, error) {
 		reg:    st.reg,
 		client: control.NewClient(control.NewTransport()),
 		wake:   make(chan struct{}, 1),
-		sem:    make(chan struct{}, cfg.jobs),
+		sem:    make(chan struct{}, cfg.maxPulls),
 		ctx:    ctx,
 		cancel: cancel,
 		index:  map[xet.XorbHash]*list.Element{},
@@ -235,7 +235,7 @@ func (m *staging) evict() {
 	}
 }
 
-// seed asks the best-ranked live seeds not yet holding each local xorb to pull it, within the job slots.
+// seed asks the best-ranked live seeds not yet holding each local xorb to pull it, within maxPulls.
 func (m *staging) seed() {
 	now := time.Now()
 	m.mu.Lock()

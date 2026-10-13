@@ -75,13 +75,13 @@ func (p *Peer) admit(hash xet.XorbHash, size int64, f *pull) {
 	}
 	p.index[hash] = p.lru.PushBack(&ready{hash: hash, size: size, pull: f})
 	p.usage += size
-	p.notify()
+	p.kick()
 	p.evict()
 }
 
 // evict deletes least recently used objects nobody reads until usage fits; caller holds p.mu.
 func (p *Peer) evict() {
-	for e := p.lru.Front(); e != nil && p.cfg.CacheSize > 0 && p.usage > p.cfg.CacheSize; {
+	for e := p.lru.Front(); e != nil && p.cfg.XorbCacheSize > 0 && p.usage > p.cfg.XorbCacheSize; {
 		next := e.Next()
 		r := e.Value.(*ready)
 		if r.pins == 0 && (r.pull == nil || r.pull.refs == 0) {
@@ -101,7 +101,7 @@ func (p *Peer) forget(e *list.Element) {
 	p.lru.Remove(e)
 	delete(p.index, r.hash)
 	p.usage -= r.size
-	p.notify()
+	p.kick()
 }
 
 // drop forgets r after its file was confirmed missing; a newer generation of the same hash stays.
@@ -138,8 +138,8 @@ func (p *Peer) unpin(r *ready) {
 	p.evict()
 }
 
-// notify wakes the announcer without blocking; safe under p.mu and after Close.
-func (p *Peer) notify() {
+// kick wakes the announcer without blocking; safe under p.mu and after Close.
+func (p *Peer) kick() {
 	select {
 	case p.wake <- struct{}{}:
 	default:

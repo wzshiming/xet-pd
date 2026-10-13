@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/wzshiming/xet-pd/apis"
+	"github.com/wzshiming/xet-pd/internal/clustertest"
 	"github.com/wzshiming/xet-pd/internal/hubtest"
 )
 
@@ -43,7 +44,7 @@ func TestAnnounceRegistersCanonicalInventory(t *testing.T) {
 	if status != http.StatusOK || resp.Resync || resp.TTL != 2 {
 		t.Fatalf("full announce = %d %q %+v, want ttl 2", status, body, resp)
 	}
-	d := diag(t, srv.URL)
+	d := clustertest.Diag(t, srv.URL)
 	if len(d.Peers) != 1 || d.Peers[0].ID != "p1" || d.Peers[0].URL != "http://127.0.0.1:1" || d.Peers[0].Epoch != "e1" || d.Peers[0].Holdings != 1 {
 		t.Fatalf("registry = %+v, want canonical origin and one holding", d.Peers)
 	}
@@ -55,11 +56,11 @@ func TestAnnounceRegistersCanonicalInventory(t *testing.T) {
 		t.Fatalf("delta remove = %d %+v, holders %d", status, resp, g.reg.aliveHolders(testHash))
 	}
 	status, _, resp = post(t, srv, announceJSON(t, apis.AnnounceRequest{Peer: apis.Peer{ID: "p1", URL: "http://127.0.0.1:1"}, Epoch: "e2", Add: []string{testHash}}))
-	if status != http.StatusOK || !resp.Resync || len(diag(t, srv.URL).Peers) != 0 {
+	if status != http.StatusOK || !resp.Resync || len(clustertest.Diag(t, srv.URL).Peers) != 0 {
 		t.Fatalf("delta from a new epoch = %d %+v, want resync and the peer dropped", status, resp)
 	}
 	status, _, resp = post(t, srv, announceJSON(t, apis.AnnounceRequest{Peer: apis.Peer{ID: "p1", URL: "http://127.0.0.1:1"}, Epoch: "e2", Full: true}))
-	if d := diag(t, srv.URL); status != http.StatusOK || resp.Resync || len(d.Peers) != 1 || d.Peers[0].Holdings != 0 {
+	if d := clustertest.Diag(t, srv.URL); status != http.StatusOK || resp.Resync || len(d.Peers) != 1 || d.Peers[0].Holdings != 0 {
 		t.Fatalf("empty full = %d %+v %+v", status, resp, d.Peers)
 	}
 }
@@ -108,7 +109,7 @@ func TestAnnounceRejectsInvalidRequestsAtomically(t *testing.T) {
 			t.Fatalf("%s: error echoes request data: %q", tt.name, body)
 		}
 	}
-	if d := diag(t, srv.URL); len(d.Peers) != 0 || g.reg.aliveHolders(testHash) != 0 {
+	if d := clustertest.Diag(t, srv.URL); len(d.Peers) != 0 || g.reg.aliveHolders(testHash) != 0 {
 		t.Fatalf("registry changed by invalid announces: %+v", d.Peers)
 	}
 }

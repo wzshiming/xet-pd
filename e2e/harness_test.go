@@ -6,14 +6,11 @@ package e2e
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"io/fs"
-	"math/rand/v2"
 	"net"
 	"net/http"
 	"os"
@@ -30,9 +27,9 @@ import (
 	"github.com/wzshiming/xet/client"
 	"github.com/wzshiming/xet/client/hf"
 	"github.com/wzshiming/xet/download"
-	"github.com/wzshiming/xet/xorb"
 
 	"github.com/wzshiming/xet-pd/apis"
+	"github.com/wzshiming/xet-pd/internal/clustertest"
 )
 
 const (
@@ -328,17 +325,6 @@ func runCLI(t *testing.T, args []string, env ...string) (code int, stdout, stder
 	return cmd.ProcessState.ExitCode(), out.String(), errOut.String()
 }
 
-func waitFor(t *testing.T, timeout time.Duration, what string, cond func() bool) {
-	t.Helper()
-	deadline := time.Now().Add(timeout)
-	for !cond() {
-		if time.Now().After(deadline) {
-			t.Fatalf("timed out after %v waiting for %s", timeout, what)
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-}
-
 var noRedirect = &http.Client{Timeout: 30 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 
 // request performs one request without following redirects and returns the response and body.
@@ -410,22 +396,12 @@ func plainGet(t *testing.T, url string) []byte {
 func headReady(t *testing.T, resolveURL string) http.Header {
 	t.Helper()
 	var hdr http.Header
-	waitFor(t, ingestTimeout, "ingest of "+resolveURL, func() bool {
+	clustertest.WaitFor(t, ingestTimeout, "ingest of "+resolveURL, func() bool {
 		resp, _ := request(t, http.MethodHead, resolveURL, "")
 		hdr = resp.Header
 		return resp.StatusCode == http.StatusOK && hdr.Get("X-Xet-Hash") != ""
 	})
 	return hdr
-}
-
-func diag(t *testing.T, gw string) apis.PeersResponse {
-	t.Helper()
-	resp, body := request(t, http.MethodGet, gw+apis.PeersPath, "")
-	var d apis.PeersResponse
-	if resp.StatusCode != http.StatusOK || json.Unmarshal(body, &d) != nil {
-		t.Fatalf("GET %s = %d %q", apis.PeersPath, resp.StatusCode, body)
-	}
-	return d
 }
 
 // seeded reports whether the gateway stages nothing while each of n live peers holds count xorbs.
@@ -534,35 +510,4 @@ func xorbHashes(t *testing.T, base string) []string {
 	}
 	slices.Sort(out)
 	return out
-}
-
-func sha(data []byte) string {
-	sum := sha256.Sum256(data)
-	return hex.EncodeToString(sum[:])
-}
-
-// randomData is deterministic incompressible content.
-func randomData(seed byte, n int) []byte {
-	b := make([]byte, n)
-	_, _ = rand.NewChaCha8([32]byte{seed}).Read(b)
-	return b
-}
-
-// xorbBody packs deterministic incompressible chunks with the real encoder.
-func xorbBody(t *testing.T, seed byte, chunks, chunkSize int) (xet.XorbHash, []byte) {
-	t.Helper()
-	var buf bytes.Buffer
-	enc := xorb.NewEncoder(&buf, true)
-	rng := rand.NewChaCha8([32]byte{seed})
-	chunk := make([]byte, chunkSize)
-	for range chunks {
-		_, _ = rng.Read(chunk)
-		if _, err := enc.Write(chunk); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := enc.Close(); err != nil {
-		t.Fatal(err)
-	}
-	return enc.SummoryHash(), buf.Bytes()
 }

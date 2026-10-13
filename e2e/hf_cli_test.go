@@ -31,6 +31,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/wzshiming/xet-pd/internal/clustertest"
 )
 
 // The fixture is a pinned public xet-backed file on huggingface.co.
@@ -56,7 +58,7 @@ func TestHFCLI(t *testing.T) {
 	for range 2 {
 		peers = append(peers, startPeer(t, gw.URL, secret, []string{"-heartbeat", "100ms"}))
 	}
-	waitFor(t, readyTimeout, "both seeds to register", func() bool { return len(diag(t, gw.URL).Peers) == 2 })
+	clustertest.WaitFor(t, readyTimeout, "both seeds to register", func() bool { return len(clustertest.Diag(t, gw.URL).Peers) == 2 })
 	front := newFront(t, gw.URL)
 	guard := newRefuser(t)
 	resolveURL := gw.URL + "/" + hfRepo + "/resolve/" + hfRevision + "/" + hfFile
@@ -67,8 +69,8 @@ func TestHFCLI(t *testing.T) {
 	}
 	fileHash := headReady(t, resolveURL).Get("X-Xet-Hash")
 	xorbs := hashesOf(reconstructionURLs(t, gw.URL, fileHash))
-	waitFor(t, seedTimeout, "both seeds to hold every xorb and the gateway to evict them", func() bool {
-		return seeded(diag(t, gw.URL), 2, len(xorbs))
+	clustertest.WaitFor(t, seedTimeout, "both seeds to hold every xorb and the gateway to evict them", func() bool {
+		return seeded(clustertest.Diag(t, gw.URL), 2, len(xorbs))
 	})
 	for _, p := range peers {
 		if got := xorbHashes(t, p.CacheDir); !slices.Equal(got, xorbs) {
@@ -86,7 +88,7 @@ func TestHFCLI(t *testing.T) {
 		t.Errorf("cold run tunneled %d origin bytes, want at least %d", coldBytes, hfFileSize/2)
 	}
 	coldHits := front.reset()
-	before := diag(t, gw.URL)
+	before := clustertest.Diag(t, gw.URL)
 	front.noBridge.Store(true)
 
 	warmPath, warmLog := runHF(t, hfPath, front.URL, guard.URL)
@@ -95,7 +97,7 @@ func TestHFCLI(t *testing.T) {
 	}
 	warmBytes := origin.bytes.Load() - coldBytes
 	warmHits := front.reset()
-	after := diag(t, gw.URL)
+	after := clustertest.Diag(t, gw.URL)
 	if after.XorbGets != before.XorbGets || after.XorbBytes != 0 {
 		t.Errorf("gateway xorb gets %+v -> %+v and %d staged bytes during the warm run", before.XorbGets, after.XorbGets, after.XorbBytes)
 	}
@@ -237,7 +239,7 @@ func fileDigest(t *testing.T, p string) (string, int64) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return sha(data), int64(len(data))
+	return clustertest.SHA256(data), int64(len(data))
 }
 
 // hashesOf lists the distinct xorbs the fetch URLs name, sorted.

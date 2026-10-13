@@ -21,6 +21,7 @@ import (
 	"github.com/wzshiming/xet"
 
 	"github.com/wzshiming/xet-pd/apis"
+	"github.com/wzshiming/xet-pd/internal/clustertest"
 	"github.com/wzshiming/xet-pd/internal/hubtest"
 )
 
@@ -35,7 +36,7 @@ func startCluster(t *testing.T, hub *hubtest.Hub, minSeeds int, peerFlags ...str
 	for range 2 {
 		peers = append(peers, startPeer(t, gw.URL, secret, append([]string{"-heartbeat", "100ms"}, peerFlags...)))
 	}
-	waitFor(t, readyTimeout, "both seeds to register", func() bool { return len(diag(t, gw.URL).Peers) == 2 })
+	clustertest.WaitFor(t, readyTimeout, "both seeds to register", func() bool { return len(clustertest.Diag(t, gw.URL).Peers) == 2 })
 	return gw, peers
 }
 
@@ -58,20 +59,20 @@ func seedOf(t *testing.T, peers []*peerProc, urls []string) *peerProc {
 
 func TestSeedsPulledAfterIngest(t *testing.T) {
 	hub := hubtest.New(t)
-	data := randomData(1, 1<<20)
+	data := clustertest.RandomData(1, 1<<20)
 	hub.Set(modelPath, data)
 	gw, peers := startCluster(t, hub, 2)
 	url := gw.URL + modelPath
 
-	if got := plainGet(t, url); sha(got) != sha(data) {
-		t.Fatalf("cold plain GET returned %d bytes with sha %s", len(got), sha(got))
+	if got := plainGet(t, url); clustertest.SHA256(got) != clustertest.SHA256(data) {
+		t.Fatalf("cold plain GET returned %d bytes with sha %s", len(got), clustertest.SHA256(got))
 	}
 	fileHash := headReady(t, url).Get("X-Xet-Hash")
-	waitFor(t, seedTimeout, "both seeds to hold the xorb and the gateway to evict it", func() bool { return seeded(diag(t, gw.URL), 2, 1) })
+	clustertest.WaitFor(t, seedTimeout, "both seeds to hold the xorb and the gateway to evict it", func() bool { return seeded(clustertest.Diag(t, gw.URL), 2, 1) })
 	if left := xorbHashes(t, filepath.Join(gw.StorageDir, "data")); len(left) != 0 {
 		t.Fatalf("gateway still stores %v after seeding", left)
 	}
-	before := diag(t, gw.URL)
+	before := clustertest.Diag(t, gw.URL)
 	if before.XorbGets != (apis.XorbGets{Peer: 2}) {
 		t.Fatalf("xorb gets after seeding = %+v, want two seed pulls", before.XorbGets)
 	}
@@ -81,8 +82,8 @@ func TestSeedsPulledAfterIngest(t *testing.T) {
 	}
 
 	fh, v2, out := xetDownload(t, url)
-	if fh.String() != fileHash || sha(out) != sha(data) {
-		t.Fatalf("xet download: hash %s (resolve %s), %d bytes sha %s", fh, fileHash, len(out), sha(out))
+	if fh.String() != fileHash || clustertest.SHA256(out) != clustertest.SHA256(data) {
+		t.Fatalf("xet download: hash %s (resolve %s), %d bytes sha %s", fh, fileHash, len(out), clustertest.SHA256(out))
 	}
 	var hashes []string
 	for h, fetches := range v2.Xorbs {
@@ -102,7 +103,7 @@ func TestSeedsPulledAfterIngest(t *testing.T) {
 	if g, b := hub.CDN(); g != cdnGets || b != cdnBytes {
 		t.Fatalf("hub CDN grew to %d gets, %d bytes during the xet download", g, b)
 	}
-	if after := diag(t, gw.URL); after.XorbGets != before.XorbGets {
+	if after := clustertest.Diag(t, gw.URL); after.XorbGets != before.XorbGets {
 		t.Fatalf("gateway xorb gets %+v -> %+v during the xet download", before.XorbGets, after.XorbGets)
 	}
 	t.Logf("file %s = xorbs %v on both seeds (%d bytes each); hub CDN %d get, %d bytes; gateway xorb gets %+v", fileHash, hashes, xorbSize(t, peers[0].CacheDir, hashes[0]), cdnGets, cdnBytes, before.XorbGets)
@@ -120,28 +121,28 @@ func xorbSize(t *testing.T, base, hash string) int64 {
 
 func TestPeerLossFailsOver(t *testing.T) {
 	hub := hubtest.New(t)
-	data := randomData(2, 1<<20)
+	data := clustertest.RandomData(2, 1<<20)
 	hub.Set(modelPath, data)
 	gw, peers := startCluster(t, hub, 2)
 	url := gw.URL + modelPath
 
 	fileHash := headReady(t, url).Get("X-Xet-Hash")
-	waitFor(t, seedTimeout, "both seeds to hold the xorb and the gateway to evict it", func() bool { return seeded(diag(t, gw.URL), 2, 1) })
+	clustertest.WaitFor(t, seedTimeout, "both seeds to hold the xorb and the gateway to evict it", func() bool { return seeded(clustertest.Diag(t, gw.URL), 2, 1) })
 	victim := seedOf(t, peers, reconstructionURLs(t, gw.URL, fileHash))
 	survivor := peers[1-slices.Index(peers, victim)]
 	cdnGets, _ := hub.CDN()
 
 	victim.kill()
-	waitFor(t, 10*time.Second, "the dead seed to expire", func() bool {
-		d := diag(t, gw.URL)
+	clustertest.WaitFor(t, 10*time.Second, "the dead seed to expire", func() bool {
+		d := clustertest.Diag(t, gw.URL)
 		return len(d.Peers) == 1 && d.Peers[0].URL == survivor.URL && d.Peers[0].Holdings == 1
 	})
 	if got := seedOf(t, peers, reconstructionURLs(t, gw.URL, fileHash)); got != survivor {
 		t.Fatalf("reconstruction after the loss points at %s, want survivor %s", got.URL, survivor.URL)
 	}
 	fh, v2, out := xetDownload(t, url)
-	if fh.String() != fileHash || sha(out) != sha(data) {
-		t.Fatalf("xet download after the loss: hash %s, %d bytes sha %s", fh, len(out), sha(out))
+	if fh.String() != fileHash || clustertest.SHA256(out) != clustertest.SHA256(data) {
+		t.Fatalf("xet download after the loss: hash %s, %d bytes sha %s", fh, len(out), clustertest.SHA256(out))
 	}
 	if got := seedOf(t, peers, fetchURLs(v2)); got != survivor {
 		t.Fatalf("v2 fetch URLs point at %s, want survivor %s", got.URL, survivor.URL)
@@ -149,7 +150,7 @@ func TestPeerLossFailsOver(t *testing.T) {
 	if g, _ := hub.CDN(); g != cdnGets {
 		t.Fatalf("hub CDN gets %d -> %d: the loss re-ingested", cdnGets, g)
 	}
-	if d := diag(t, gw.URL); d.XorbBytes != 0 {
+	if d := clustertest.Diag(t, gw.URL); d.XorbBytes != 0 {
 		t.Fatalf("gateway staged %d bytes after the loss", d.XorbBytes)
 	}
 	t.Logf("killed %s; %s now serves %s; hub CDN gets %d", victim.URL, survivor.URL, fileHash, cdnGets)
@@ -158,7 +159,7 @@ func TestPeerLossFailsOver(t *testing.T) {
 // Seeds sized for one xorb evict a when b arrives, so the gateway re-ingests a from the hub on the next resolve.
 func TestAllSeedsEvictedReingests(t *testing.T) {
 	hub := hubtest.New(t)
-	a, b := randomData(3, 1<<20), randomData(4, 1<<20)
+	a, b := clustertest.RandomData(3, 1<<20), clustertest.RandomData(4, 1<<20)
 	hub.Set("/org/repo/resolve/main/a.bin", a)
 	hub.Set("/org/repo/resolve/main/b.bin", b)
 	gw, peers := startCluster(t, hub, 1, "-xorb-cache-size", strconv.Itoa(5<<18)) // 1.25MiB: one 1MiB xorb plus headers, never two
@@ -171,7 +172,7 @@ func TestAllSeedsEvictedReingests(t *testing.T) {
 	}
 	holding := func(want []string) func() bool {
 		return func() bool {
-			if !seeded(diag(t, gw.URL), 2, len(want)) {
+			if !seeded(clustertest.Diag(t, gw.URL), 2, len(want)) {
 				return false
 			}
 			for _, p := range peers {
@@ -184,21 +185,21 @@ func TestAllSeedsEvictedReingests(t *testing.T) {
 	}
 
 	hashA := headReady(t, urlA).Get("X-Xet-Hash")
-	waitFor(t, ingestTimeout, "one CDN download of a", cdn(1))
-	waitFor(t, seedTimeout, "both seeds to hold a", func() bool { return seeded(diag(t, gw.URL), 2, 1) })
+	clustertest.WaitFor(t, ingestTimeout, "one CDN download of a", cdn(1))
+	clustertest.WaitFor(t, seedTimeout, "both seeds to hold a", func() bool { return seeded(clustertest.Diag(t, gw.URL), 2, 1) })
 	xorbsA := xorbHashes(t, peers[0].CacheDir)
 	if len(xorbsA) != 1 || !slices.Equal(xorbHashes(t, peers[1].CacheDir), xorbsA) {
 		t.Fatalf("seeds store %v and %v after a", xorbsA, xorbHashes(t, peers[1].CacheDir))
 	}
 
 	hashB := headReady(t, urlB).Get("X-Xet-Hash")
-	waitFor(t, ingestTimeout, "one CDN download of b", cdn(2))
-	waitFor(t, seedTimeout, "both seeds to evict a for b", func() bool {
+	clustertest.WaitFor(t, ingestTimeout, "one CDN download of b", cdn(2))
+	clustertest.WaitFor(t, seedTimeout, "both seeds to evict a for b", func() bool {
 		got := xorbHashes(t, peers[0].CacheDir)
 		return len(got) == 1 && got[0] != xorbsA[0] && holding(got)()
 	})
 	xorbsB := xorbHashes(t, peers[0].CacheDir)
-	waitFor(t, readyTimeout, "the reconstruction of a to fail", func() bool {
+	clustertest.WaitFor(t, readyTimeout, "the reconstruction of a to fail", func() bool {
 		resp, _ := request(t, http.MethodGet, gw.URL+"/v1/reconstructions/"+hashA, "")
 		return resp.StatusCode == http.StatusNotFound
 	})
@@ -212,11 +213,11 @@ func TestAllSeedsEvictedReingests(t *testing.T) {
 	if got := headReady(t, urlA).Get("X-Xet-Hash"); got != hashA {
 		t.Fatalf("re-ingested a has hash %s, want %s", got, hashA)
 	}
-	waitFor(t, ingestTimeout, "exactly one more CDN download of a", cdn(3))
-	waitFor(t, seedTimeout, "both seeds to hold a again", holding(xorbsA))
+	clustertest.WaitFor(t, ingestTimeout, "exactly one more CDN download of a", cdn(3))
+	clustertest.WaitFor(t, seedTimeout, "both seeds to hold a again", holding(xorbsA))
 	fh, _, out := xetDownload(t, urlA)
-	if fh.String() != hashA || sha(out) != sha(a) {
-		t.Fatalf("xet download of a: hash %s, %d bytes sha %s", fh, len(out), sha(out))
+	if fh.String() != hashA || clustertest.SHA256(out) != clustertest.SHA256(a) {
+		t.Fatalf("xet download of a: hash %s, %d bytes sha %s", fh, len(out), clustertest.SHA256(out))
 	}
 	if !cdn(3)() {
 		g, n := hub.CDN()
@@ -230,13 +231,13 @@ func TestAllSeedsEvictedReingests(t *testing.T) {
 
 func TestNoPeersServesFromGateway(t *testing.T) {
 	hub := hubtest.New(t)
-	data := randomData(5, 1<<20)
+	data := clustertest.RandomData(5, 1<<20)
 	hub.Set(modelPath, data)
 	gw := startGateway(t, hub.URL, "", []string{"-xorb-cache-size", "1", "-peer-ttl", "2s"})
 	url := gw.URL + modelPath
 
 	fileHash := headReady(t, url).Get("X-Xet-Hash")
-	before := diag(t, gw.URL)
+	before := clustertest.Diag(t, gw.URL)
 	if len(before.Peers) != 0 || before.XorbBytes == 0 || before.XorbGets != (apis.XorbGets{}) {
 		t.Fatalf("diagnostics after ingest = %+v", before)
 	}
@@ -246,28 +247,28 @@ func TestNoPeersServesFromGateway(t *testing.T) {
 	}
 
 	fh, v2, out := xetDownload(t, url)
-	if fh.String() != fileHash || sha(out) != sha(data) {
-		t.Fatalf("xet download: hash %s, %d bytes sha %s", fh, len(out), sha(out))
+	if fh.String() != fileHash || clustertest.SHA256(out) != clustertest.SHA256(data) {
+		t.Fatalf("xet download: hash %s, %d bytes sha %s", fh, len(out), clustertest.SHA256(out))
 	}
 	for _, u := range fetchURLs(v2) {
 		if !strings.HasPrefix(u, gw.URL+"/v1/xorbs/") {
 			t.Fatalf("fetch URL %s is not the gateway", u)
 		}
 	}
-	after := diag(t, gw.URL)
+	after := clustertest.Diag(t, gw.URL)
 	if after.XorbGets.Direct == 0 || after.XorbGets.Peer != 0 || after.XorbBytes != before.XorbBytes {
 		t.Fatalf("diagnostics after the xet download = %+v, before %+v", after, before)
 	}
-	if got := plainGet(t, url); sha(got) != sha(data) {
-		t.Fatalf("warm plain GET returned %d bytes with sha %s", len(got), sha(got))
+	if got := plainGet(t, url); clustertest.SHA256(got) != clustertest.SHA256(data) {
+		t.Fatalf("warm plain GET returned %d bytes with sha %s", len(got), clustertest.SHA256(got))
 	}
 	if g, n := hub.CDN(); g != 1 || n != int64(len(data)) {
 		t.Fatalf("hub CDN = %d gets, %d bytes, want the single ingest", g, n)
 	}
 
 	hub.Close()
-	if got := plainGet(t, gw.URL+"/org/repo/resolve/"+hub.Commit+"/model.bin"); sha(got) != sha(data) {
-		t.Fatalf("offline commit GET returned %d bytes with sha %s", len(got), sha(got))
+	if got := plainGet(t, gw.URL+"/org/repo/resolve/"+hub.Commit+"/model.bin"); clustertest.SHA256(got) != clustertest.SHA256(data) {
+		t.Fatalf("offline commit GET returned %d bytes with sha %s", len(got), clustertest.SHA256(got))
 	}
 	if got := xorbHashes(t, filepath.Join(gw.StorageDir, "data")); !slices.Equal(got, stored) {
 		t.Fatalf("gateway stores %v, want %v retained", got, stored)
@@ -350,7 +351,7 @@ func (g *fakeGateway) added() bool {
 }
 
 func TestServeWhilePulling(t *testing.T) {
-	hash, body := xorbBody(t, 6, 4, 64<<10)
+	hash, body := clustertest.MakeXorb(t, 6, 4, 64<<10)
 	const prefix = 100 << 10
 	fake := newFakeGateway(t, hash, body, prefix)
 	secret := testSecret(t)
@@ -364,7 +365,7 @@ func TestServeWhilePulling(t *testing.T) {
 	if resp, out := request(t, http.MethodPost, p.URL+apis.PullPath, payload, "Content-Type", "application/json", "Authorization", "Bearer "+secret); resp.StatusCode != http.StatusAccepted {
 		t.Fatalf("pull = %d %q", resp.StatusCode, out)
 	}
-	waitFor(t, readyTimeout, "the pull to reach the gateway", func() bool { return fake.getCount() == 1 })
+	clustertest.WaitFor(t, readyTimeout, "the pull to reach the gateway", func() bool { return fake.getCount() == 1 })
 
 	resp, got := request(t, http.MethodGet, u, "", "Range", fmt.Sprintf("bytes=0-%d", prefix-1))
 	if resp.StatusCode != http.StatusPartialContent || !bytes.Equal(got, body[:prefix]) {
@@ -396,7 +397,7 @@ func TestServeWhilePulling(t *testing.T) {
 	if r := <-whole; r.err != nil || r.resp.StatusCode != http.StatusOK || r.resp.ContentLength != int64(len(body)) || !bytes.Equal(r.body, body) {
 		t.Fatalf("whole GET = %v, %d bytes, %v", r.resp, len(r.body), r.err)
 	}
-	waitFor(t, readyTimeout, "the commit to be announced", fake.added)
+	clustertest.WaitFor(t, readyTimeout, "the commit to be announced", fake.added)
 	if got := xorbHashes(t, p.CacheDir); !slices.Equal(got, []string{hash.String()}) {
 		t.Fatalf("seed stores %v, want %s", got, hash)
 	}

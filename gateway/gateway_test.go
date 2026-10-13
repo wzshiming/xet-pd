@@ -2,11 +2,8 @@ package gateway
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"io"
-	"math/rand/v2"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -22,6 +19,7 @@ import (
 	"github.com/wzshiming/xet/client/hf"
 
 	"github.com/wzshiming/xet-pd/apis"
+	"github.com/wzshiming/xet-pd/internal/clustertest"
 	"github.com/wzshiming/xet-pd/internal/hubtest"
 	"github.com/wzshiming/xet-pd/peer"
 )
@@ -89,32 +87,11 @@ func request(t *testing.T, method, url, body string, hdr ...string) (*http.Respo
 	return resp, string(data)
 }
 
-func diag(t *testing.T, gw string) apis.PeersResponse {
-	t.Helper()
-	resp, body := request(t, http.MethodGet, gw+apis.PeersPath, "")
-	var d apis.PeersResponse
-	if resp.StatusCode != http.StatusOK || json.Unmarshal([]byte(body), &d) != nil {
-		t.Fatalf("GET %s = %d %q", apis.PeersPath, resp.StatusCode, body)
-	}
-	return d
-}
-
-func sha(data []byte) string {
-	sum := sha256.Sum256(data)
-	return hex.EncodeToString(sum[:])
-}
-
-func testData(n int) []byte {
-	b := make([]byte, n)
-	_, _ = rand.NewChaCha8([32]byte{7}).Read(b)
-	return b
-}
-
 // waitReady polls the resolve HEAD until the mirror advertises the xet hash and returns that response.
 func waitReady(t *testing.T, resolveURL string) *http.Response {
 	t.Helper()
 	var resp *http.Response
-	waitFor(t, "ingest ready", func() bool {
+	clustertest.WaitFor(t, waitTimeout, "ingest ready", func() bool {
 		resp, _ = request(t, http.MethodHead, resolveURL, "")
 		return resp.Header.Get("X-Xet-Hash") != ""
 	})
@@ -272,7 +249,7 @@ func TestReadOnlySurface(t *testing.T) {
 
 func TestSigningKeyBindsReadTokens(t *testing.T) {
 	hub := hubtest.New(t)
-	data := testData(64 << 10)
+	data := clustertest.RandomData(7, 64<<10)
 	hub.Set("/org/repo/resolve/main/a.bin", data)
 	_, srv := newTestGateway(t, hub, func(cfg *Config, _ string) { cfg.SigningKey = "k" })
 	fileHash := waitReady(t, srv.URL+"/org/repo/resolve/main/a.bin").Header.Get("X-Xet-Hash")
@@ -296,7 +273,7 @@ func TestSigningKeyBindsReadTokens(t *testing.T) {
 	if resp, _ := request(t, http.MethodHead, srv.URL+"/v1/xorbs/default/"+strings.Repeat("11", 32), ""); resp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("anonymous xorb probe = %d, want 401", resp.StatusCode)
 	}
-	if resp, _ := request(t, http.MethodGet, srv.URL+"/xet-bridge/"+sha(data), ""); resp.StatusCode != http.StatusOK {
+	if resp, _ := request(t, http.MethodGet, srv.URL+"/xet-bridge/"+clustertest.SHA256(data), ""); resp.StatusCode != http.StatusOK {
 		t.Fatalf("anonymous bridge = %d, want 200", resp.StatusCode)
 	}
 }
@@ -317,7 +294,7 @@ func TestCloseIsIdempotent(t *testing.T) {
 func TestGatewayIntegration(t *testing.T) {
 	const secret, upstreamToken = "s3cret", "up-tok"
 	hub := hubtest.New(t)
-	data := testData(300 << 10)
+	data := clustertest.RandomData(7, 300<<10)
 	hub.Set("/org/repo/resolve/main/model.bin", data)
 	g, srv := newTestGateway(t, hub, func(cfg *Config, self string) {
 		cfg.Secret, cfg.UpstreamToken, cfg.ExternalURL = secret, upstreamToken, self
@@ -339,10 +316,10 @@ func TestGatewayIntegration(t *testing.T) {
 		}
 		return out
 	}
-	waitFor(t, "peers registered", func() bool { return len(diag(t, srv.URL).Peers) == 2 })
+	clustertest.WaitFor(t, waitTimeout, "peers registered", func() bool { return len(clustertest.Diag(t, srv.URL).Peers) == 2 })
 	for _, addr := range addrs {
-		if !strings.Contains(strings.Join(peerURLs(diag(t, srv.URL)), " "), "http://"+addr) {
-			t.Fatalf("peer %s missing from %v", addr, peerURLs(diag(t, srv.URL)))
+		if !strings.Contains(strings.Join(peerURLs(clustertest.Diag(t, srv.URL)), " "), "http://"+addr) {
+			t.Fatalf("peer %s missing from %v", addr, peerURLs(clustertest.Diag(t, srv.URL)))
 		}
 	}
 
@@ -353,12 +330,12 @@ func TestGatewayIntegration(t *testing.T) {
 	}
 	body, err := io.ReadAll(resp.Body)
 	_ = resp.Body.Close()
-	if err != nil || resp.StatusCode != http.StatusOK || sha(body) != sha(data) {
+	if err != nil || resp.StatusCode != http.StatusOK || clustertest.SHA256(body) != clustertest.SHA256(data) {
 		t.Fatalf("plain GET = %d %v, %d bytes", resp.StatusCode, err, len(body))
 	}
 	ready := waitReady(t, resolveURL)
 	fileHash, etag := ready.Header.Get("X-Xet-Hash"), ready.Header.Get("ETag")
-	if etag != `"`+sha(data)+`"` || ready.Header.Get("X-Repo-Commit") != hub.Commit {
+	if etag != `"`+clustertest.SHA256(data)+`"` || ready.Header.Get("X-Repo-Commit") != hub.Commit {
 		t.Fatalf("ready headers = %v", ready.Header)
 	}
 	if gets, n := hub.CDN(); gets != 1 || n != int64(len(data)) {
@@ -377,8 +354,8 @@ func TestGatewayIntegration(t *testing.T) {
 		}
 		return true
 	}
-	waitFor(t, "seeds hold the xorb", func() bool { return seeded(diag(t, srv.URL)) })
-	if d := diag(t, srv.URL); d.XorbGets != (apis.XorbGets{Peer: 2}) {
+	clustertest.WaitFor(t, waitTimeout, "seeds hold the xorb", func() bool { return seeded(clustertest.Diag(t, srv.URL)) })
+	if d := clustertest.Diag(t, srv.URL); d.XorbGets != (apis.XorbGets{Peer: 2}) {
 		t.Fatalf("xorb gets after seeding = %+v", d.XorbGets)
 	}
 
@@ -412,7 +389,7 @@ func TestGatewayIntegration(t *testing.T) {
 			t.Fatal(err)
 		}
 		out, err := os.ReadFile(f.Name())
-		if err != nil || sha(out) != sha(data) {
+		if err != nil || clustertest.SHA256(out) != clustertest.SHA256(data) {
 			t.Fatalf("xet download: %v, %d bytes", err, len(out))
 		}
 		v1, err := c.GetReconstructionV1(ctx, fh, nil)
@@ -430,7 +407,7 @@ func TestGatewayIntegration(t *testing.T) {
 		if len(v1.FetchInfo) == 0 || !reflect.DeepEqual(batch.FetchInfo, v1.FetchInfo) || !reflect.DeepEqual(batch.Files[fileHash], v1.Terms) || !reflect.DeepEqual(v2.Terms, v1.Terms) {
 			t.Fatalf("batch/v2 differ from v1:\n%+v\n%+v\n%+v", v1, v2, batch)
 		}
-		peers := peerURLs(diag(t, srv.URL))
+		peers := peerURLs(clustertest.Diag(t, srv.URL))
 		for xorbHash, entries := range v1.FetchInfo {
 			multi := v2.Xorbs[xorbHash]
 			if len(multi) != 1 || len(multi[0].Ranges) != len(entries) {
@@ -451,18 +428,18 @@ func TestGatewayIntegration(t *testing.T) {
 	if gets, _ := hub.CDN(); gets != 1 {
 		t.Fatalf("hub CDN gets after xet download = %d, want 1", gets)
 	}
-	if d := diag(t, srv.URL); d.XorbGets != (apis.XorbGets{Peer: 2}) {
+	if d := clustertest.Diag(t, srv.URL); d.XorbGets != (apis.XorbGets{Peer: 2}) {
 		t.Fatalf("xorb gets after xet download = %+v, want no direct gets", d.XorbGets)
 	}
 
 	// Both seeds restart empty on the same addresses: every copy is gone.
-	before := diag(t, srv.URL)
+	before := clustertest.Diag(t, srv.URL)
 	for i, stop := range stops {
 		stop()
 		startPeer(t, srv.URL, secret, addrs[i])
 	}
-	waitFor(t, "seeds re-registered empty", func() bool {
-		d := diag(t, srv.URL)
+	clustertest.WaitFor(t, waitTimeout, "seeds re-registered empty", func() bool {
+		d := clustertest.Diag(t, srv.URL)
 		if len(d.Peers) != 2 {
 			return false
 		}
@@ -476,7 +453,7 @@ func TestGatewayIntegration(t *testing.T) {
 	if resp, _ := request(t, http.MethodGet, srv.URL+"/v1/reconstructions/"+fileHash, ""); resp.StatusCode != http.StatusNotFound {
 		t.Fatalf("reconstruction after total loss = %d, want 404", resp.StatusCode)
 	}
-	if resp, _ := request(t, http.MethodGet, srv.URL+"/xet-bridge/"+sha(data), ""); resp.StatusCode != http.StatusNotFound {
+	if resp, _ := request(t, http.MethodGet, srv.URL+"/xet-bridge/"+clustertest.SHA256(data), ""); resp.StatusCode != http.StatusNotFound {
 		t.Fatalf("bridge after total loss = %d, want 404", resp.StatusCode)
 	}
 
@@ -488,12 +465,12 @@ func TestGatewayIntegration(t *testing.T) {
 	if gets, n := hub.CDN(); gets != 2 || n != 2*int64(len(data)) {
 		t.Fatalf("hub CDN after re-ingest = %d gets, %d bytes", gets, n)
 	}
-	waitFor(t, "seeds hold the xorb again", func() bool { return seeded(diag(t, srv.URL)) })
+	clustertest.WaitFor(t, waitTimeout, "seeds hold the xorb again", func() bool { return seeded(clustertest.Diag(t, srv.URL)) })
 	download()
 	if gets, _ := hub.CDN(); gets != 2 {
 		t.Fatalf("hub CDN gets after second xet download = %d, want 2", gets)
 	}
-	if d := diag(t, srv.URL); d.XorbGets != (apis.XorbGets{Peer: 4}) {
+	if d := clustertest.Diag(t, srv.URL); d.XorbGets != (apis.XorbGets{Peer: 4}) {
 		t.Fatalf("xorb gets at the end = %+v", d.XorbGets)
 	}
 	for _, a := range hub.Auth() {

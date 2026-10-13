@@ -21,6 +21,7 @@ import (
 	"github.com/wzshiming/xet/storage"
 
 	"github.com/wzshiming/xet-pd/apis"
+	"github.com/wzshiming/xet-pd/internal/clustertest"
 )
 
 // pull is one pull request as a fake seed saw it.
@@ -130,16 +131,7 @@ func newTestStaging(t *testing.T, st *store, cfg stagingConfig) *staging {
 	return m
 }
 
-func waitFor(t *testing.T, what string, cond func() bool) {
-	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
-	for !cond() {
-		if time.Now().After(deadline) {
-			t.Fatalf("timed out waiting for %s", what)
-		}
-		time.Sleep(2 * time.Millisecond)
-	}
-}
+const waitTimeout = 5 * time.Second
 
 func hasLocal(t *testing.T, st *store, hash xet.XorbHash) bool {
 	t.Helper()
@@ -164,7 +156,7 @@ func TestPutSeedsReplicasOnce(t *testing.T) {
 	}
 	selected := reg.rank(x.hash.String())[:2]
 	for _, p := range selected {
-		waitFor(t, "pull at "+p.ID, func() bool { return len(seeds[p.ID].requests()) == 1 })
+		clustertest.WaitFor(t, waitTimeout, "pull at "+p.ID, func() bool { return len(seeds[p.ID].requests()) == 1 })
 	}
 	if inserted, err := st.PutXorb(ctx, x.hash, bytes.NewReader(x.body)); err != nil || inserted {
 		t.Fatalf("dedup PutXorb = %v, %v", inserted, err)
@@ -201,7 +193,7 @@ func TestPutSeedsReplicasOnce(t *testing.T) {
 		t.Fatalf("usage after re-insertion = %d, want %d", got, len(x.body))
 	}
 	for _, p := range selected {
-		waitFor(t, "second pull at "+p.ID, func() bool { return len(seeds[p.ID].requests()) == 2 })
+		clustertest.WaitFor(t, waitTimeout, "second pull at "+p.ID, func() bool { return len(seeds[p.ID].requests()) == 2 })
 	}
 }
 
@@ -218,7 +210,7 @@ func TestAcceptedIsNotAHolding(t *testing.T) {
 				t.Fatal(err)
 			}
 			for _, s := range []*seed{s1, s2} {
-				waitFor(t, "pull at "+s.peer.ID, func() bool {
+				clustertest.WaitFor(t, waitTimeout, "pull at "+s.peer.ID, func() bool {
 					if !hasLocal(t, st, x.hash) {
 						t.Fatal("xorb evicted on 202 alone")
 					}
@@ -239,7 +231,7 @@ func TestAcceptedIsNotAHolding(t *testing.T) {
 				s2.holds(x.hash)
 				m.kick()
 			}
-			waitFor(t, "eviction", func() bool { return !hasLocal(t, st, x.hash) })
+			clustertest.WaitFor(t, waitTimeout, "eviction", func() bool { return !hasLocal(t, st, x.hash) })
 			if got := m.snapshot(); got != 0 {
 				t.Fatalf("usage after eviction = %d, want 0", got)
 			}
@@ -266,10 +258,10 @@ func TestNoPeersRetainsUntilRegistered(t *testing.T) {
 	}
 	s := newSeed(t, st, "s1")
 	m.kick()
-	waitFor(t, "pull at the newly registered seed", func() bool { return len(s.requests()) == 1 })
+	clustertest.WaitFor(t, waitTimeout, "pull at the newly registered seed", func() bool { return len(s.requests()) == 1 })
 	s.holds(x.hash)
 	m.kick()
-	waitFor(t, "eviction", func() bool { return !hasLocal(t, st, x.hash) })
+	clustertest.WaitFor(t, waitTimeout, "eviction", func() bool { return !hasLocal(t, st, x.hash) })
 }
 
 // Failed and refused pulls are retried per (xorb, seed) after the backoff; redirects are not followed.
@@ -285,14 +277,14 @@ func TestFailedPullRetriesAfterBackoff(t *testing.T) {
 	if _, err := st.PutXorb(context.Background(), x.hash, bytes.NewReader(x.body)); err != nil {
 		t.Fatal(err)
 	}
-	waitFor(t, "first pull", func() bool { return len(s.requests()) == 1 })
+	clustertest.WaitFor(t, waitTimeout, "first pull", func() bool { return len(s.requests()) == 1 })
 	time.Sleep(40 * time.Millisecond)
 	if n := len(s.requests()); n != 1 {
 		t.Fatalf("%d pulls within the backoff, want 1", n)
 	}
-	waitFor(t, "retry after backoff", func() bool { return len(s.requests()) == 2 })
+	clustertest.WaitFor(t, waitTimeout, "retry after backoff", func() bool { return len(s.requests()) == 2 })
 	s.answer(0, other.URL+apis.PullPath)
-	waitFor(t, "retries past a redirect", func() bool { return len(s.requests()) >= 4 })
+	clustertest.WaitFor(t, waitTimeout, "retries past a redirect", func() bool { return len(s.requests()) >= 4 })
 	if n := elsewhere.Load(); n != 0 {
 		t.Fatalf("redirect target saw %d requests, want none", n)
 	}
@@ -337,7 +329,7 @@ func TestEvictionIsLRU(t *testing.T) {
 			}
 			s.holds(a.hash, b.hash)
 			m.kick()
-			waitFor(t, "eviction of the untouched copy", func() bool { return !hasLocal(t, st, second.hash) })
+			clustertest.WaitFor(t, waitTimeout, "eviction of the untouched copy", func() bool { return !hasLocal(t, st, second.hash) })
 			if !hasLocal(t, st, first.hash) {
 				t.Fatal("recently read copy evicted")
 			}
@@ -365,7 +357,7 @@ func TestPinnedXorbEvictedAfterUnpin(t *testing.T) {
 		t.Fatal("pinned xorb evicted")
 	}
 	st.unpin(x.hash)
-	waitFor(t, "eviction after unpin", func() bool { return !hasLocal(t, st, x.hash) })
+	clustertest.WaitFor(t, waitTimeout, "eviction after unpin", func() bool { return !hasLocal(t, st, x.hash) })
 	if got := m.snapshot(); got != 0 {
 		t.Fatalf("usage = %d, want 0", got)
 	}
@@ -393,13 +385,13 @@ func TestRestartScansExistingObjects(t *testing.T) {
 	if got := m.snapshot(); got != int64(len(a.body)+len(b.body)) {
 		t.Fatalf("usage after restart = %d, want %d", got, len(a.body)+len(b.body))
 	}
-	waitFor(t, "pulls of the scanned copies", func() bool { return len(s1.requests()) == 2 })
+	clustertest.WaitFor(t, waitTimeout, "pulls of the scanned copies", func() bool { return len(s1.requests()) == 2 })
 	s2 := newSeed(t, st, "s2")
 	m.kick()
-	waitFor(t, "pulls at the late seed", func() bool { return len(s2.requests()) == 2 })
+	clustertest.WaitFor(t, waitTimeout, "pulls at the late seed", func() bool { return len(s2.requests()) == 2 })
 	s1.holds(a.hash, b.hash)
 	m.kick()
-	waitFor(t, "eviction of the oldest copy", func() bool { return !hasLocal(t, st, a.hash) })
+	clustertest.WaitFor(t, waitTimeout, "eviction of the oldest copy", func() bool { return !hasLocal(t, st, a.hash) })
 	if !hasLocal(t, st, b.hash) {
 		t.Fatal("newer copy evicted before the older one")
 	}
@@ -418,7 +410,7 @@ func TestCloseCancelsHungPull(t *testing.T) {
 	if _, err := st.PutXorb(ctx, x.hash, bytes.NewReader(x.body)); err != nil {
 		t.Fatal(err)
 	}
-	waitFor(t, "hung pull", func() bool { return len(s.requests()) == 1 })
+	clustertest.WaitFor(t, waitTimeout, "hung pull", func() bool { return len(s.requests()) == 1 })
 	done := make(chan struct{})
 	go func() {
 		_ = m.Close()
@@ -429,7 +421,7 @@ func TestCloseCancelsHungPull(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("Close did not return while a pull request hung")
 	}
-	waitFor(t, "seed to see the cancellation", func() bool { return s.cancellations() == 1 })
+	clustertest.WaitFor(t, waitTimeout, "seed to see the cancellation", func() bool { return s.cancellations() == 1 })
 	s2 := newSeed(t, st, "s2")
 	m.kick()
 	if _, err := st.PutXorb(ctx, y.hash, bytes.NewReader(y.body)); err != nil {

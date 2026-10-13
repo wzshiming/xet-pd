@@ -19,6 +19,7 @@ import (
 
 	"github.com/wzshiming/xet-pd/apis"
 	"github.com/wzshiming/xet-pd/gateway"
+	"github.com/wzshiming/xet-pd/internal/clustertest"
 	"github.com/wzshiming/xet-pd/peer"
 )
 
@@ -399,15 +400,6 @@ func (g *fakeGateway) count() int {
 	return g.announces
 }
 
-func waitFor(t *testing.T, what string, cond func() bool) {
-	t.Helper()
-	for deadline := time.Now().Add(10 * time.Second); !cond(); time.Sleep(5 * time.Millisecond) {
-		if time.Now().After(deadline) {
-			t.Fatalf("timed out waiting for %s", what)
-		}
-	}
-}
-
 // chanWriter hands every write to the test as it happens.
 type chanWriter chan string
 
@@ -488,7 +480,7 @@ func TestRunPeerServesUntilCancelled(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("healthz = %d", resp.StatusCode)
 	}
-	waitFor(t, "first announce", func() bool { return gw.count() > 0 })
+	clustertest.WaitFor(t, 10*time.Second, "first announce", func() bool { return gw.count() > 0 })
 	cancel()
 	if got := await(t, "exit", code); got != 0 {
 		t.Fatalf("run = %d, want 0; stderr %q", got, stderr.String())

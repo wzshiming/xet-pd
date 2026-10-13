@@ -23,6 +23,7 @@ import (
 	"github.com/wzshiming/xet"
 
 	"github.com/wzshiming/xet-pd/apis"
+	"github.com/wzshiming/xet-pd/internal/clustertest"
 )
 
 // serveByHash serves the body registered for the requested xorb hash.
@@ -41,8 +42,8 @@ func serveByHash(bodies map[xet.XorbHash][]byte) http.HandlerFunc {
 // settled waits until no pull, spool or pinned reader is left.
 func settled(t *testing.T, p *Peer) {
 	t.Helper()
-	waitFor(t, "spool cleanup", spoolEmpty(p))
-	waitFor(t, "readers released", func() bool {
+	clustertest.WaitFor(t, waitTimeout, "spool cleanup", spoolEmpty(p))
+	clustertest.WaitFor(t, waitTimeout, "readers released", func() bool {
 		p.mu.Lock()
 		defer p.mu.Unlock()
 		for _, e := range p.index {
@@ -119,8 +120,8 @@ func finishHeld(t *testing.T, w *holdWriter, done <-chan struct{}, want []byte) 
 }
 
 func TestStartupDropsCorruptObject(t *testing.T) {
-	a, bodyA := makeXorb(t, 22, 2, 8<<10)
-	b, bodyB := makeXorb(t, 23, 2, 8<<10)
+	a, bodyA := clustertest.MakeXorb(t, 22, 2, 8<<10)
+	b, bodyB := clustertest.MakeXorb(t, 23, 2, 8<<10)
 	dir := t.TempDir()
 	seedStore(t, dir, a, bodyA)
 	corrupt := bytes.Clone(bodyB)
@@ -145,15 +146,15 @@ func TestStartupDropsCorruptObject(t *testing.T) {
 }
 
 func TestPullEntersInventoryOnlyAfterValidation(t *testing.T) {
-	hash, body := makeXorb(t, 24, 4, 16<<10)
+	hash, body := clustertest.MakeXorb(t, 24, 4, 16<<10)
 	release := make(chan struct{})
 	g := newGateway(t, gatedBody(body, 4<<10, release))
 	p, srv := newTestPeer(t, g.URL, func(c *Config) { c.Heartbeat = 20 * time.Millisecond })
 	late := doAsync(t, xorbURL(srv, hash))
-	waitFor(t, "pull start", func() bool { return g.gets.Load() == 1 })
+	clustertest.WaitFor(t, waitTimeout, "pull start", func() bool { return g.gets.Load() == 1 })
 	// Heartbeats keep flowing while the pull is gated; none may carry the object.
 	before := g.announceCount()
-	waitFor(t, "heartbeats", func() bool { return g.announceCount() >= before+3 })
+	clustertest.WaitFor(t, waitTimeout, "heartbeats", func() bool { return g.announceCount() >= before+3 })
 	g.mu.Lock()
 	for i, a := range g.announces {
 		if hasAdd(a, hash) || (i > 0 && (a.req.Full || len(a.req.Add)+len(a.req.Remove) != 0)) {
@@ -173,7 +174,7 @@ func TestPullEntersInventoryOnlyAfterValidation(t *testing.T) {
 }
 
 func TestAnnounceFailureRetriesAsFull(t *testing.T) {
-	hash, body := makeXorb(t, 25, 2, 8<<10)
+	hash, body := clustertest.MakeXorb(t, 25, 2, 8<<10)
 	g := newGateway(t, serveBody(body))
 	var fails atomic.Int32
 	fails.Store(2)
@@ -214,8 +215,8 @@ func TestAnnounceFailureRetriesAsFull(t *testing.T) {
 
 // The gateway applies an announce but loses the reply; the inventory changes back before the retry, so only a Full can correct its view.
 func TestAmbiguousAnnounceReplyForcesFullReconciliation(t *testing.T) {
-	a, bodyA := makeXorb(t, 44, 2, 8<<10)
-	b, bodyB := makeXorb(t, 45, 2, 8<<10)
+	a, bodyA := clustertest.MakeXorb(t, 44, 2, 8<<10)
+	b, bodyB := clustertest.MakeXorb(t, 45, 2, 8<<10)
 	modes := map[string]func(http.ResponseWriter){
 		"status":    func(w http.ResponseWriter) { w.WriteHeader(http.StatusInternalServerError) },
 		"malformed": func(w http.ResponseWriter) { _, _ = io.WriteString(w, `{"ttl":`) },
@@ -273,24 +274,24 @@ func TestAmbiguousAnnounceReplyForcesFullReconciliation(t *testing.T) {
 			}
 			check := func(i int, want xet.XorbHash) {
 				t.Helper()
-				waitFor(t, "announce", func() bool { return count() > i })
+				clustertest.WaitFor(t, waitTimeout, "announce", func() bool { return count() > i })
 				mu.Lock()
 				defer mu.Unlock()
 				if got := slices.Sorted(maps.Keys(holdings)); !reqs[i].Full || !slices.Equal(got, hashes(want)) {
 					t.Fatalf("retry = %+v, gateway holdings = %v, want Full with %v", reqs[i], got, hashes(want))
 				}
 			}
-			waitFor(t, "startup ack", func() bool { return count() == 1 })
+			clustertest.WaitFor(t, waitTimeout, "startup ack", func() bool { return count() == 1 })
 			// Add a is applied but its reply is lost; a is evicted before the retry.
 			loseNext.Store(true)
 			pullAndSettle(t, p, srv, a, bodyA)
-			waitFor(t, "lost delta", func() bool { return count() == 2 })
+			clustertest.WaitFor(t, waitTimeout, "lost delta", func() bool { return count() == 2 })
 			pullAndSettle(t, p, srv, b, bodyB)
 			check(2, b)
 			// Remove b is applied but its reply is lost; b is pulled again before the retry.
 			loseNext.Store(true)
 			pullAndSettle(t, p, srv, a, bodyA)
-			waitFor(t, "lost delta", func() bool { return count() == 4 })
+			clustertest.WaitFor(t, waitTimeout, "lost delta", func() bool { return count() == 4 })
 			pullAndSettle(t, p, srv, b, bodyB)
 			check(4, b)
 		})
@@ -298,7 +299,7 @@ func TestAmbiguousAnnounceReplyForcesFullReconciliation(t *testing.T) {
 }
 
 func TestInFlightAnnounceKeepsConcurrentCommitForNextDelta(t *testing.T) {
-	hash, body := makeXorb(t, 26, 2, 8<<10)
+	hash, body := clustertest.MakeXorb(t, 26, 2, 8<<10)
 	g := newGateway(t, serveBody(body))
 	hold := make(chan struct{})
 	g.setReply(func(_ http.ResponseWriter, r *http.Request, _ apis.AnnounceRequest) (int, apis.AnnounceResponse) {
@@ -321,9 +322,9 @@ func TestInFlightAnnounceKeepsConcurrentCommitForNextDelta(t *testing.T) {
 }
 
 func TestResyncSendsFullWithCurrentInventory(t *testing.T) {
-	a, bodyA := makeXorb(t, 27, 2, 8<<10)
-	b, bodyB := makeXorb(t, 28, 2, 8<<10)
-	c, bodyC := makeXorb(t, 29, 2, 8<<10)
+	a, bodyA := clustertest.MakeXorb(t, 27, 2, 8<<10)
+	b, bodyB := clustertest.MakeXorb(t, 28, 2, 8<<10)
+	c, bodyC := clustertest.MakeXorb(t, 29, 2, 8<<10)
 	g := newGateway(t, serveByHash(map[xet.XorbHash][]byte{a: bodyA, b: bodyB, c: bodyC}))
 	var mode atomic.Int32 // 0 ok, 1 fail once, 2 resync once
 	g.setReply(func(_ http.ResponseWriter, _ *http.Request, req apis.AnnounceRequest) (int, apis.AnnounceResponse) {
@@ -420,14 +421,14 @@ func TestAnnounceRejectsMalformedReply(t *testing.T) {
 	t.Cleanup(srv.Close)
 	newTestPeer(t, srv.URL, func(c *Config) { c.Heartbeat = 20 * time.Millisecond })
 	// Every malformed reply is a failure: the Full is resent until a clean ack.
-	waitFor(t, "heartbeat after the ack", func() bool { return reqs.Load() >= int32(len(replies))+1 })
+	clustertest.WaitFor(t, waitTimeout, "heartbeat after the ack", func() bool { return reqs.Load() >= int32(len(replies))+1 })
 	if n := fulls.Load(); n != int32(len(replies)) {
 		t.Fatalf("Full announces = %d, want %d", n, len(replies))
 	}
 }
 
 func TestMissingStoredObjectLeavesInventoryAndPullsAgain(t *testing.T) {
-	hash, body := makeXorb(t, 46, 2, 8<<10)
+	hash, body := clustertest.MakeXorb(t, 46, 2, 8<<10)
 	g := newGateway(t, serveBody(body))
 	p, srv := newTestPeer(t, g.URL, func(c *Config) { c.Heartbeat = time.Hour })
 	g.announce(t, 0)
@@ -459,7 +460,7 @@ func TestMissingStoredObjectLeavesInventoryAndPullsAgain(t *testing.T) {
 }
 
 func TestPullRestoresMissingStoredObject(t *testing.T) {
-	hash, body := makeXorb(t, 49, 2, 8<<10)
+	hash, body := clustertest.MakeXorb(t, 49, 2, 8<<10)
 	gateway := newGateway(t, serveBody(body))
 	seed, _ := newTestPeer(t, gateway.URL, nil)
 	commitDirect(t, seed, hash, body)
@@ -473,7 +474,7 @@ func TestPullRestoresMissingStoredObject(t *testing.T) {
 	if response.Code != http.StatusAccepted {
 		t.Fatalf("pull status = %d, want %d", response.Code, http.StatusAccepted)
 	}
-	waitFor(t, "pull of the missing object", func() bool { return gateway.gets.Load() == 1 })
+	clustertest.WaitFor(t, waitTimeout, "pull of the missing object", func() bool { return gateway.gets.Load() == 1 })
 	settled(t, seed)
 	if !hasXorb(t, seed, hash) {
 		t.Fatal("accepted pull did not restore the missing object")
@@ -481,7 +482,7 @@ func TestPullRestoresMissingStoredObject(t *testing.T) {
 }
 
 func TestStaleReaderDoesNotTouchNewerGeneration(t *testing.T) {
-	hash, body := makeXorb(t, 47, 2, 8<<10)
+	hash, body := clustertest.MakeXorb(t, 47, 2, 8<<10)
 	g := newGateway(t, serveByHash(nil))
 	p, _ := newTestPeer(t, g.URL, func(c *Config) { c.Heartbeat = time.Hour })
 	commitDirect(t, p, hash, body)
@@ -528,7 +529,7 @@ func TestUnreadableStoredObjectIsNotDropped(t *testing.T) {
 	if os.Geteuid() == 0 {
 		t.Skip("root ignores file modes")
 	}
-	hash, body := makeXorb(t, 48, 2, 8<<10)
+	hash, body := clustertest.MakeXorb(t, 48, 2, 8<<10)
 	g := newGateway(t, serveByHash(nil))
 	p, srv := newTestPeer(t, g.URL, func(c *Config) { c.Heartbeat = time.Hour })
 	commitDirect(t, p, hash, body)
@@ -554,8 +555,8 @@ func TestUnreadableStoredObjectIsNotDropped(t *testing.T) {
 }
 
 func TestReadyDecisionSurvivesEviction(t *testing.T) {
-	a, bodyA := makeXorb(t, 49, 2, 8<<10)
-	b, bodyB := makeXorb(t, 50, 2, 8<<10)
+	a, bodyA := clustertest.MakeXorb(t, 49, 2, 8<<10)
+	b, bodyB := clustertest.MakeXorb(t, 50, 2, 8<<10)
 	g := newGateway(t, serveByHash(nil))
 	p, _ := newTestPeer(t, g.URL, func(c *Config) {
 		c.Heartbeat, c.XorbCacheSize = time.Hour, int64(len(bodyA)+len(bodyB)/2)
@@ -585,9 +586,9 @@ func TestReadyDecisionSurvivesEviction(t *testing.T) {
 }
 
 func TestLRUEvictsLeastRecentlyUsed(t *testing.T) {
-	a, bodyA := makeXorb(t, 30, 2, 8<<10)
-	b, bodyB := makeXorb(t, 31, 2, 8<<10)
-	c, bodyC := makeXorb(t, 32, 2, 8<<10)
+	a, bodyA := clustertest.MakeXorb(t, 30, 2, 8<<10)
+	b, bodyB := clustertest.MakeXorb(t, 31, 2, 8<<10)
+	c, bodyC := clustertest.MakeXorb(t, 32, 2, 8<<10)
 	g := newGateway(t, serveByHash(map[xet.XorbHash][]byte{a: bodyA, b: bodyB, c: bodyC}))
 	p, srv := newTestPeer(t, g.URL, func(cfg *Config) {
 		cfg.Heartbeat, cfg.XorbCacheSize = time.Hour, int64(len(bodyA)+len(bodyB))
@@ -618,8 +619,8 @@ func TestLRUEvictsLeastRecentlyUsed(t *testing.T) {
 }
 
 func TestLRUProtectsActiveReadersAndConvergesOnRelease(t *testing.T) {
-	a, bodyA := makeXorb(t, 33, 2, 8<<10)
-	b, bodyB := makeXorb(t, 34, 2, 8<<10)
+	a, bodyA := clustertest.MakeXorb(t, 33, 2, 8<<10)
+	b, bodyB := clustertest.MakeXorb(t, 34, 2, 8<<10)
 	g := newGateway(t, serveByHash(map[xet.XorbHash][]byte{a: bodyA, b: bodyB}))
 	p, srv := newTestPeer(t, g.URL, func(cfg *Config) {
 		cfg.Heartbeat, cfg.XorbCacheSize = time.Hour, int64(len(bodyA)+len(bodyB)/2)
@@ -629,7 +630,7 @@ func TestLRUProtectsActiveReadersAndConvergesOnRelease(t *testing.T) {
 	wa, doneA := serveHeld(t, p, a)
 	wb, doneB := serveHeld(t, p, b)
 	// The pull leaves p.pulls under the lock that admits b; the store file lands earlier.
-	waitFor(t, "b commit", func() bool {
+	clustertest.WaitFor(t, waitTimeout, "b commit", func() bool {
 		p.mu.Lock()
 		defer p.mu.Unlock()
 		return p.pulls[b] == nil
@@ -638,7 +639,7 @@ func TestLRUProtectsActiveReadersAndConvergesOnRelease(t *testing.T) {
 		t.Fatal("object with an active reader was evicted")
 	}
 	finishHeld(t, wa, doneA, bodyA)
-	waitFor(t, "a evicted on release", func() bool { return !hasXorb(t, p, a) })
+	clustertest.WaitFor(t, waitTimeout, "a evicted on release", func() bool { return !hasXorb(t, p, a) })
 	if !hasXorb(t, p, b) {
 		t.Fatal("streamed object evicted while its reader was attached")
 	}
@@ -653,7 +654,7 @@ func TestLRUProtectsActiveReadersAndConvergesOnRelease(t *testing.T) {
 }
 
 func TestOversizedObjectServedThenEvicted(t *testing.T) {
-	hash, body := makeXorb(t, 35, 2, 8<<10)
+	hash, body := clustertest.MakeXorb(t, 35, 2, 8<<10)
 	g := newGateway(t, serveBody(body))
 	var resync atomic.Bool
 	g.setReply(func(_ http.ResponseWriter, _ *http.Request, _ apis.AnnounceRequest) (int, apis.AnnounceResponse) {
@@ -680,10 +681,10 @@ func TestOversizedObjectServedThenEvicted(t *testing.T) {
 }
 
 func TestRestartRebuildsUsageAndOrder(t *testing.T) {
-	a, bodyA := makeXorb(t, 36, 2, 8<<10)
-	b, bodyB := makeXorb(t, 37, 2, 8<<10)
-	c, bodyC := makeXorb(t, 38, 2, 8<<10)
-	d, bodyD := makeXorb(t, 39, 2, 8<<10)
+	a, bodyA := clustertest.MakeXorb(t, 36, 2, 8<<10)
+	b, bodyB := clustertest.MakeXorb(t, 37, 2, 8<<10)
+	c, bodyC := clustertest.MakeXorb(t, 38, 2, 8<<10)
+	d, bodyD := clustertest.MakeXorb(t, 39, 2, 8<<10)
 	dir := t.TempDir()
 	now := time.Now()
 	for _, o := range []struct {
@@ -714,7 +715,7 @@ func TestRestartRebuildsUsageAndOrder(t *testing.T) {
 }
 
 func TestCloseCancelsHungAnnounceAndPull(t *testing.T) {
-	hash, body := makeXorb(t, 40, 4, 16<<10)
+	hash, body := clustertest.MakeXorb(t, 40, 4, 16<<10)
 	g := newGateway(t, gatedBody(body, 4<<10, make(chan struct{})))
 	unblocked := make(chan struct{})
 	g.setReply(func(_ http.ResponseWriter, r *http.Request, _ apis.AnnounceRequest) (int, apis.AnnounceResponse) {
@@ -725,7 +726,7 @@ func TestCloseCancelsHungAnnounceAndPull(t *testing.T) {
 	p, srv := newTestPeer(t, g.URL, func(c *Config) { c.Heartbeat = time.Hour })
 	g.announce(t, 0)
 	late := doAsync(t, xorbURL(srv, hash))
-	waitFor(t, "pull start", func() bool { return g.gets.Load() == 1 })
+	clustertest.WaitFor(t, waitTimeout, "pull start", func() bool { return g.gets.Load() == 1 })
 	closed := make(chan error, 1)
 	go func() { closed <- p.Close() }()
 	select {

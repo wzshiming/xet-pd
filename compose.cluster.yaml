@@ -1,0 +1,93 @@
+# Local test cluster: one gateway and two seed peers.
+# Peers advertise their service names, so hub clients join this network and use HF_ENDPOINT=http://gateway:8080.
+name: xet-pd-cluster
+
+x-app: &app
+  build:
+    context: .
+    target: app
+  image: xet-pd:local
+  restart: unless-stopped
+  stop_grace_period: 15s
+
+x-secret: &secret
+  XET_PD_SECRET: ${XET_PD_SECRET:-xet-pd-local-test}
+
+x-healthcheck: &healthcheck
+  interval: 2s
+  timeout: 2s
+  start_period: 5s
+  retries: 30
+
+services:
+  gateway:
+    <<: *app
+    command:
+      - gateway
+      - -listen=:8080
+      - -storage-dir=/data
+      - "-upstream=${XET_PD_UPSTREAM:-https://huggingface.co}"
+      - -replicas=2
+      - -min-seeds=2
+      - -peer-ttl=10s
+      - "-xorb-cache-size=${XET_PD_XORB_CACHE_SIZE:-1}"
+    environment:
+      <<: *secret
+      XET_PD_UPSTREAM_TOKEN: ${XET_PD_UPSTREAM_TOKEN:-}
+      HTTPS_PROXY: ${XET_PD_PROXY:-}
+      HTTP_PROXY: ${XET_PD_PROXY:-}
+      NO_PROXY: localhost,127.0.0.1,gateway,peer-1,peer-2,host.docker.internal
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    ports:
+      - "127.0.0.1:${XET_PD_PORT:-8080}:8080"
+    volumes:
+      - gateway-data:/data
+    healthcheck:
+      <<: *healthcheck
+      test: [CMD, wget, -q, -O-, "http://127.0.0.1:8080/healthz"]
+
+  peer-1:
+    <<: *app
+    command:
+      - peer
+      - -listen=:8081
+      - -advertise=http://peer-1:8081
+      - -gateway=http://gateway:8080
+      - -cache-dir=/data
+      - "-xorb-cache-size=${XET_PD_PEER_CACHE_SIZE:-128MiB}"
+      - -heartbeat=1s
+    environment: *secret
+    depends_on:
+      gateway:
+        condition: service_healthy
+    volumes:
+      - peer-1-data:/data
+    healthcheck:
+      <<: *healthcheck
+      test: [CMD, wget, -q, -O-, "http://127.0.0.1:8081/healthz"]
+
+  peer-2:
+    <<: *app
+    command:
+      - peer
+      - -listen=:8081
+      - -advertise=http://peer-2:8081
+      - -gateway=http://gateway:8080
+      - -cache-dir=/data
+      - "-xorb-cache-size=${XET_PD_PEER_CACHE_SIZE:-128MiB}"
+      - -heartbeat=1s
+    environment: *secret
+    depends_on:
+      gateway:
+        condition: service_healthy
+    volumes:
+      - peer-2-data:/data
+    healthcheck:
+      <<: *healthcheck
+      test: [CMD, wget, -q, -O-, "http://127.0.0.1:8081/healthz"]
+
+volumes:
+  gateway-data:
+  peer-1-data:
+  peer-2-data:

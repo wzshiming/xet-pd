@@ -1,5 +1,4 @@
-// Package control holds the HTTP plumbing the gateway and its peers share.
-package control
+package apis
 
 import (
 	"crypto/subtle"

@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/wzshiming/xet-pd/apis"
-	"github.com/wzshiming/xet-pd/internal/control"
 )
 
 const (
@@ -85,7 +84,7 @@ func (a *announcer) send(req apis.AnnounceRequest) (apis.AnnounceResponse, error
 	var out apis.AnnounceResponse
 	ctx, cancel := context.WithTimeout(p.ctx, announceTimeout)
 	defer cancel()
-	resp, err := control.PostJSON(ctx, p.control, p.cfg.Gateway+apis.AnnouncePath, p.cfg.Secret, req)
+	resp, err := apis.PostJSON(ctx, p.control, p.cfg.Gateway+apis.AnnouncePath, p.cfg.Secret, req)
 	if err != nil {
 		return out, err
 	}
@@ -93,7 +92,7 @@ func (a *announcer) send(req apis.AnnounceRequest) (apis.AnnounceResponse, error
 	if resp.StatusCode/100 != 2 {
 		return out, fmt.Errorf("gateway status %s", resp.Status)
 	}
-	if err := control.DecodeJSON(resp.Body, maxReplyBytes, &out); err != nil {
+	if err := apis.DecodeJSON(resp.Body, maxReplyBytes, &out); err != nil {
 		return out, fmt.Errorf("gateway reply: %w", err)
 	}
 	return out, nil

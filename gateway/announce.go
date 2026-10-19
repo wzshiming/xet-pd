@@ -9,7 +9,6 @@ import (
 	"github.com/wzshiming/xet"
 
 	"github.com/wzshiming/xet-pd/apis"
-	"github.com/wzshiming/xet-pd/internal/control"
 )
 
 // maxAnnounceBytes bounds one announce body, a Full inventory of about 500k xorbs.
@@ -17,12 +16,12 @@ const maxAnnounceBytes = 32 << 20
 
 // serveAnnounce registers a peer inventory; the registry changes only once the whole request validated.
 func (g *Gateway) serveAnnounce(w http.ResponseWriter, r *http.Request) {
-	if !control.Authorized(r, g.secret) {
+	if !apis.Authorized(r, g.secret) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
 	var req apis.AnnounceRequest
-	if !control.ReadJSON(w, r, maxAnnounceBytes, &req) {
+	if !apis.ReadJSON(w, r, maxAnnounceBytes, &req) {
 		return
 	}
 	req, err := canonical(req)
@@ -56,7 +55,7 @@ func canonical(req apis.AnnounceRequest) (apis.AnnounceRequest, error) {
 	if !validID(req.Peer.ID) || !validID(req.Epoch) {
 		return req, errors.New("invalid peer id or epoch")
 	}
-	u, err := control.Origin(req.Peer.URL)
+	u, err := apis.Origin(req.Peer.URL)
 	if err != nil {
 		return req, fmt.Errorf("peer url: %w", err)
 	}

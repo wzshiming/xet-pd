@@ -21,7 +21,6 @@ import (
 	"github.com/wzshiming/xet/xorb"
 
 	"github.com/wzshiming/xet-pd/apis"
-	"github.com/wzshiming/xet-pd/internal/control"
 )
 
 // relayAttempts bounds the holders tried per remote open.
@@ -59,7 +58,7 @@ func newStore(dir string, reg *registry) (*store, error) {
 	if err := os.MkdirAll(offsetDir, 0o755); err != nil {
 		return nil, err
 	}
-	return &store{Storage: st, reg: reg, offsetDir: offsetDir, transport: control.NewTransport(), pins: map[xet.XorbHash]int{}, writers: map[xet.XorbHash]*writerLock{}}, nil
+	return &store{Storage: st, reg: reg, offsetDir: offsetDir, transport: apis.NewTransport(), pins: map[xet.XorbHash]int{}, writers: map[xet.XorbHash]*writerLock{}}, nil
 }
 
 // lockWriter blocks until this caller is the only writer of hash; the result releases it.

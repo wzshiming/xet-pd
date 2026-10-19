@@ -15,7 +15,6 @@ import (
 	"github.com/wzshiming/xet"
 
 	"github.com/wzshiming/xet-pd/apis"
-	"github.com/wzshiming/xet-pd/internal/control"
 )
 
 // pullTimeout bounds one control request to a seed.
@@ -71,7 +70,7 @@ func newStaging(st *store, cfg stagingConfig) (*staging, error) {
 		cfg:    cfg,
 		st:     st,
 		reg:    st.reg,
-		client: control.NewClient(control.NewTransport()),
+		client: apis.NewClient(apis.NewTransport()),
 		wake:   make(chan struct{}, 1),
 		sem:    make(chan struct{}, cfg.maxPulls),
 		ctx:    ctx,
@@ -277,7 +276,7 @@ func (m *staging) pull(p apis.Peer, hash xet.XorbHash) {
 func (m *staging) request(p apis.Peer, hash xet.XorbHash) error {
 	ctx, cancel := context.WithTimeout(m.ctx, pullTimeout)
 	defer cancel()
-	resp, err := control.PostJSON(ctx, m.client, p.URL+apis.PullPath, m.cfg.secret, apis.PullRequest{Hash: hash.String()})
+	resp, err := apis.PostJSON(ctx, m.client, p.URL+apis.PullPath, m.cfg.secret, apis.PullRequest{Hash: hash.String()})
 	if err != nil {
 		return err
 	}

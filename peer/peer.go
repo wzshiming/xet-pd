@@ -23,7 +23,6 @@ import (
 	"github.com/wzshiming/xet/storage/local"
 
 	"github.com/wzshiming/xet-pd/apis"
-	"github.com/wzshiming/xet-pd/internal/control"
 )
 
 type Config struct {
@@ -39,10 +38,10 @@ type Config struct {
 
 func (c *Config) normalize() error {
 	var err error
-	if c.Advertise, err = control.Origin(c.Advertise); err != nil {
+	if c.Advertise, err = apis.Origin(c.Advertise); err != nil {
 		return fmt.Errorf("advertise: %w", err)
 	}
-	if c.Gateway, err = control.Origin(c.Gateway); err != nil {
+	if c.Gateway, err = apis.Origin(c.Gateway); err != nil {
 		return fmt.Errorf("gateway: %w", err)
 	}
 	if c.CacheDir == "" {
@@ -103,7 +102,7 @@ func New(cfg Config) (*Peer, error) {
 		return nil, err
 	}
 	sum := sha256.Sum256([]byte(cfg.Advertise))
-	transport := control.NewTransport()
+	transport := apis.NewTransport()
 	ctx, cancel := context.WithCancel(context.Background())
 	p := &Peer{
 		cfg:      cfg,
@@ -112,7 +111,7 @@ func New(cfg Config) (*Peer, error) {
 		store:    store,
 		spoolDir: spoolDir,
 		client:   &http.Client{Transport: transport},
-		control:  control.NewClient(transport),
+		control:  apis.NewClient(transport),
 		mux:      http.NewServeMux(),
 		wake:     make(chan struct{}, 1),
 		ctx:      ctx,
@@ -227,12 +226,12 @@ const maxPullBytes = 4096
 
 // servePull starts (or joins) a pull on behalf of the gateway and answers 202 at once.
 func (p *Peer) servePull(w http.ResponseWriter, r *http.Request) {
-	if !control.Authorized(r, p.cfg.Secret) {
+	if !apis.Authorized(r, p.cfg.Secret) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
 	var req apis.PullRequest
-	if !control.ReadJSON(w, r, maxPullBytes, &req) {
+	if !apis.ReadJSON(w, r, maxPullBytes, &req) {
 		return
 	}
 	hash, err := xet.ParseXorbHash(req.Hash)

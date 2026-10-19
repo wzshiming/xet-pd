@@ -20,7 +20,6 @@ import (
 	"github.com/wzshiming/xet/server/hf"
 
 	"github.com/wzshiming/xet-pd/apis"
-	"github.com/wzshiming/xet-pd/internal/control"
 )
 
 // Config configures New; zero values take the noted defaults.
@@ -45,11 +44,11 @@ func (c *Config) normalize() error {
 	if c.Upstream == "" {
 		return errors.New("upstream is required")
 	}
-	if c.Upstream, err = control.Origin(c.Upstream); err != nil {
+	if c.Upstream, err = apis.Origin(c.Upstream); err != nil {
 		return fmt.Errorf("upstream: %w", err)
 	}
 	if c.ExternalURL != "" {
-		if c.ExternalURL, err = control.Origin(c.ExternalURL); err != nil {
+		if c.ExternalURL, err = apis.Origin(c.ExternalURL); err != nil {
 			return fmt.Errorf("external url: %w", err)
 		}
 	}

@@ -1,4 +1,4 @@
-// Package apis defines the xet-pd control wire protocol shared by the gateway and peers.
+// Package apis defines the xet-pd control wire protocol and the HTTP plumbing the gateway and peers share.
 package apis
 
 import "time"

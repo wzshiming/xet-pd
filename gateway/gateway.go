@@ -174,11 +174,15 @@ func route(method string, h http.HandlerFunc) http.HandlerFunc {
 // pathsInfoRe admits the one hub POST that only reads: /api/{type}s/{repo}/paths-info/{rev}.
 var pathsInfoRe = regexp.MustCompile(`^/api/(models|datasets|spaces)/.+/paths-info/[^/]+$`)
 
-// servePublic keeps the CAS and hub surface read-only and tallies xorb GETs; peer pulls carry apis.PeerHeader.
+// telemetryPath takes xet-core >= 1.7.0's per-transfer summary; the CAS handler validates and discards it.
+const telemetryPath = "/v1/telemetry"
+
+// servePublic keeps the CAS and hub surface read-only (GET/HEAD plus two POSTs that write nothing: paths-info reads the hub, telemetry is discarded) and tallies xorb GETs; peer pulls carry apis.PeerHeader.
 func (g *Gateway) servePublic(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case r.Method == http.MethodGet, r.Method == http.MethodHead:
 	case r.Method == http.MethodPost && pathsInfoRe.MatchString(r.URL.EscapedPath()):
+	case r.Method == http.MethodPost && r.URL.Path == telemetryPath:
 	default:
 		http.Error(w, "read-only gateway", http.StatusForbidden)
 		return

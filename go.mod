@@ -5,7 +5,7 @@ go 1.27.1
 require (
 	github.com/wzshiming/httpseek v0.7.0
 	github.com/wzshiming/ioswmr v0.3.1
-	github.com/wzshiming/xet v0.0.0-20261011085732-523c3c339605
+	github.com/wzshiming/xet v0.0.0-20261014100411-c4bc4eb03555
 )
 
 require (

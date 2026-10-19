@@ -12,8 +12,8 @@ github.com/wzshiming/httpseek v0.7.0 h1:fF5DkcNGoEAWbSmaiCn5r5TZB9Evw+EXERVkZbsq
 github.com/wzshiming/httpseek v0.7.0/go.mod h1:YoZhlLIwNjTBDXIT8NpK5zRjOgZouRXPaBfjVXdqMMs=
 github.com/wzshiming/ioswmr v0.3.1 h1:S6sILTfV4tUz3XRfINHSGG0y7280v2Z1B7hs5YJ03ek=
 github.com/wzshiming/ioswmr v0.3.1/go.mod h1:TwwDyS1wnJG3AvKliA+PPB0kliN3yEjsabtH4o7xySQ=
-github.com/wzshiming/xet v0.0.0-20261011085732-523c3c339605 h1:odCi9LbW2keeslqUkM8SwixVM3B9FARhdBpi/IYuMdU=
-github.com/wzshiming/xet v0.0.0-20261011085732-523c3c339605/go.mod h1:iMOlyYhKwKcYCfdQdAEFq4c0p4YESwPnTHzFwe+mUtI=
+github.com/wzshiming/xet v0.0.0-20261014100411-c4bc4eb03555 h1:9cSwW4s+VXhLrB+TH0+Wnulmlo34jlsr4L1t93hHyX4=
+github.com/wzshiming/xet v0.0.0-20261014100411-c4bc4eb03555/go.mod h1:iMOlyYhKwKcYCfdQdAEFq4c0p4YESwPnTHzFwe+mUtI=
 github.com/zeebo/assert v1.1.0 h1:hU1L1vLTHsnO8x8c9KAR5GmM5QscxHg5RNU5z5qbUWY=
 github.com/zeebo/assert v1.1.0/go.mod h1:Pq9JiuJQpG8JLJdtkwrJESF0Foym2/D9XMU5ciN/wJ0=
 github.com/zeebo/blake3 v0.2.4 h1:KYQPkhpRtcqh0ssGYcKLG1JYvddkEA8QwCM/yBqhaZI=

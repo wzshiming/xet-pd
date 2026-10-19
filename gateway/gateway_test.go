@@ -198,6 +198,8 @@ func TestControlRoutes(t *testing.T) {
 	}
 }
 
+const telemetryBody = `{"time":"2026-10-19T00:00:00Z","event":"download","session_id":"s1","user_agent":"xet-core/1.7.0","metrics":{}}`
+
 func TestReadOnlySurface(t *testing.T) {
 	hub := hubtest.New(t)
 	_, srv := newTestGateway(t, hub, func(cfg *Config, _ string) { cfg.UpstreamToken = "up-tok" })
@@ -208,6 +210,11 @@ func TestReadOnlySurface(t *testing.T) {
 		{http.MethodPost, "/v1/shards"},
 		{http.MethodPost, "/v2/shards"},
 		{http.MethodPost, "/v1/chunks/default:query"},
+		{http.MethodPost, "/v1/telemetry/"},
+		{http.MethodPost, "/v1/telemetry/extra"},
+		{http.MethodPost, "/v1/telemetryx"},
+		{http.MethodPut, "/v1/telemetry"},
+		{http.MethodPost, "/V1/telemetry"},
 		{http.MethodDelete, "/api/models/org/repo"},
 		{http.MethodOptions, "/api/models/org/repo/paths-info/main"},
 		{http.MethodPost, "/api/models/org/repo/commit/main"},
@@ -227,6 +234,15 @@ func TestReadOnlySurface(t *testing.T) {
 	}
 	if n := len(hub.Auth()); n != 0 {
 		t.Fatalf("denied requests reached the upstream %d times", n)
+	}
+	if resp, body := request(t, http.MethodPost, srv.URL+"/v1/telemetry", telemetryBody); resp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /v1/telemetry = %d %q, want 200", resp.StatusCode, body)
+	}
+	if resp, body := request(t, http.MethodPost, srv.URL+"/v1/telemetry", "{"); resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("POST /v1/telemetry with a malformed body = %d %q, want 400", resp.StatusCode, body)
+	}
+	if n := len(hub.Auth()); n != 0 {
+		t.Fatalf("telemetry reached the upstream %d times", n)
 	}
 	for _, path := range []string{"/api/models/org/repo/paths-info/main", "/api/datasets/org/paths-info/refs%2Fpr%2F1?expand=1"} {
 		resp, body := request(t, http.MethodPost, srv.URL+path, "paths=a.bin", "Content-Type", "application/x-www-form-urlencoded", "Authorization", "Bearer client-tok")
@@ -275,6 +291,12 @@ func TestSigningKeyBindsReadTokens(t *testing.T) {
 	}
 	if resp, _ := request(t, http.MethodGet, srv.URL+"/xet-bridge/"+clustertest.SHA256(data), ""); resp.StatusCode != http.StatusOK {
 		t.Fatalf("anonymous bridge = %d, want 200", resp.StatusCode)
+	}
+	if resp, body := request(t, http.MethodPost, srv.URL+"/v1/telemetry", telemetryBody); resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("anonymous telemetry = %d %q, want 401", resp.StatusCode, body)
+	}
+	if resp, body := request(t, http.MethodPost, srv.URL+"/v1/telemetry", telemetryBody, "Authorization", "Bearer "+mint(fileHash)); resp.StatusCode != http.StatusOK {
+		t.Fatalf("telemetry with a read token = %d %q, want 200", resp.StatusCode, body)
 	}
 }
 

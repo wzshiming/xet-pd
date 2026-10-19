@@ -119,10 +119,12 @@ func (s *seed) holds(hashes ...xet.XorbHash) {
 	s.st.reg.announce(deltaReq(s.peer, "e", add, nil))
 }
 
-// newTestStaging runs maintenance on wakes only unless the config asks for a period.
+// newTestStaging takes New's replicas and minSeeds defaults and runs maintenance on wakes only unless the config asks for a period.
 func newTestStaging(t *testing.T, st *store, cfg stagingConfig) *staging {
 	t.Helper()
 	cfg.tick = cmp.Or(cfg.tick, time.Hour)
+	cfg.replicas = cmp.Or(cfg.replicas, 2)
+	cfg.minSeeds = cmp.Or(cfg.minSeeds, 1)
 	m, err := newStaging(st, cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -362,6 +364,39 @@ func TestPinnedXorbEvictedAfterUnpin(t *testing.T) {
 	clustertest.WaitFor(t, waitTimeout, "eviction after unpin", func() bool { return !hasLocal(t, st, x.hash) && m.snapshot() == 0 })
 	if got := m.snapshot(); got != 0 {
 		t.Fatalf("usage = %d, want 0", got)
+	}
+}
+
+// A victim whose delete is refused is skipped for the pass: maintenance goes on to seed and Close returns.
+func TestRefusedVictimIsSkipped(t *testing.T) {
+	x, y := makeXorb(t, 60, 2, 4<<10), makeXorb(t, 61, 2, 4<<10)
+	st, _ := newTestStore(t, t.TempDir())
+	s := newSeed(t, st, "s1")
+	m := newTestStaging(t, st, stagingConfig{cacheSize: 1})
+	st.pin(x.hash)
+	t.Cleanup(func() { st.unpin(x.hash) }) // registered after m's Close cleanup, so it runs first and a spinning eviction can end
+	ctx := context.Background()
+	if _, err := st.PutXorb(ctx, x.hash, bytes.NewReader(x.body)); err != nil {
+		t.Fatal(err)
+	}
+	s.holds(x.hash)
+	if _, err := st.PutXorb(ctx, y.hash, bytes.NewReader(y.body)); err != nil {
+		t.Fatal(err)
+	}
+	m.kick()
+	want, _ := json.Marshal(apis.PullRequest{Hash: y.hash.String()})
+	clustertest.WaitFor(t, waitTimeout, "pull of y past the refused victim", func() bool {
+		return slices.ContainsFunc(s.requests(), func(r pull) bool { return r.body == string(want) })
+	})
+	if !hasLocal(t, st, x.hash) {
+		t.Fatal("pinned victim deleted")
+	}
+	done := make(chan struct{})
+	go func() { _ = m.Close(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(waitTimeout):
+		t.Fatal("Close did not return while the refused victim stayed over the cap")
 	}
 }
 

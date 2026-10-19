@@ -525,6 +525,39 @@ func TestStaleReaderDoesNotTouchNewerGeneration(t *testing.T) {
 	settled(t, p)
 }
 
+// A stale reader confirming a miss on a replaced generation neither drops the replacement nor wakes the announcer (pins drop's identity check).
+func TestStaleDropDoesNotAnnounce(t *testing.T) {
+	hash, body := clustertest.MakeXorb(t, 72, 2, 8<<10)
+	g := newGateway(t, serveByHash(nil))
+	p, _ := newTestPeer(t, g.URL, func(c *Config) { c.Heartbeat = time.Hour })
+	commitDirect(t, p, hash, body)
+	_, i := g.findAnnounce(t, 0, func(x announced) bool { return hasAdd(x, hash) })
+	req := httptest.NewRequest(http.MethodGet, "/v1/xorbs/default/"+hash.String(), nil)
+	first, second := p.pin(hash), p.pin(hash)
+	if first == nil || second == nil {
+		t.Fatal("pin failed for a committed object")
+	}
+	if err := p.store.DeleteXorb(context.Background(), hash); err != nil {
+		t.Fatal(err)
+	}
+	_ = p.serveStored(httptest.NewRecorder(), req, first) // confirms the miss: drops the first generation and announces it
+	_, j := g.findAnnounce(t, i+1, func(x announced) bool { return hasRemove(x, hash) })
+	commitDirect(t, p, hash, body)
+	g.findAnnounce(t, j+1, func(x announced) bool { return hasAdd(x, hash) })
+	n := g.announceCount()
+	p.drop(second)
+	p.unpin(second)
+	time.Sleep(150 * time.Millisecond)
+	if got := g.announceCount(); got != n {
+		t.Fatalf("stale drop woke the announcer: %d announces, want %d", got, n)
+	}
+	rd := p.pin(hash)
+	if rd == nil || rd == first {
+		t.Fatal("new generation missing from the inventory")
+	}
+	p.unpin(rd)
+}
+
 func TestUnreadableStoredObjectIsNotDropped(t *testing.T) {
 	if os.Geteuid() == 0 {
 		t.Skip("root ignores file modes")

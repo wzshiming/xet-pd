@@ -12,14 +12,17 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"time"
 
 	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/storage/local"
+	"github.com/wzshiming/xet/xorb"
 
 	"github.com/wzshiming/xet-pd/apis"
 	"github.com/wzshiming/xet-pd/internal/lru"
@@ -36,25 +39,10 @@ type Config struct {
 	Secret        string        // optional bearer token shared with the gateway for pull and announce
 }
 
-func (c *Config) normalize() error {
-	var err error
-	if c.Advertise, err = apis.Origin(c.Advertise); err != nil {
-		return fmt.Errorf("advertise: %w", err)
-	}
-	if c.Gateway, err = apis.Origin(c.Gateway); err != nil {
-		return fmt.Errorf("gateway: %w", err)
-	}
-	if c.CacheDir == "" {
-		return errors.New("cache dir is required")
-	}
-	if c.XorbCacheSize < 0 || c.MaxPulls < 0 || c.PullTimeout < 0 || c.Heartbeat < 0 {
-		return errors.New("negative config value")
-	}
-	c.MaxPulls = cmp.Or(c.MaxPulls, 8)
-	c.PullTimeout = cmp.Or(c.PullTimeout, 10*time.Minute)
-	c.Heartbeat = cmp.Or(c.Heartbeat, 10*time.Second)
-	return nil
-}
+const (
+	announceTimeout = 5 * time.Second
+	maxReplyBytes   = 4096
+)
 
 type Peer struct {
 	cfg      Config
@@ -80,9 +68,22 @@ type Peer struct {
 }
 
 func New(cfg Config) (*Peer, error) {
-	if err := cfg.normalize(); err != nil {
-		return nil, err
+	var err error
+	if cfg.Advertise, err = apis.Origin(cfg.Advertise); err != nil {
+		return nil, fmt.Errorf("advertise: %w", err)
 	}
+	if cfg.Gateway, err = apis.Origin(cfg.Gateway); err != nil {
+		return nil, fmt.Errorf("gateway: %w", err)
+	}
+	if cfg.CacheDir == "" {
+		return nil, errors.New("cache dir is required")
+	}
+	if cfg.XorbCacheSize < 0 || cfg.MaxPulls < 0 || cfg.PullTimeout < 0 || cfg.Heartbeat < 0 {
+		return nil, errors.New("negative config value")
+	}
+	cfg.MaxPulls = cmp.Or(cfg.MaxPulls, 8)
+	cfg.PullTimeout = cmp.Or(cfg.PullTimeout, 10*time.Minute)
+	cfg.Heartbeat = cmp.Or(cfg.Heartbeat, 10*time.Second)
 	store, err := local.NewStorage(local.WithBasePath(cfg.CacheDir))
 	if err != nil {
 		return nil, err
@@ -118,12 +119,103 @@ func New(cfg Config) (*Peer, error) {
 		pulls:    map[xet.XorbHash]*pull{},
 		cooldown: map[xet.XorbHash]cooled{},
 	}
-	if err := p.scan(); err != nil {
+	xorbs, err := lru.Scan(context.Background(), p.store)
+	if err != nil {
 		cancel()
 		return nil, err
 	}
+	p.mu.Lock()
+	for _, x := range xorbs {
+		obj, err := p.store.GetXorbReadSeekCloser(context.Background(), x.Hash)
+		if err == nil {
+			err = xorb.Validate(obj, x.Hash)
+			_ = obj.Close()
+		}
+		if err != nil {
+			slog.Warn("peer: dropping invalid xorb", "hash", x.Hash, "err", err)
+			if err := p.store.DeleteXorb(context.Background(), x.Hash); err != nil {
+				p.mu.Unlock()
+				cancel()
+				return nil, err
+			}
+			continue
+		}
+		p.admit(x.Hash, x.Size, nil)
+	}
+	p.evict()
+	p.mu.Unlock()
+	// The announcer reconciles the gateway's view with the inventory.
 	p.wg.Add(1)
-	go p.announceLoop()
+	go func() {
+		defer p.wg.Done()
+		var acked map[string]struct{} // inventory the gateway confirmed
+		full := true                  // next request carries the whole inventory
+		var failed, warned bool
+		tick := time.NewTicker(p.cfg.Heartbeat)
+		defer tick.Stop()
+		for {
+			wasFull := full
+			p.mu.Lock()
+			select {
+			case <-p.wake: // changes before this snapshot are covered by it
+			default:
+			}
+			snap := make(map[string]struct{}, p.xorbs.Len())
+			for e := range p.xorbs.Oldest() {
+				snap[e.Hash.String()] = struct{}{}
+			}
+			p.mu.Unlock()
+			req := apis.AnnounceRequest{Peer: apis.Peer{ID: p.id, URL: p.cfg.Advertise}, Epoch: p.epoch, Full: full}
+			for h := range snap {
+				if _, ok := acked[h]; full || !ok {
+					req.Add = append(req.Add, h)
+				}
+			}
+			for h := range acked {
+				if _, ok := snap[h]; !ok && !full {
+					req.Remove = append(req.Remove, h)
+				}
+			}
+			slices.Sort(req.Add)
+			slices.Sort(req.Remove)
+			var out apis.AnnounceResponse
+			ctx, cancel := context.WithTimeout(p.ctx, announceTimeout)
+			resp, err := apis.PostJSON(ctx, p.control, p.cfg.Gateway+apis.AnnouncePath, p.cfg.Secret, req)
+			if err == nil {
+				if resp.StatusCode/100 != 2 {
+					err = fmt.Errorf("gateway status %s", resp.Status)
+				} else if derr := apis.DecodeJSON(resp.Body, maxReplyBytes, &out); derr != nil {
+					err = fmt.Errorf("gateway reply: %w", derr)
+				}
+				_ = resp.Body.Close()
+			}
+			cancel()
+			if err != nil {
+				if !failed {
+					slog.Warn("peer: announce", "err", err)
+				}
+				// The gateway may have applied this request, so only a Full can resync it.
+				failed, full = true, true
+			} else {
+				failed = false
+				acked, full = snap, out.Resync
+				if !warned && out.TTL > 0 && p.cfg.Heartbeat >= time.Duration(out.TTL)*time.Second {
+					slog.Warn("peer: heartbeat not shorter than gateway TTL", "heartbeat", p.cfg.Heartbeat, "ttl", out.TTL)
+					warned = true
+				}
+				// A resync to a delta is answered at once; a resync to a Full waits for the heartbeat.
+				if out.Resync && !wasFull && p.ctx.Err() == nil {
+					continue
+				}
+			}
+			select {
+			case <-p.ctx.Done():
+				return
+			case <-tick.C:
+			case <-p.wake:
+			}
+		}
+	}()
 	p.mux.HandleFunc("GET /v1/xorbs/{prefix}/{hash}", p.serveXorb)
 	p.mux.HandleFunc("POST "+apis.PullPath, p.servePull)
 	p.mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
@@ -200,12 +292,31 @@ func (p *Peer) serveXorb(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer f.release()
-	stream, size, err := f.wait(r.Context())
+	// The stream can be served once headers are handled and the size is known, or once the pull finished.
+	size := int64(-1)
+	select {
+	case <-f.started:
+		select {
+		case <-f.done:
+		default:
+			size = f.length
+		}
+	case <-r.Context().Done():
+		err = r.Context().Err()
+	}
+	if err == nil && size < 1 {
+		select {
+		case <-f.done:
+			err, size = f.err, f.size
+		case <-r.Context().Done():
+			err = r.Context().Err()
+		}
+	}
 	if err != nil {
 		http.Error(w, err.Error(), statusOf(err))
 		return
 	}
-	rs, err := stream.NewReadSeeker(0, int(size))
+	rs, err := f.stream.NewReadSeeker(0, int(size))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return

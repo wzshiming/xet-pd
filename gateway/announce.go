@@ -23,7 +23,26 @@ func (g *Gateway) serveAnnounce(w http.ResponseWriter, r *http.Request) {
 	if !apis.ReadJSON(w, r, maxAnnounceBytes, &req) {
 		return
 	}
-	req, err := canonical(req)
+	// Canonical form, as the registry keys it: origin-only URL, lowercase hashes.
+	var err error
+	if !validID(req.Peer.ID) || !validID(req.Epoch) {
+		err = errors.New("invalid peer id or epoch")
+	} else if u, uerr := apis.Origin(req.Peer.URL); uerr != nil {
+		err = fmt.Errorf("peer url: %w", uerr)
+	} else {
+		req.Peer.URL = u
+	lists:
+		for _, list := range [][]string{req.Add, req.Remove} {
+			for i, h := range list {
+				hash, herr := xet.ParseXorbHash(h)
+				if herr != nil {
+					err = fmt.Errorf("xorb hash: %w", herr)
+					break lists
+				}
+				list[i] = hash.String()
+			}
+		}
+	}
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -47,26 +66,4 @@ func validID(s string) bool {
 		}
 	}
 	return true
-}
-
-// canonical validates an announce and returns it as the registry keys it: origin-only URL, lowercase hashes.
-func canonical(req apis.AnnounceRequest) (apis.AnnounceRequest, error) {
-	if !validID(req.Peer.ID) || !validID(req.Epoch) {
-		return req, errors.New("invalid peer id or epoch")
-	}
-	u, err := apis.Origin(req.Peer.URL)
-	if err != nil {
-		return req, fmt.Errorf("peer url: %w", err)
-	}
-	req.Peer.URL = u
-	for _, list := range [][]string{req.Add, req.Remove} {
-		for i, h := range list {
-			hash, err := xet.ParseXorbHash(h)
-			if err != nil {
-				return req, fmt.Errorf("xorb hash: %w", err)
-			}
-			list[i] = hash.String()
-		}
-	}
-	return req, nil
 }

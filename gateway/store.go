@@ -159,24 +159,6 @@ func (s *store) sidecar(hash xet.XorbHash) string {
 	return filepath.Join(s.offsetDir, filepath.FromSlash(storage.ObjectKey("", hash.String())))
 }
 
-// validOffsets accepts what a footer read would: a bounded count, each end within the packed cap and at least a header past the previous.
-func validOffsets(offsets []uint64) error {
-	if len(offsets) > xet.MaxChunksPerXorb {
-		return fmt.Errorf("%d chunk offsets exceed %d", len(offsets), xet.MaxChunksPerXorb)
-	}
-	prev := uint64(0)
-	for _, off := range offsets {
-		if off > apis.MaxXorbBytes {
-			return fmt.Errorf("chunk offset %d exceeds %d", off, apis.MaxXorbBytes)
-		}
-		if off < prev || off-prev < 8 {
-			return fmt.Errorf("chunk offset %d does not follow %d", off, prev)
-		}
-		prev = off
-	}
-	return nil
-}
-
 // readSidecar accepts exactly one bounded JSON array of valid offsets.
 func (s *store) readSidecar(hash xet.XorbHash) ([]uint64, error) {
 	f, err := os.Open(s.sidecar(hash))
@@ -192,8 +174,21 @@ func (s *store) readSidecar(hash xet.XorbHash) ([]uint64, error) {
 	if err == nil {
 		err = json.Unmarshal(data, &offsets)
 	}
-	if err == nil {
-		err = validOffsets(offsets)
+	// Accept what a footer read would: a bounded count, each end within the packed cap and at least a header past the previous.
+	if err == nil && len(offsets) > xet.MaxChunksPerXorb {
+		err = fmt.Errorf("%d chunk offsets exceed %d", len(offsets), xet.MaxChunksPerXorb)
+	}
+	prev := uint64(0)
+	for _, off := range offsets {
+		if err != nil {
+			break
+		}
+		if off > apis.MaxXorbBytes {
+			err = fmt.Errorf("chunk offset %d exceeds %d", off, apis.MaxXorbBytes)
+		} else if off < prev || off-prev < 8 {
+			err = fmt.Errorf("chunk offset %d does not follow %d", off, prev)
+		}
+		prev = off
 	}
 	if err != nil {
 		return nil, fmt.Errorf("offsets sidecar of xorb %s: %w", hash, err)
@@ -224,24 +219,6 @@ func (s *store) writeSidecar(hash xet.XorbHash, offsets []uint64) error {
 	return err
 }
 
-// saveOffsets records the offsets of the committed local bytes and reports their size; the hash does not bind their packing.
-func (s *store) saveOffsets(ctx context.Context, hash xet.XorbHash) (int64, error) {
-	f, err := s.Storage.GetXorbReadSeekCloser(ctx, hash)
-	if err != nil {
-		return 0, err
-	}
-	defer func() { _ = f.Close() }()
-	offsets, err := storage.ReadXorbChunkOffsets(f)
-	if err != nil {
-		return 0, fmt.Errorf("read chunk offsets of xorb %s: %w", hash, err)
-	}
-	size, err := f.Seek(0, io.SeekEnd)
-	if err != nil {
-		return 0, err
-	}
-	return size, s.writeSidecar(hash, offsets)
-}
-
 // PutXorb serializes writers of one hash because the local store lets a second one rename over the first.
 func (s *store) PutXorb(ctx context.Context, hash xet.XorbHash, r io.Reader) (bool, error) {
 	s.pin(hash)
@@ -251,7 +228,21 @@ func (s *store) PutXorb(ctx context.Context, hash xet.XorbHash, r io.Reader) (bo
 	if err != nil {
 		return false, err
 	}
-	size, err := s.saveOffsets(ctx, hash)
+	// Record the offsets of the committed local bytes and their size; the hash does not bind their packing.
+	f, err := s.Storage.GetXorbReadSeekCloser(ctx, hash)
+	if err != nil {
+		return false, err
+	}
+	offsets, err := storage.ReadXorbChunkOffsets(f)
+	if err != nil {
+		_ = f.Close()
+		return false, fmt.Errorf("read chunk offsets of xorb %s: %w", hash, err)
+	}
+	size, err := f.Seek(0, io.SeekEnd)
+	if err == nil {
+		err = s.writeSidecar(hash, offsets)
+	}
+	_ = f.Close()
 	if err != nil {
 		return false, err
 	}
@@ -299,38 +290,30 @@ func (s *store) remote(ctx context.Context, hash xet.XorbHash, start, end int64)
 	}
 	var err error
 	for _, p := range holders[:min(len(holders), relayAttempts)] {
-		var sk *httpseek.Seeker
-		if sk, err = s.open(ctx, p, hash, start, end); err == nil {
-			return sk, nil
+		var req *http.Request
+		if req, err = http.NewRequestWithContext(ctx, http.MethodGet, apis.XorbURL(p.URL, hash.String()), nil); err == nil {
+			req.Header.Set(apis.PeerHeader, "gateway")
+			sk := httpseek.NewRangeSeeker(ctx, s.transport, req, start, end)
+			if end < 0 {
+				if _, err = sk.Seek(0, io.SeekEnd); err == nil {
+					_, err = sk.Seek(start, io.SeekStart)
+				}
+			} else if resp, rerr := sk.Response(); rerr != nil {
+				err = rerr
+			} else if resp.StatusCode != http.StatusPartialContent {
+				err = errors.New(resp.Status)
+			}
+			if err == nil {
+				return sk, nil
+			}
+			_ = sk.Close()
+			err = fmt.Errorf("holder %s: %w", p.ID, err)
 		}
 		if cerr := ctx.Err(); cerr != nil {
 			return nil, cerr
 		}
 	}
 	return nil, fmt.Errorf("xorb %s: %w", hash, err)
-}
-
-func (s *store) open(ctx context.Context, p apis.Peer, hash xet.XorbHash, start, end int64) (*httpseek.Seeker, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, apis.XorbURL(p.URL, hash.String()), nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set(apis.PeerHeader, "gateway")
-	sk := httpseek.NewRangeSeeker(ctx, s.transport, req, start, end)
-	if end < 0 {
-		if _, err = sk.Seek(0, io.SeekEnd); err == nil {
-			_, err = sk.Seek(start, io.SeekStart)
-		}
-	} else if resp, rerr := sk.Response(); rerr != nil {
-		err = rerr
-	} else if resp.StatusCode != http.StatusPartialContent {
-		err = errors.New(resp.Status)
-	}
-	if err != nil {
-		_ = sk.Close()
-		return nil, fmt.Errorf("holder %s: %w", p.ID, err)
-	}
-	return sk, nil
 }
 
 func (s *store) GetXorbReadSeekCloser(ctx context.Context, hash xet.XorbHash) (io.ReadSeekCloser, error) {
@@ -413,21 +396,6 @@ func (s *store) DeleteXorb(ctx context.Context, hash xet.XorbHash) error {
 	return s.Storage.DeleteXorb(ctx, hash)
 }
 
-// stage copies a xorb only holders have into the local store so local verification can read it.
-func (s *store) stage(ctx context.Context, hash xet.XorbHash) error {
-	ok, err := s.Storage.HasXorb(ctx, hash)
-	if err != nil || ok {
-		return err
-	}
-	sk, err := s.remote(ctx, hash, 0, -1)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = sk.Close() }()
-	_, err = s.PutXorb(ctx, hash, sk)
-	return err
-}
-
 // PutShard stages and pins every referenced xorb so the local store's full verification can run; fully indexed shards skip staging.
 func (s *store) PutShard(ctx context.Context, sh *shard.Shard) (bool, error) {
 	indexed := len(sh.Files) > 0
@@ -445,7 +413,20 @@ func (s *store) PutShard(ctx context.Context, sh *shard.Shard) (bool, error) {
 	s.pin(hashes...)
 	defer s.unpin(hashes...)
 	for _, h := range hashes {
-		if err := s.stage(ctx, h); err != nil {
+		ok, err := s.Storage.HasXorb(ctx, h)
+		if err != nil {
+			return false, err
+		}
+		if ok {
+			continue
+		}
+		sk, err := s.remote(ctx, h, 0, -1)
+		if err != nil {
+			return false, err
+		}
+		_, err = s.PutXorb(ctx, h, sk)
+		_ = sk.Close()
+		if err != nil {
 			return false, err
 		}
 	}

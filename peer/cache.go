@@ -5,7 +5,6 @@ import (
 	"log/slog"
 
 	"github.com/wzshiming/xet"
-	"github.com/wzshiming/xet/xorb"
 
 	"github.com/wzshiming/xet-pd/internal/lru"
 )
@@ -14,38 +13,6 @@ import (
 type ready struct {
 	pins int   // open readers of the stored file
 	pull *pull // readers still streaming from the spool hold pull.refs
-}
-
-// scan indexes the committed xorbs oldest first, deleting any that fail validation.
-func (p *Peer) scan() error {
-	ctx := context.Background()
-	xorbs, err := lru.Scan(ctx, p.store)
-	if err != nil {
-		return err
-	}
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	for _, x := range xorbs {
-		if err := p.validateStored(ctx, x.Hash); err != nil {
-			slog.Warn("peer: dropping invalid xorb", "hash", x.Hash, "err", err)
-			if err := p.store.DeleteXorb(ctx, x.Hash); err != nil {
-				return err
-			}
-			continue
-		}
-		p.admit(x.Hash, x.Size, nil)
-	}
-	p.evict()
-	return nil
-}
-
-func (p *Peer) validateStored(ctx context.Context, hash xet.XorbHash) error {
-	obj, err := p.store.GetXorbReadSeekCloser(ctx, hash)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = obj.Close() }()
-	return xorb.Validate(obj, hash)
 }
 
 // admit records a committed xorb as most recently used and trims the cache; caller holds p.mu.
@@ -122,19 +89,4 @@ func (p *Peer) kick() {
 	case p.wake <- struct{}{}:
 	default:
 	}
-}
-
-// inventory snapshots the committed hashes.
-func (p *Peer) inventory() map[string]struct{} {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	select {
-	case <-p.wake: // changes before this snapshot are covered by it
-	default:
-	}
-	out := make(map[string]struct{}, p.xorbs.Len())
-	for e := range p.xorbs.Oldest() {
-		out[e.Hash.String()] = struct{}{}
-	}
-	return out
 }

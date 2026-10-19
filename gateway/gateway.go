@@ -36,37 +36,6 @@ type Config struct {
 	XorbCacheSize int64         // bytes of local xorbs kept, 0 unlimited
 }
 
-func (c *Config) normalize() error {
-	var err error
-	if c.StorageDir == "" {
-		return errors.New("storage dir is required")
-	}
-	if c.Upstream == "" {
-		return errors.New("upstream is required")
-	}
-	if c.Upstream, err = apis.Origin(c.Upstream); err != nil {
-		return fmt.Errorf("upstream: %w", err)
-	}
-	if c.ExternalURL != "" {
-		if c.ExternalURL, err = apis.Origin(c.ExternalURL); err != nil {
-			return fmt.Errorf("external url: %w", err)
-		}
-	}
-	if c.PeerTTL < 0 || c.Replicas < 0 || c.MinSeeds < 0 || c.XorbCacheSize < 0 {
-		return errors.New("negative config value")
-	}
-	c.PeerTTL = cmp.Or(c.PeerTTL, 30*time.Second)
-	if c.PeerTTL < time.Second {
-		return errors.New("peer ttl below 1s")
-	}
-	c.Replicas = cmp.Or(c.Replicas, 2)
-	c.MinSeeds = cmp.Or(c.MinSeeds, 1)
-	if c.MinSeeds > c.Replicas {
-		return errors.New("min seeds exceed replicas")
-	}
-	return nil
-}
-
 // Gateway is the xet-pd central service: a hub mirror whose xorb bytes live on registered peers.
 type Gateway struct {
 	mux       *http.ServeMux
@@ -83,25 +52,41 @@ type Gateway struct {
 
 // New composes the store, hub mirror, CAS server and staging behind one read-only handler.
 func New(cfg Config) (*Gateway, error) {
-	g, err := build(cfg)
-	if err != nil {
-		return nil, fmt.Errorf("gateway: %w", err)
+	var err error
+	if cfg.StorageDir == "" {
+		return nil, errors.New("gateway: storage dir is required")
 	}
-	return g, nil
-}
-
-func build(cfg Config) (*Gateway, error) {
-	if err := cfg.normalize(); err != nil {
-		return nil, err
+	if cfg.Upstream == "" {
+		return nil, errors.New("gateway: upstream is required")
+	}
+	if cfg.Upstream, err = apis.Origin(cfg.Upstream); err != nil {
+		return nil, fmt.Errorf("gateway: upstream: %w", err)
+	}
+	if cfg.ExternalURL != "" {
+		if cfg.ExternalURL, err = apis.Origin(cfg.ExternalURL); err != nil {
+			return nil, fmt.Errorf("gateway: external url: %w", err)
+		}
+	}
+	if cfg.PeerTTL < 0 || cfg.Replicas < 0 || cfg.MinSeeds < 0 || cfg.XorbCacheSize < 0 {
+		return nil, errors.New("gateway: negative config value")
+	}
+	cfg.PeerTTL = cmp.Or(cfg.PeerTTL, 30*time.Second)
+	if cfg.PeerTTL < time.Second {
+		return nil, errors.New("gateway: peer ttl below 1s")
+	}
+	cfg.Replicas = cmp.Or(cfg.Replicas, 2)
+	cfg.MinSeeds = cmp.Or(cfg.MinSeeds, 1)
+	if cfg.MinSeeds > cfg.Replicas {
+		return nil, errors.New("gateway: min seeds exceed replicas")
 	}
 	reg := newRegistry(cfg.PeerTTL)
 	st, err := newStore(filepath.Join(cfg.StorageDir, "data"), reg)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("gateway: %w", err)
 	}
 	issuer, err := auth.NewIssuer([]byte(cfg.SigningKey), 0, nil)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("gateway: %w", err)
 	}
 	mirrorDir := filepath.Join(cfg.StorageDir, "mirror")
 	transport := http.DefaultTransport.(*http.Transport).Clone()
@@ -112,7 +97,7 @@ func build(cfg Config) (*Gateway, error) {
 		mirror.WithTransport(transport),
 	)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("gateway: %w", err)
 	}
 	hub := hf.NewHandler(
 		hf.WithMirror(mir),
@@ -133,7 +118,7 @@ func build(cfg Config) (*Gateway, error) {
 	cas := server.NewHandler(server.WithStorage(st), server.WithAuthorizer(authorizer), server.WithNext(hub))
 	staging, err := newStaging(st, stagingConfig{replicas: cfg.Replicas, minSeeds: cfg.MinSeeds, cacheSize: cfg.XorbCacheSize, secret: cfg.Secret})
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("gateway: %w", err)
 	}
 	g := &Gateway{mux: http.NewServeMux(), cas: cas, reg: reg, st: st, staging: staging, secret: cfg.Secret, transport: transport}
 	g.mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })

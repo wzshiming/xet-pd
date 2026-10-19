@@ -67,15 +67,6 @@ func (r *registry) announce(req apis.AnnounceRequest) apis.AnnounceResponse {
 	return resp
 }
 
-// score is the rendezvous weight of peer id for hash; the length prefix keeps the pair unambiguous.
-func score(id, hash string) uint64 {
-	h := fnv.New64a()
-	h.Write(binary.BigEndian.AppendUint64(nil, uint64(len(hash))))
-	h.Write([]byte(hash))
-	h.Write([]byte(id))
-	return h.Sum64()
-}
-
 // rank lists live peers best first for hash, ties broken by ID.
 func (r *registry) rank(hash string) []ranked {
 	now := r.now()
@@ -86,7 +77,12 @@ func (r *registry) rank(hash string) []ranked {
 			continue
 		}
 		_, holder := p.holdings[hash]
-		list = append(list, ranked{Peer: p.Peer, holder: holder, score: score(p.ID, hash)})
+		// The score is the rendezvous weight of the peer for hash; the length prefix keeps the pair unambiguous.
+		h := fnv.New64a()
+		h.Write(binary.BigEndian.AppendUint64(nil, uint64(len(hash))))
+		h.Write([]byte(hash))
+		h.Write([]byte(p.ID))
+		list = append(list, ranked{Peer: p.Peer, holder: holder, score: h.Sum64()})
 	}
 	r.mu.RUnlock()
 	slices.SortFunc(list, func(a, b ranked) int {

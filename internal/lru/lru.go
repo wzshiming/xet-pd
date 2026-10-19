@@ -57,9 +57,7 @@ func (x *Index[V]) Add(hash xet.XorbHash, size int64, v V) *Entry[V] {
 
 // Touch marks e most recently used; a removed or replaced e is ignored.
 func (x *Index[V]) Touch(e *Entry[V]) {
-	if x.entries[e.Hash] == e.elem {
-		x.order.MoveToBack(e.elem)
-	}
+	x.order.MoveToBack(e.elem)
 }
 
 // Remove unindexes e; a removed or replaced e is ignored, so a replacement under the same hash stays.

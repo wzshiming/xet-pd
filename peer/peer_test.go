@@ -444,9 +444,10 @@ func TestWarmServe(t *testing.T) {
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("bad hash = %d", resp.StatusCode)
 	}
-	resp, _, _ = do(t, http.MethodGet, srv.URL+"/healthz")
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("healthz = %d", resp.StatusCode)
+	for _, method := range []string{http.MethodGet, http.MethodHead} {
+		if resp, _, _ := do(t, method, srv.URL+"/healthz"); resp.StatusCode != http.StatusOK {
+			t.Fatalf("%s /healthz = %d", method, resp.StatusCode)
+		}
 	}
 	resp, _, _ = do(t, http.MethodPut, u)
 	if resp.StatusCode != http.StatusMethodNotAllowed && resp.StatusCode != http.StatusNotFound {
@@ -911,7 +912,7 @@ func TestAcquireAfterCommitReportsReady(t *testing.T) {
 		f.release()
 		t.Fatal("acquire started a redundant pull for a committed xorb")
 	}
-	if rd == nil || rd.hash != hash {
+	if rd == nil || rd.Hash != hash {
 		t.Fatalf("acquire did not reserve the committed xorb: %+v", rd)
 	}
 	p.unpin(rd)

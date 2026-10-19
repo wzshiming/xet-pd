@@ -2,19 +2,18 @@ package gateway
 
 import (
 	"cmp"
-	"container/list"
 	"context"
 	"errors"
 	"io"
 	"log/slog"
 	"net/http"
-	"slices"
 	"sync"
 	"time"
 
 	"github.com/wzshiming/xet"
 
 	"github.com/wzshiming/xet-pd/apis"
+	"github.com/wzshiming/xet-pd/internal/lru"
 )
 
 // pullTimeout bounds one control request to a seed.
@@ -31,10 +30,8 @@ type stagingConfig struct {
 	maxPulls  int           // parallel pull requests, default 8
 }
 
-// staged is one durable local xorb; its LRU position is its recency.
+// staged is the seeding state of one durable local xorb.
 type staged struct {
-	hash  xet.XorbHash
-	size  int64
 	asked map[string]time.Time // seed ID -> when it may be asked again
 }
 
@@ -51,11 +48,9 @@ type staging struct {
 	wg     sync.WaitGroup
 	once   sync.Once
 
-	mu     sync.Mutex // guards the fields below; never held across store or network calls
-	index  map[xet.XorbHash]*list.Element
-	lru    *list.List // front is least recently used
-	usage  int64
-	warned bool // over the cap with nothing evictable, logged once until it clears
+	mu     sync.Mutex        // guards the fields below; never held across store or network calls
+	xorbs  lru.Index[staged] // local copies
+	warned bool              // over the cap with nothing evictable, logged once until it clears
 }
 
 // newStaging indexes the store's local xorbs and hooks the store; call before the store is shared.
@@ -75,8 +70,6 @@ func newStaging(st *store, cfg stagingConfig) (*staging, error) {
 		sem:    make(chan struct{}, cfg.maxPulls),
 		ctx:    ctx,
 		cancel: cancel,
-		index:  map[xet.XorbHash]*list.Element{},
-		lru:    list.New(),
 	}
 	if err := m.scan(); err != nil {
 		cancel()
@@ -88,56 +81,26 @@ func newStaging(st *store, cfg stagingConfig) (*staging, error) {
 	return m, nil
 }
 
-// scan indexes the local xorbs oldest first.
+// scan indexes the local xorbs oldest first, before m is shared.
 func (m *staging) scan() error {
-	type found struct {
-		hash  xet.XorbHash
-		size  int64
-		mtime time.Time
-	}
-	var objs []found
-	err := m.st.WalkXorbs(context.Background(), func(name string, size int64, mtime time.Time) error {
-		if hash, err := xet.ParseXorbHash(name); err == nil {
-			objs = append(objs, found{hash, size, mtime})
-		}
-		return nil
-	})
+	xorbs, err := lru.Scan(context.Background(), m.st)
 	if err != nil {
 		return err
 	}
-	slices.SortFunc(objs, func(a, b found) int {
-		return cmp.Or(a.mtime.Compare(b.mtime), cmp.Compare(a.hash.String(), b.hash.String()))
-	})
-	for _, o := range objs {
-		m.add(o.hash, o.size)
+	for _, x := range xorbs {
+		m.xorbs.Add(x.Hash, x.Size, staged{asked: map[string]time.Time{}})
 	}
 	return nil
-}
-
-// add tracks a new local copy as most recently used; caller holds m.mu or owns m alone.
-func (m *staging) add(hash xet.XorbHash, size int64) {
-	m.index[hash] = m.lru.PushBack(&staged{hash: hash, size: size, asked: map[string]time.Time{}})
-	m.usage += size
-}
-
-// forget untracks e; caller holds m.mu.
-func (m *staging) forget(e *list.Element) {
-	s := m.lru.Remove(e).(*staged)
-	delete(m.index, s.hash)
-	m.usage -= s.size
 }
 
 // stored records a durable local xorb; inserted bytes supersede any copy tracked under the hash.
 func (m *staging) stored(hash xet.XorbHash, size int64, inserted bool) {
 	m.mu.Lock()
-	if e := m.index[hash]; e != nil {
-		if !inserted {
-			m.mu.Unlock()
-			return
-		}
-		m.forget(e)
+	if !inserted && m.xorbs.Get(hash) != nil {
+		m.mu.Unlock()
+		return
 	}
-	m.add(hash, size)
+	m.xorbs.Add(hash, size, staged{asked: map[string]time.Time{}})
 	m.mu.Unlock()
 	m.kick()
 }
@@ -145,8 +108,8 @@ func (m *staging) stored(hash xet.XorbHash, size int64, inserted bool) {
 // touch marks a local xorb most recently used.
 func (m *staging) touch(hash xet.XorbHash) {
 	m.mu.Lock()
-	if e := m.index[hash]; e != nil {
-		m.lru.MoveToBack(e)
+	if e := m.xorbs.Get(hash); e != nil {
+		m.xorbs.Touch(e)
 	}
 	m.mu.Unlock()
 }
@@ -163,7 +126,7 @@ func (m *staging) kick() {
 func (m *staging) snapshot() int64 {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.usage
+	return m.xorbs.Usage()
 }
 
 // Close stops maintenance, cancels in-flight pull requests and waits for them.
@@ -197,38 +160,38 @@ func (m *staging) evict() {
 	if m.cfg.cacheSize <= 0 {
 		return
 	}
-	skip := map[*list.Element]bool{}
+	skip := map[*lru.Entry[staged]]bool{}
 	var skipErr error
 	for {
 		m.mu.Lock()
-		if m.usage <= m.cfg.cacheSize {
+		if m.xorbs.Usage() <= m.cfg.cacheSize {
 			m.warned = false
 			m.mu.Unlock()
 			return
 		}
-		var victim *list.Element
-		for e := m.lru.Front(); e != nil && victim == nil; e = e.Next() {
-			if !skip[e] && m.reg.aliveHolders(e.Value.(*staged).hash.String()) >= m.cfg.minSeeds {
+		var victim *lru.Entry[staged]
+		for e := range m.xorbs.Oldest() {
+			if !skip[e] && m.reg.aliveHolders(e.Hash.String()) >= m.cfg.minSeeds {
 				victim = e
+				break
 			}
 		}
 		if victim == nil {
 			if !m.warned {
-				slog.Warn("gateway: local xorbs over the cache size, nothing evictable yet", "usage", m.usage, "limit", m.cfg.cacheSize, "err", skipErr)
+				slog.Warn("gateway: local xorbs over the cache size, nothing evictable yet", "usage", m.xorbs.Usage(), "limit", m.cfg.cacheSize, "err", skipErr)
 				m.warned = true
 			}
 			m.mu.Unlock()
 			return
 		}
-		s := victim.Value.(*staged)
 		m.mu.Unlock()
-		err := m.st.DeleteXorb(context.Background(), s.hash)
+		err := m.st.DeleteXorb(context.Background(), victim.Hash)
 		m.mu.Lock()
 		switch {
 		case err != nil:
 			skip[victim], skipErr = true, err
-		case m.index[s.hash] == victim: // a copy re-inserted meanwhile is a new entry and stays
-			m.forget(victim)
+		case m.xorbs.Get(victim.Hash) == victim: // a copy re-inserted meanwhile is a new entry and stays
+			m.xorbs.Remove(victim)
 		}
 		m.mu.Unlock()
 	}
@@ -239,16 +202,15 @@ func (m *staging) seed() {
 	now := time.Now()
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	for e := m.lru.Front(); e != nil; e = e.Next() {
-		s := e.Value.(*staged)
-		for id, next := range s.asked {
+	for e := range m.xorbs.Oldest() {
+		for id, next := range e.V.asked {
 			if !now.Before(next) {
-				delete(s.asked, id)
+				delete(e.V.asked, id)
 			}
 		}
-		ranked := m.reg.rank(s.hash.String())
+		ranked := m.reg.rank(e.Hash.String())
 		for _, p := range ranked[:min(len(ranked), m.cfg.replicas)] {
-			if _, asked := s.asked[p.ID]; p.holder || asked {
+			if _, asked := e.V.asked[p.ID]; p.holder || asked {
 				continue
 			}
 			select {
@@ -256,9 +218,9 @@ func (m *staging) seed() {
 			default:
 				return
 			}
-			s.asked[p.ID] = now.Add(m.cfg.retry)
+			e.V.asked[p.ID] = now.Add(m.cfg.retry)
 			m.wg.Add(1)
-			go m.pull(p.Peer, s.hash)
+			go m.pull(p.Peer, e.Hash)
 		}
 	}
 }

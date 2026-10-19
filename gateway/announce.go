@@ -16,8 +16,7 @@ const maxAnnounceBytes = 32 << 20
 
 // serveAnnounce registers a peer inventory; the registry changes only once the whole request validated.
 func (g *Gateway) serveAnnounce(w http.ResponseWriter, r *http.Request) {
-	if !apis.Authorized(r, g.secret) {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
+	if !apis.Authorize(w, r, g.secret) {
 		return
 	}
 	var req apis.AnnounceRequest

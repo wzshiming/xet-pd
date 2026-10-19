@@ -136,7 +136,7 @@ func build(cfg Config) (*Gateway, error) {
 		return nil, err
 	}
 	g := &Gateway{mux: http.NewServeMux(), cas: cas, reg: reg, st: st, staging: staging, secret: cfg.Secret, transport: transport}
-	g.mux.HandleFunc("/healthz", route(http.MethodGet, func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) }))
+	g.mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
 	g.mux.HandleFunc(apis.AnnouncePath, route(http.MethodPost, g.serveAnnounce))
 	g.mux.HandleFunc(apis.PeersPath, route(http.MethodGet, g.servePeers))
 	g.mux.Handle("/xet-pd/", http.NotFoundHandler()) // unknown control paths never reach the upstream

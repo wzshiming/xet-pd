@@ -14,6 +14,7 @@ import (
 	"github.com/wzshiming/xet/xorb"
 
 	"github.com/wzshiming/xet-pd/apis"
+	"github.com/wzshiming/xet-pd/internal/lru"
 )
 
 const failedCooldown = 15 * time.Second
@@ -44,7 +45,7 @@ type cooled struct {
 }
 
 // acquire returns exactly one of a joined or new pull (release it) or a pinned committed xorb (unpin it); force clears a failure cooldown.
-func (p *Peer) acquire(hash xet.XorbHash, force bool) (*pull, *ready, error) {
+func (p *Peer) acquire(hash xet.XorbHash, force bool) (*pull, *lru.Entry[ready], error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if f := p.pulls[hash]; f != nil {
@@ -54,7 +55,7 @@ func (p *Peer) acquire(hash xet.XorbHash, force bool) (*pull, *ready, error) {
 	if p.ctx.Err() != nil {
 		return nil, nil, errClosed
 	}
-	if entry := p.index[hash]; entry != nil {
+	if entry := p.xorbs.Get(hash); entry != nil {
 		exists, err := p.store.HasXorb(p.ctx, hash)
 		if err != nil {
 			return nil, nil, err
@@ -153,7 +154,7 @@ func (f *pull) fetch(ctx context.Context) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, p.cfg.Gateway+apis.XorbPathPrefix+f.hash.String(), nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, apis.XorbURL(p.cfg.Gateway, f.hash.String()), nil)
 	if err != nil {
 		return err
 	}

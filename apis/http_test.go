@@ -32,30 +32,6 @@ func TestOrigin(t *testing.T) {
 	}
 }
 
-func TestAuthorized(t *testing.T) {
-	tests := []struct {
-		secret, header string
-		want           bool
-	}{
-		{"s3cret", "", false},
-		{"s3cret", "Bearer nope", false},
-		{"s3cret", "Basic s3cret", false},
-		{"s3cret", "Bearer s3cretx", false},
-		{"s3cret", "Bearer s3cret", true},
-		{"", "", true},
-		{"", "Bearer nope", true},
-	}
-	for _, tt := range tests {
-		r := httptest.NewRequest(http.MethodPost, "/", nil)
-		if tt.header != "" {
-			r.Header.Set("Authorization", tt.header)
-		}
-		if got := Authorized(r, tt.secret); got != tt.want {
-			t.Errorf("Authorized(%q) with secret %q = %v, want %v", tt.header, tt.secret, got, tt.want)
-		}
-	}
-}
-
 func TestReadJSON(t *testing.T) {
 	const limit = 16
 	tests := []struct {
@@ -78,5 +54,42 @@ func TestReadJSON(t *testing.T) {
 		if got != want || w.Code != tt.status || want && v.N != 1 || tt.text != "" && w.Body.String() != tt.text {
 			t.Errorf("%s: ReadJSON = %v, %d %q, N %d, want %v, %d %q", tt.name, got, w.Code, w.Body, v.N, want, tt.status, tt.text)
 		}
+	}
+}
+
+func TestAuthorize(t *testing.T) {
+	tests := []struct {
+		secret, header string
+		want           bool
+	}{
+		{"", "", true},
+		{"", "Bearer nope", true},
+		{"s3cret", "", false},
+		{"s3cret", "Bearer wrong", false},
+		{"s3cret", "Basic s3cret", false},
+		{"s3cret", "bearer s3cret", false},
+		{"s3cret", "Bearer s3cret ", false},
+		{"s3cret", "Bearer s3cret", true},
+	}
+	for _, tt := range tests {
+		w := httptest.NewRecorder()
+		r := httptest.NewRequest(http.MethodPost, "/", nil)
+		if tt.header != "" {
+			r.Header.Set("Authorization", tt.header)
+		}
+		code, body := http.StatusOK, ""
+		if !tt.want {
+			code, body = http.StatusUnauthorized, "unauthorized\n"
+		}
+		if got := Authorize(w, r, tt.secret); got != tt.want || w.Code != code || w.Body.String() != body {
+			t.Errorf("Authorize(%q) with secret %q = %v, %d %q, want %v, %d %q", tt.header, tt.secret, got, w.Code, w.Body, tt.want, code, body)
+		}
+	}
+}
+
+func TestXorbURL(t *testing.T) {
+	got := XorbURL("http://g:1", "abc")
+	if want := "http://g:1/v1/xorbs/default/abc"; got != want || got != "http://g:1"+XorbPathPrefix+"abc" {
+		t.Errorf("XorbURL(%q, %q) = %q, want %q", "http://g:1", "abc", got, want)
 	}
 }

@@ -35,10 +35,17 @@ func Origin(raw string) (string, error) {
 	return u.Scheme + "://" + u.Host, nil
 }
 
-// Authorized reports whether r carries the bearer secret; an empty secret authorizes every request.
-func Authorized(r *http.Request, secret string) bool {
-	return secret == "" || subtle.ConstantTimeCompare([]byte(r.Header.Get("Authorization")), []byte("Bearer "+secret)) == 1
+// Authorize answers 401 unless r carries the bearer secret; an empty secret authorizes every request.
+func Authorize(w http.ResponseWriter, r *http.Request, secret string) bool {
+	if secret == "" || subtle.ConstantTimeCompare([]byte(r.Header.Get("Authorization")), []byte("Bearer "+secret)) == 1 {
+		return true
+	}
+	http.Error(w, "unauthorized", http.StatusUnauthorized)
+	return false
 }
+
+// XorbURL is the CAS xorb route of hash at origin.
+func XorbURL(origin, hash string) string { return origin + XorbPathPrefix + hash }
 
 // ReadJSON decodes a request body of exactly one JSON value within limit bytes into v; otherwise it answers 413 or 400 and reports false.
 func ReadJSON(w http.ResponseWriter, r *http.Request, limit int64, v any) bool {

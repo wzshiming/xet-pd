@@ -174,7 +174,8 @@ func TestControlRoutes(t *testing.T) {
 		allow        string
 	}{
 		{http.MethodGet, "/healthz", http.StatusOK, ""},
-		{http.MethodPost, "/healthz", http.StatusMethodNotAllowed, http.MethodGet},
+		{http.MethodHead, "/healthz", http.StatusOK, ""},
+		{http.MethodPost, "/healthz", http.StatusForbidden, ""},
 		{http.MethodGet, apis.AnnouncePath, http.StatusMethodNotAllowed, http.MethodPost},
 		{http.MethodPost, apis.PeersPath, http.StatusMethodNotAllowed, http.MethodGet},
 		{http.MethodGet, apis.PullPath, http.StatusNotFound, ""},

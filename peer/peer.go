@@ -4,7 +4,6 @@ package peer
 
 import (
 	"cmp"
-	"container/list"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -23,6 +22,7 @@ import (
 	"github.com/wzshiming/xet/storage/local"
 
 	"github.com/wzshiming/xet-pd/apis"
+	"github.com/wzshiming/xet-pd/internal/lru"
 )
 
 type Config struct {
@@ -76,9 +76,7 @@ type Peer struct {
 	mu       sync.Mutex // guards pulls, cooldown, the inventory and cancel-vs-acquire
 	pulls    map[xet.XorbHash]*pull
 	cooldown map[xet.XorbHash]cooled
-	index    map[xet.XorbHash]*list.Element // committed xorbs, element value *ready
-	lru      *list.List                     // front is least recently used
-	usage    int64                          // bytes of committed xorbs
+	xorbs    lru.Index[ready] // committed xorbs
 }
 
 func New(cfg Config) (*Peer, error) {
@@ -119,8 +117,6 @@ func New(cfg Config) (*Peer, error) {
 		sem:      make(chan struct{}, cfg.MaxPulls),
 		pulls:    map[xet.XorbHash]*pull{},
 		cooldown: map[xet.XorbHash]cooled{},
-		index:    map[xet.XorbHash]*list.Element{},
-		lru:      list.New(),
 	}
 	if err := p.scan(); err != nil {
 		cancel()
@@ -157,9 +153,9 @@ func serveContent(w http.ResponseWriter, r *http.Request, hash xet.XorbHash, con
 }
 
 // serveStored serves a pinned committed xorb and releases the pin; a missing file leaves the inventory so the next request pulls again.
-func (p *Peer) serveStored(w http.ResponseWriter, r *http.Request, rd *ready) error {
+func (p *Peer) serveStored(w http.ResponseWriter, r *http.Request, rd *lru.Entry[ready]) error {
 	defer p.unpin(rd)
-	obj, err := p.store.GetXorbReadSeekCloser(r.Context(), rd.hash)
+	obj, err := p.store.GetXorbReadSeekCloser(r.Context(), rd.Hash)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			p.drop(rd)
@@ -167,7 +163,7 @@ func (p *Peer) serveStored(w http.ResponseWriter, r *http.Request, rd *ready) er
 		return err
 	}
 	defer func() { _ = obj.Close() }()
-	serveContent(w, r, rd.hash, obj)
+	serveContent(w, r, rd.Hash, obj)
 	return nil
 }
 
@@ -226,8 +222,7 @@ const maxPullBytes = 4096
 
 // servePull starts (or joins) a pull on behalf of the gateway and answers 202 at once.
 func (p *Peer) servePull(w http.ResponseWriter, r *http.Request) {
-	if !apis.Authorized(r, p.cfg.Secret) {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
+	if !apis.Authorize(w, r, p.cfg.Secret) {
 		return
 	}
 	var req apis.PullRequest

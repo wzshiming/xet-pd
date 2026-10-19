@@ -82,13 +82,9 @@ func (s *store) lockWriter(hash xet.XorbHash) func() {
 	}
 }
 
-func xorbURL(origin string, hash xet.XorbHash) string {
-	return origin + apis.XorbPathPrefix + hash.String()
-}
-
 func (s *store) GetXorbURL(ctx context.Context, hash xet.XorbHash) (string, error) {
 	if p, ok := s.reg.pick(hash.String()); ok {
-		return xorbURL(p.URL, hash), nil
+		return apis.XorbURL(p.URL, hash.String()), nil
 	}
 	return s.Storage.GetXorbURL(ctx, hash)
 }
@@ -315,7 +311,7 @@ func (s *store) remote(ctx context.Context, hash xet.XorbHash, start, end int64)
 }
 
 func (s *store) open(ctx context.Context, p apis.Peer, hash xet.XorbHash, start, end int64) (*httpseek.Seeker, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, xorbURL(p.URL, hash), nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, apis.XorbURL(p.URL, hash.String()), nil)
 	if err != nil {
 		return nil, err
 	}

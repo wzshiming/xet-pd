@@ -46,8 +46,8 @@ func settled(t *testing.T, p *Peer) {
 	clustertest.WaitFor(t, waitTimeout, "readers released", func() bool {
 		p.mu.Lock()
 		defer p.mu.Unlock()
-		for _, e := range p.index {
-			if e.Value.(*ready).pins != 0 {
+		for e := range p.xorbs.Oldest() {
+			if e.V.pins != 0 {
 				return false
 			}
 		}
@@ -68,7 +68,7 @@ func pullAndSettle(t *testing.T, p *Peer, srv *httptest.Server, hash xet.XorbHas
 func usage(p *Peer) int64 {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return p.usage
+	return p.xorbs.Usage()
 }
 
 // holdWriter is a ResponseWriter whose body writes wait for the gate to open.
@@ -510,7 +510,7 @@ func TestStaleReaderDoesNotTouchNewerGeneration(t *testing.T) {
 		t.Fatal("new generation missing from the inventory")
 	}
 	p.mu.Lock()
-	pins := rd.pins
+	pins := rd.V.pins
 	p.mu.Unlock()
 	if pins != 1 {
 		t.Fatalf("new generation pins = %d after the stale unpin, want 1", pins)
@@ -578,7 +578,7 @@ func TestReadyDecisionSurvivesEviction(t *testing.T) {
 	}
 	// The read released its pin and the cache fits its cap again, without any gateway fetch.
 	p.mu.Lock()
-	u, pins := p.usage, rd.pins
+	u, pins := p.xorbs.Usage(), rd.V.pins
 	p.mu.Unlock()
 	if u > p.cfg.XorbCacheSize || pins != 0 || g.gets.Load() != 0 {
 		t.Fatalf("after release: usage %d, pins %d, gateway GETs %d", u, pins, g.gets.Load())

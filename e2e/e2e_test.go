@@ -22,13 +22,12 @@ import (
 
 	"github.com/wzshiming/xet-pd/apis"
 	"github.com/wzshiming/xet-pd/internal/clustertest"
-	"github.com/wzshiming/xet-pd/internal/hubtest"
 )
 
 const modelPath = "/org/repo/resolve/main/model.bin"
 
 // startCluster runs a gateway that evicts every local xorb once minSeeds live seeds hold it, plus two registered seeds.
-func startCluster(t *testing.T, hub *hubtest.Hub, minSeeds int, peerFlags ...string) (*gatewayProc, []*peerProc) {
+func startCluster(t *testing.T, hub *clustertest.Hub, minSeeds int, peerFlags ...string) (*gatewayProc, []*peerProc) {
 	t.Helper()
 	secret := testSecret(t)
 	gw := startGateway(t, hub.URL, secret, []string{"-xorb-cache-size", "1", "-peer-ttl", "2s", "-replicas", "2", "-min-seeds", strconv.Itoa(minSeeds)})
@@ -58,7 +57,7 @@ func seedOf(t *testing.T, peers []*peerProc, urls []string) *peerProc {
 }
 
 func TestSeedsPulledAfterIngest(t *testing.T) {
-	hub := hubtest.New(t)
+	hub := clustertest.NewHub(t)
 	data := clustertest.RandomData(1, 1<<20)
 	hub.Set(modelPath, data)
 	gw, peers := startCluster(t, hub, 2)
@@ -120,7 +119,7 @@ func xorbSize(t *testing.T, base, hash string) int64 {
 }
 
 func TestPeerLossFailsOver(t *testing.T) {
-	hub := hubtest.New(t)
+	hub := clustertest.NewHub(t)
 	data := clustertest.RandomData(2, 1<<20)
 	hub.Set(modelPath, data)
 	gw, peers := startCluster(t, hub, 2)
@@ -158,7 +157,7 @@ func TestPeerLossFailsOver(t *testing.T) {
 
 // Seeds sized for one xorb evict a when b arrives, so the gateway re-ingests a from the hub on the next resolve.
 func TestAllSeedsEvictedReingests(t *testing.T) {
-	hub := hubtest.New(t)
+	hub := clustertest.NewHub(t)
 	a, b := clustertest.RandomData(3, 1<<20), clustertest.RandomData(4, 1<<20)
 	hub.Set("/org/repo/resolve/main/a.bin", a)
 	hub.Set("/org/repo/resolve/main/b.bin", b)
@@ -230,7 +229,7 @@ func TestAllSeedsEvictedReingests(t *testing.T) {
 }
 
 func TestNoPeersServesFromGateway(t *testing.T) {
-	hub := hubtest.New(t)
+	hub := clustertest.NewHub(t)
 	data := clustertest.RandomData(5, 1<<20)
 	hub.Set(modelPath, data)
 	gw := startGateway(t, hub.URL, "", []string{"-xorb-cache-size", "1", "-peer-ttl", "2s"})

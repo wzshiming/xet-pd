@@ -10,7 +10,6 @@ import (
 
 	"github.com/wzshiming/xet-pd/apis"
 	"github.com/wzshiming/xet-pd/internal/clustertest"
-	"github.com/wzshiming/xet-pd/internal/hubtest"
 )
 
 const testHash = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
@@ -38,7 +37,7 @@ func announceJSON(t *testing.T, req apis.AnnounceRequest) string {
 }
 
 func TestAnnounceRegistersCanonicalInventory(t *testing.T) {
-	g, srv := newTestGateway(t, hubtest.New(t), func(cfg *Config, _ string) { cfg.PeerTTL = 2 * time.Second })
+	g, srv := newTestGateway(t, clustertest.NewHub(t), func(cfg *Config, _ string) { cfg.PeerTTL = 2 * time.Second })
 	upper := strings.ToUpper(testHash)
 	status, body, resp := post(t, srv, announceJSON(t, apis.AnnounceRequest{Peer: apis.Peer{ID: "p1", URL: "http://127.0.0.1:1/"}, Epoch: "e1", Full: true, Add: []string{upper}}))
 	if status != http.StatusOK || resp.Resync || resp.TTL != 2 {
@@ -66,7 +65,7 @@ func TestAnnounceRegistersCanonicalInventory(t *testing.T) {
 }
 
 func TestAnnounceRejectsInvalidRequestsAtomically(t *testing.T) {
-	g, srv := newTestGateway(t, hubtest.New(t), nil)
+	g, srv := newTestGateway(t, clustertest.NewHub(t), nil)
 	peer := apis.Peer{ID: "p1", URL: "http://127.0.0.1:1"}
 	valid := apis.AnnounceRequest{Peer: peer, Epoch: "e", Full: true, Add: []string{testHash}}
 	tests := []struct {
@@ -117,7 +116,7 @@ func TestAnnounceRejectsInvalidRequestsAtomically(t *testing.T) {
 // A body padded with whitespace to the limit is accepted; one byte more is 413 whether the overflow surfaces on the value or on the trailing check.
 func TestAnnounceBodyLimit(t *testing.T) {
 	// The 32 MiB posts can outlast the default TTL under -race load.
-	g, srv := newTestGateway(t, hubtest.New(t), func(cfg *Config, _ string) { cfg.PeerTTL = time.Hour })
+	g, srv := newTestGateway(t, clustertest.NewHub(t), func(cfg *Config, _ string) { cfg.PeerTTL = time.Hour })
 	pad := func(req apis.AnnounceRequest, n int) string {
 		body := announceJSON(t, req)
 		return body + strings.Repeat(" ", n-len(body))
@@ -137,7 +136,7 @@ func TestAnnounceBodyLimit(t *testing.T) {
 
 func TestAnnounceRequiresSecret(t *testing.T) {
 	const secret = "s3cret"
-	g, srv := newTestGateway(t, hubtest.New(t), func(cfg *Config, _ string) { cfg.Secret = secret })
+	g, srv := newTestGateway(t, clustertest.NewHub(t), func(cfg *Config, _ string) { cfg.Secret = secret })
 	body := announceJSON(t, apis.AnnounceRequest{Peer: apis.Peer{ID: "p1", URL: "http://127.0.0.1:1"}, Epoch: "e", Full: true, Add: []string{testHash}})
 	for _, hdr := range [][]string{nil, {"Authorization", "Bearer nope"}, {"Authorization", "Basic " + secret}, {"Authorization", "Bearer " + secret + "x"}} {
 		if status, text, _ := post(t, srv, body, hdr...); status != http.StatusUnauthorized || strings.Contains(text, secret) {

@@ -20,12 +20,11 @@ import (
 
 	"github.com/wzshiming/xet-pd/apis"
 	"github.com/wzshiming/xet-pd/internal/clustertest"
-	"github.com/wzshiming/xet-pd/internal/hubtest"
 	"github.com/wzshiming/xet-pd/peer"
 )
 
 // newTestGateway serves a gateway whose own origin is handed to mod before New runs.
-func newTestGateway(t *testing.T, hub *hubtest.Hub, mod func(cfg *Config, self string)) (*Gateway, *httptest.Server) {
+func newTestGateway(t *testing.T, hub *clustertest.Hub, mod func(cfg *Config, self string)) (*Gateway, *httptest.Server) {
 	t.Helper()
 	srv := httptest.NewUnstartedServer(nil)
 	cfg := Config{StorageDir: t.TempDir(), Upstream: hub.URL}
@@ -99,7 +98,7 @@ func waitReady(t *testing.T, resolveURL string) *http.Response {
 }
 
 func TestConfigValidation(t *testing.T) {
-	hub := hubtest.New(t)
+	hub := clustertest.NewHub(t)
 	tests := []struct {
 		name    string
 		mod     func(*Config)
@@ -167,7 +166,7 @@ func TestConfigValidation(t *testing.T) {
 }
 
 func TestControlRoutes(t *testing.T) {
-	hub := hubtest.New(t)
+	hub := clustertest.NewHub(t)
 	_, srv := newTestGateway(t, hub, nil)
 	tests := []struct {
 		method, path string
@@ -201,7 +200,7 @@ func TestControlRoutes(t *testing.T) {
 const telemetryBody = `{"time":"2026-10-19T00:00:00Z","event":"download","session_id":"s1","user_agent":"xet-core/1.7.0","metrics":{}}`
 
 func TestReadOnlySurface(t *testing.T) {
-	hub := hubtest.New(t)
+	hub := clustertest.NewHub(t)
 	_, srv := newTestGateway(t, hub, func(cfg *Config, _ string) { cfg.UpstreamToken = "up-tok" })
 	hash := strings.Repeat("ab", 32)
 	denied := []struct{ method, path string }{
@@ -264,7 +263,7 @@ func TestReadOnlySurface(t *testing.T) {
 }
 
 func TestSigningKeyBindsReadTokens(t *testing.T) {
-	hub := hubtest.New(t)
+	hub := clustertest.NewHub(t)
 	data := clustertest.RandomData(7, 64<<10)
 	hub.Set("/org/repo/resolve/main/a.bin", data)
 	_, srv := newTestGateway(t, hub, func(cfg *Config, _ string) { cfg.SigningKey = "k" })
@@ -301,7 +300,7 @@ func TestSigningKeyBindsReadTokens(t *testing.T) {
 }
 
 func TestCloseIsIdempotent(t *testing.T) {
-	g, srv := newTestGateway(t, hubtest.New(t), nil)
+	g, srv := newTestGateway(t, clustertest.NewHub(t), nil)
 	for range 2 {
 		if err := g.Close(); err != nil {
 			t.Fatal(err)
@@ -315,7 +314,7 @@ func TestCloseIsIdempotent(t *testing.T) {
 // Two real seeds hold the only copies of an ingested file; a full loss of both re-ingests it from the hub.
 func TestGatewayIntegration(t *testing.T) {
 	const secret, upstreamToken = "s3cret", "up-tok"
-	hub := hubtest.New(t)
+	hub := clustertest.NewHub(t)
 	data := clustertest.RandomData(7, 300<<10)
 	hub.Set("/org/repo/resolve/main/model.bin", data)
 	g, srv := newTestGateway(t, hub, func(cfg *Config, self string) {

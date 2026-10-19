@@ -1,6 +1,4 @@
-// Package hubtest is a plain (non-xet) upstream hub fixture: resolve requests answer hub metadata
-// and redirect to a /cdn path that serves the bytes with Range support.
-package hubtest
+package clustertest
 
 import (
 	"bytes"
@@ -20,7 +18,7 @@ import (
 
 var resolveRe = regexp.MustCompile(`^(/.+?/resolve/)[^/]+(/.+)$`)
 
-// Hub serves the files given to Set; Commit is the 40-hex revision every branch resolves to.
+// Hub serves the files given to Set; Commit is the 40-hex revision every branch resolves to. It is a plain (non-xet) upstream hub fixture: resolve requests answer hub metadata and redirect to a /cdn path that serves the bytes with Range support.
 type Hub struct {
 	*httptest.Server
 	Commit string
@@ -32,7 +30,7 @@ type Hub struct {
 	auth  []string
 }
 
-func New(t testing.TB) *Hub {
+func NewHub(t testing.TB) *Hub {
 	h := &Hub{Commit: strings.Repeat("ab", 20), files: map[string][]byte{}}
 	h.Server = httptest.NewServer(http.HandlerFunc(h.serve))
 	t.Cleanup(h.Close)

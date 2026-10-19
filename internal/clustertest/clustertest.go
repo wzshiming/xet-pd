@@ -1,4 +1,4 @@
-// Package clustertest holds the helpers the gateway, peer, cmd and e2e tests share.
+// Package clustertest holds the fixtures and helpers the gateway, peer, cmd and e2e tests share.
 package clustertest
 
 import (

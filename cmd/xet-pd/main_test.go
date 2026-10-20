@@ -101,8 +101,8 @@ func TestParseGatewayDefaults(t *testing.T) {
 
 func TestParseGatewayEnv(t *testing.T) {
 	getenv := env(
-		"XET_PD_LISTEN", ":9000", "XET_PD_STORAGE_DIR", "/data", "XET_PD_UPSTREAM", "http://hub:8000",
-		"XET_PD_UPSTREAM_TOKEN", "tok", "XET_PD_SIGNING_KEY", "sign", "XET_PD_EXTERNAL_URL", "http://gw",
+		"XET_PD_LISTEN", ":9000", "XET_PD_STORAGE_DIR", "/data", "HF_ENDPOINT", "http://hub:8000",
+		"HF_TOKEN", "tok", "XET_PD_SIGNING_KEY", "sign", "XET_PD_EXTERNAL_URL", "http://gw",
 		"XET_PD_SECRET", "sec", "XET_PD_PEER_TTL", "45s", "XET_PD_REPLICAS", "3", "XET_PD_MIN_SEEDS", "2",
 		"XET_PD_XORB_CACHE_SIZE", "64MiB")
 	listen, cfg, err := parseGateway(nil, getenv, io.Discard)
@@ -115,8 +115,8 @@ func TestParseGatewayEnv(t *testing.T) {
 // Flags win over the environment, and an unparsable environment value is ignored once its flag is given.
 func TestParseGatewayFlagsOverrideEnv(t *testing.T) {
 	getenv := env(
-		"XET_PD_LISTEN", ":9000", "XET_PD_STORAGE_DIR", "/data", "XET_PD_UPSTREAM", "http://hub:8000",
-		"XET_PD_UPSTREAM_TOKEN", "tok", "XET_PD_SIGNING_KEY", "sign", "XET_PD_EXTERNAL_URL", "http://gw",
+		"XET_PD_LISTEN", ":9000", "XET_PD_STORAGE_DIR", "/data", "HF_ENDPOINT", "http://hub:8000",
+		"HF_TOKEN", "tok", "XET_PD_SIGNING_KEY", "sign", "XET_PD_EXTERNAL_URL", "http://gw",
 		"XET_PD_SECRET", "sec", "XET_PD_PEER_TTL", "bogus", "XET_PD_REPLICAS", "x", "XET_PD_MIN_SEEDS", "1.5",
 		"XET_PD_XORB_CACHE_SIZE", "-1")
 	args := []string{"-listen", ":7000", "-storage-dir", "/flag", "-upstream", "http://flag", "-upstream-token", "ftok",
@@ -137,8 +137,8 @@ func TestParseGatewayUpstreamToken(t *testing.T) {
 		want string
 	}{
 		{"hf token ignored", nil, env("HF_TOKEN", "hf"), ""},
-		{"xet-pd token", nil, env("XET_PD_UPSTREAM_TOKEN", "tok"), "tok"},
-		{"flag wins", []string{"-upstream-token", "ftok"}, env("XET_PD_UPSTREAM_TOKEN", "tok"), "ftok"},
+		{"xet-pd token", nil, env("HF_TOKEN", "tok"), "tok"},
+		{"flag wins", []string{"-upstream-token", "ftok"}, env("HF_TOKEN", "tok"), "ftok"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -165,7 +165,7 @@ func TestParseGatewayErrors(t *testing.T) {
 		{"bad env duration", nil, env("XET_PD_PEER_TTL", "abc"), `XET_PD_PEER_TTL="abc": parse error`},
 		{"bad env int", nil, env("XET_PD_REPLICAS", "x"), `XET_PD_REPLICAS="x": parse error`},
 		{"bad env size", nil, env("XET_PD_XORB_CACHE_SIZE", "-1"), `XET_PD_XORB_CACHE_SIZE="-1": expected bytes`},
-		{"empty env upstream is still the default", []string{"-upstream", ""}, env("XET_PD_UPSTREAM", "http://hub"), "upstream is required"},
+		{"empty env upstream is still the default", []string{"-upstream", ""}, env("HF_ENDPOINT", "http://hub"), "upstream is required"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -190,7 +190,7 @@ func TestParseGatewayHelp(t *testing.T) {
 	if strings.Contains(help.String(), "HF_TOKEN") {
 		t.Errorf("help mentions HF_TOKEN:\n%s", help.String())
 	}
-	for _, want := range []string{"Usage: xet-pd gateway", "-xorb-cache-size", "(default 8GiB)", "[env XET_PD_XORB_CACHE_SIZE]", "[env XET_PD_UPSTREAM_TOKEN]", "[env XET_PD_SECRET_FILE]", "(default \":8080\")"} {
+	for _, want := range []string{"Usage: xet-pd gateway", "-xorb-cache-size", "(default 8GiB)", "[env XET_PD_XORB_CACHE_SIZE]", "[env HF_TOKEN]", "[env XET_PD_SECRET_FILE]", "(default \":8080\")"} {
 		if !strings.Contains(help.String(), want) {
 			t.Errorf("help lacks %q:\n%s", want, help.String())
 		}
@@ -271,7 +271,7 @@ func TestEmptySecretFlagOverridesEnvironment(t *testing.T) {
 
 func TestParsePeerDefaults(t *testing.T) {
 	// HF_TOKEN and the gateway token variable mean nothing to a peer.
-	getenv := env("HF_TOKEN", "hf", "XET_PD_UPSTREAM_TOKEN", "tok")
+	getenv := env("HF_TOKEN", "hf", "HF_TOKEN", "tok")
 	listen, cfg, err := parsePeer([]string{"-advertise", "http://p:1", "-gateway", "http://g:2"}, getenv, io.Discard)
 	want := peer.Config{Advertise: "http://p:1", Gateway: "http://g:2", CacheDir: "./xet-pd-peer", MaxPulls: 8, PullTimeout: 10 * time.Minute, Heartbeat: 10 * time.Second}
 	if err != nil || listen != ":8081" || cfg != want {

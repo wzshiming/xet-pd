@@ -37,6 +37,10 @@ type pull struct {
 	size    int64     // committed bytes, set before the pull records the object
 	err     error     // outcome, read only after done
 	refs    int       // holders of the stream, guarded by p.mu
+
+	cancel context.CancelFunc // ends the pull, queueing included
+	queued bool               // still waiting for a pull slot, guarded by p.mu
+	keep   bool               // asked for by the gateway, so never dropped for lack of readers; guarded by p.mu
 }
 
 type cooled struct {
@@ -50,6 +54,7 @@ func (p *Peer) acquire(hash xet.XorbHash, force bool) (*pull, *lru.Entry[ready],
 	defer p.mu.Unlock()
 	if f := p.pulls[hash]; f != nil {
 		f.refs++
+		f.keep = f.keep || force
 		return f, nil, nil
 	}
 	if p.ctx.Err() != nil {
@@ -77,16 +82,19 @@ func (p *Peer) acquire(hash xet.XorbHash, force bool) (*pull, *lru.Entry[ready],
 		}
 		delete(p.cooldown, hash)
 	}
-	f := &pull{p: p, hash: hash, started: make(chan struct{}), done: make(chan struct{}), refs: 2}
+	ctx, cancel := context.WithTimeout(p.ctx, p.cfg.PullTimeout)
+	f := &pull{p: p, hash: hash, started: make(chan struct{}), done: make(chan struct{}), refs: 2, cancel: cancel, queued: true, keep: force}
 	p.pulls[hash] = f
 	p.wg.Add(1)
 	go func() {
 		defer p.wg.Done()
-		ctx, cancel := context.WithTimeout(p.ctx, p.cfg.PullTimeout)
 		defer cancel()
 		var err error
 		select {
 		case p.sem <- struct{}{}:
+			p.mu.Lock()
+			f.queued = false
+			p.mu.Unlock()
 			var req *http.Request
 			if req, err = http.NewRequestWithContext(ctx, http.MethodGet, apis.XorbURL(p.cfg.Gateway, f.hash.String()), nil); err == nil {
 				req.Header.Set(apis.PeerHeader, p.id)
@@ -144,11 +152,13 @@ func (p *Peer) acquire(hash xet.XorbHash, force bool) (*pull, *lru.Entry[ready],
 		}
 		f.err = err
 		p.mu.Lock()
-		delete(p.pulls, f.hash)
-		if err != nil {
-			p.cooldown[f.hash] = cooled{until: time.Now().Add(failedCooldown), err: err}
-		} else {
+		if p.pulls[f.hash] == f { // release may have dropped it and a newer pull taken the key
+			delete(p.pulls, f.hash)
+		}
+		if err == nil {
 			p.admit(f.hash, f.size, f)
+		} else if !errors.Is(err, context.Canceled) { // abandoned or closed is no fault of the xorb
+			p.cooldown[f.hash] = cooled{until: time.Now().Add(failedCooldown), err: err}
 		}
 		p.mu.Unlock()
 		close(f.done)
@@ -160,6 +170,13 @@ func (p *Peer) acquire(hash xet.XorbHash, force bool) (*pull, *lru.Entry[ready],
 func (f *pull) release() {
 	f.p.mu.Lock()
 	f.refs--
+	if f.refs == 1 && f.queued && !f.keep {
+		// Only its goroutine is left; unlisting it under the same lock keeps acquire from joining it.
+		if f.p.pulls[f.hash] == f {
+			delete(f.p.pulls, f.hash)
+		}
+		f.cancel()
+	}
 	last := f.refs == 0
 	if last {
 		f.p.evict() // a committed object nobody streams any more may go

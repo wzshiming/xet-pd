@@ -37,7 +37,7 @@ const (
 	seedTimeout   = 60 * time.Second // seeds pulling and the gateway evicting
 )
 
-var binPath string // race-instrumented xet-pd built by TestMain
+var binDir string // holds the race-instrumented gateway and peer binaries TestMain builds
 
 func TestMain(m *testing.M) {
 	code, err := buildAndRun(m)
@@ -58,11 +58,11 @@ func buildAndRun(m *testing.M) (int, error) {
 	if err != nil {
 		return 1, err
 	}
-	binPath = filepath.Join(dir, "xet-pd")
-	build := exec.Command("go", "build", "-race", "-o", binPath, "./cmd/xet-pd")
+	binDir = dir
+	build := exec.Command("go", "build", "-race", "-o", binDir, "./cmd/gateway", "./cmd/peer")
 	build.Dir = root
 	if out, err := build.CombinedOutput(); err != nil {
-		return 1, fmt.Errorf("go build -race ./cmd/xet-pd: %v\n%s", err, out)
+		return 1, fmt.Errorf("go build -race ./cmd/gateway ./cmd/peer: %v\n%s", err, out)
 	}
 	return m.Run(), nil
 }
@@ -125,12 +125,12 @@ type proc struct {
 	stopped bool
 }
 
-// startProc launches the binary; env entries extend childEnv.
-func startProc(t *testing.T, name string, args []string, env ...string) *proc {
+// startProc launches the binary of role, gateway or peer; env entries extend childEnv.
+func startProc(t *testing.T, role, name string, args []string, env ...string) *proc {
 	t.Helper()
 	ctx, cancel := context.WithCancel(t.Context())
 	p := &proc{t: t, name: name, cancel: cancel, done: make(chan struct{})}
-	p.cmd = exec.CommandContext(ctx, binPath, args...)
+	p.cmd = exec.CommandContext(ctx, filepath.Join(binDir, role), args...)
 	p.cmd.Env = childEnv(env...)
 	p.cmd.Stdout, p.cmd.Stderr = &p.stdout, &p.stderr
 	p.cmd.Cancel = func() error { return p.cmd.Process.Signal(syscall.SIGTERM) }
@@ -257,9 +257,9 @@ type gatewayProc struct {
 func startGateway(t *testing.T, upstream, secret string, flags []string, env ...string) *gatewayProc {
 	t.Helper()
 	dir := t.TempDir()
-	args := append([]string{"gateway", "-listen", "127.0.0.1:0", "-storage-dir", dir, "-upstream", upstream}, flags...)
-	p := startProc(t, "gateway", args, append(secretEnv(secret), env...)...)
-	addr, err := p.awaitBanner("xet-pd gateway listening on ")
+	args := append([]string{"-listen", "127.0.0.1:0", "-storage-dir", dir, "-upstream", upstream}, flags...)
+	p := startProc(t, "gateway", "gateway", args, append(secretEnv(secret), env...)...)
+	addr, err := p.awaitBanner("gateway listening on ")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -281,8 +281,8 @@ func startPeer(t *testing.T, gatewayURL, secret string, flags []string, env ...s
 	t.Helper()
 	for attempt := 1; ; attempt++ {
 		addr, dir := reserveAddr(t), t.TempDir()
-		args := append([]string{"peer", "-listen", addr, "-advertise", "http://" + addr, "-gateway", gatewayURL, "-cache-dir", dir}, flags...)
-		p := startProc(t, "peer "+addr, args, append(secretEnv(secret), env...)...)
+		args := append([]string{"-listen", addr, "-advertise", "http://" + addr, "-gateway", gatewayURL, "-cache-dir", dir}, flags...)
+		p := startProc(t, "peer", "peer "+addr, args, append(secretEnv(secret), env...)...)
 		err := p.awaitHealthy("http://" + addr)
 		if err == nil {
 			return &peerProc{proc: p, URL: "http://" + addr, CacheDir: dir}
@@ -307,18 +307,18 @@ func reserveAddr(t *testing.T) string {
 	return addr
 }
 
-// runCLI runs the binary to completion.
+// runCLI runs the binary args[0] names, gateway or peer, with the remaining args to completion.
 func runCLI(t *testing.T, args []string, env ...string) (code int, stdout, stderr string) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(t.Context(), stopTimeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, binPath, args...)
+	cmd := exec.CommandContext(ctx, filepath.Join(binDir, args[0]), args[1:]...)
 	cmd.Env = childEnv(env...)
 	var out, errOut bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &errOut
 	var exit *exec.ExitError
 	if err := cmd.Run(); err != nil && !errors.As(err, &exit) {
-		t.Fatalf("run xet-pd: %v", err) // args may carry a secret
+		t.Fatalf("run %s: %v", args[0], err) // args may carry a secret
 	}
 	return cmd.ProcessState.ExitCode(), out.String(), errOut.String()
 }

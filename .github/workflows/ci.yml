@@ -50,5 +50,8 @@ jobs:
       - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.x"
       - run: pip install -U 'huggingface_hub[hf_xet]'
       - run: go test -tags e2e -race -count=1 -v -timeout 10m ./e2e

@@ -420,11 +420,8 @@ func TestCLIErrors(t *testing.T) {
 		stdout string // substring, "" means empty
 		stderr string // substring, "" means empty
 	}{
-		{name: "no args", code: 2, stderr: "Usage: xet-pd <command>"},
-		{name: "help", args: []string{"help"}, stdout: "Commands:"},
-		{name: "gateway help", args: []string{"gateway", "-h"}, stdout: "Usage: xet-pd gateway"},
+		{name: "gateway help", args: []string{"gateway", "-h"}, stdout: "Usage: gateway"},
 		{name: "peer help", args: []string{"peer", "--help"}, stdout: "[env XET_PD_ADVERTISE]"},
-		{name: "unknown command", args: []string{"bogus"}, code: 2, stderr: `unknown command "bogus"`},
 		{name: "unknown flag", args: []string{"gateway", "-bogus"}, code: 2, stderr: "flag provided but not defined: -bogus"},
 		{name: "peer missing advertise", args: []string{"peer", "-gateway", "http://127.0.0.1:1"}, code: 2, stderr: "advertise is required"},
 		{name: "gateway bad upstream", args: []string{"gateway", "-storage-dir", dir, "-upstream", "ftp://hub"}, code: 1, stderr: "upstream: scheme is not http(s)"},

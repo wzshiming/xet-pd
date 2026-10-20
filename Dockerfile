@@ -10,16 +10,22 @@ COPY gateway/ gateway/
 COPY peer/ peer/
 COPY internal/ internal/
 
-FROM builder AS build-app
+FROM builder AS build
 RUN --mount=type=cache,target=/root/.cache/go-build \
-    go build -ldflags='-s -w' -o /out/xet-pd ./cmd/xet-pd
+    go build -ldflags='-s -w' -o /out/ ./cmd/gateway ./cmd/peer
 
-FROM alpine:3.22 AS app
+FROM alpine:3.22 AS runtime
 RUN apk add --no-cache ca-certificates \
     && adduser -D -u 10001 xet-pd \
     && install -d -o xet-pd -g xet-pd /data
-COPY --from=build-app /out/xet-pd /usr/local/bin/xet-pd
 USER xet-pd
 WORKDIR /data
 VOLUME /data
-ENTRYPOINT ["/usr/local/bin/xet-pd"]
+
+FROM runtime AS gateway
+COPY --from=build /out/gateway /usr/local/bin/gateway
+ENTRYPOINT ["/usr/local/bin/gateway"]
+
+FROM runtime AS peer
+COPY --from=build /out/peer /usr/local/bin/peer
+ENTRYPOINT ["/usr/local/bin/peer"]

@@ -3,12 +3,14 @@
 name: xet-pd-cluster
 
 x-app: &app
-  build:
-    context: .
-    target: app
-  image: xet-pd:local
   restart: unless-stopped
   stop_grace_period: 15s
+
+x-peer: &peer
+  build:
+    context: .
+    target: peer
+  image: xet-pd-peer:local
 
 x-secret: &secret
   XET_PD_SECRET: ${XET_PD_SECRET:-xet-pd-local-test}
@@ -22,8 +24,11 @@ x-healthcheck: &healthcheck
 services:
   gateway:
     <<: *app
+    build:
+      context: .
+      target: gateway
+    image: xet-pd-gateway:local
     command:
-      - gateway
       - -listen=:8080
       - -storage-dir=/data
       - "-upstream=${HF_ENDPOINT:-https://huggingface.co}"
@@ -45,9 +50,8 @@ services:
       test: [CMD, wget, -q, -O-, "http://127.0.0.1:8080/healthz"]
 
   peer-1:
-    <<: *app
+    <<: [*app, *peer]
     command:
-      - peer
       - -listen=:8081
       - -advertise=http://peer-1:8081
       - -gateway=http://gateway:8080
@@ -67,9 +71,8 @@ services:
       test: [CMD, wget, -q, -O-, "http://127.0.0.1:8081/healthz"]
 
   peer-2:
-    <<: *app
+    <<: [*app, *peer]
     command:
-      - peer
       - -listen=:8082
       - -advertise=http://peer-2:8082
       - -gateway=http://gateway:8080

@@ -116,7 +116,7 @@ func TestParseGatewayEnv(t *testing.T) {
 func TestParseGatewayFlagsOverrideEnv(t *testing.T) {
 	getenv := env(
 		"XET_PD_LISTEN", ":9000", "XET_PD_STORAGE_DIR", "/data", "XET_PD_UPSTREAM", "http://hub:8000",
-		"XET_PD_UPSTREAM_TOKEN", "tok", "HF_TOKEN", "hf", "XET_PD_SIGNING_KEY", "sign", "XET_PD_EXTERNAL_URL", "http://gw",
+		"XET_PD_UPSTREAM_TOKEN", "tok", "XET_PD_SIGNING_KEY", "sign", "XET_PD_EXTERNAL_URL", "http://gw",
 		"XET_PD_SECRET", "sec", "XET_PD_PEER_TTL", "bogus", "XET_PD_REPLICAS", "x", "XET_PD_MIN_SEEDS", "1.5",
 		"XET_PD_XORB_CACHE_SIZE", "-1")
 	args := []string{"-listen", ":7000", "-storage-dir", "/flag", "-upstream", "http://flag", "-upstream-token", "ftok",
@@ -136,9 +136,9 @@ func TestParseGatewayUpstreamToken(t *testing.T) {
 		env  func(string) string
 		want string
 	}{
-		{"hf token fallback", nil, env("HF_TOKEN", "hf"), "hf"},
-		{"xet-pd token first", nil, env("HF_TOKEN", "hf", "XET_PD_UPSTREAM_TOKEN", "tok"), "tok"},
-		{"flag wins", []string{"-upstream-token", "ftok"}, env("HF_TOKEN", "hf", "XET_PD_UPSTREAM_TOKEN", "tok"), "ftok"},
+		{"hf token ignored", nil, env("HF_TOKEN", "hf"), ""},
+		{"xet-pd token", nil, env("XET_PD_UPSTREAM_TOKEN", "tok"), "tok"},
+		{"flag wins", []string{"-upstream-token", "ftok"}, env("XET_PD_UPSTREAM_TOKEN", "tok"), "ftok"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -187,7 +187,10 @@ func TestParseGatewayHelp(t *testing.T) {
 	if !errors.Is(err, flag.ErrHelp) {
 		t.Fatalf("err = %v, want flag.ErrHelp", err)
 	}
-	for _, want := range []string{"Usage: xet-pd gateway", "-xorb-cache-size", "(default 8GiB)", "[env XET_PD_XORB_CACHE_SIZE]", "[env XET_PD_UPSTREAM_TOKEN, HF_TOKEN]", "[env XET_PD_SECRET_FILE]", "(default \":8080\")"} {
+	if strings.Contains(help.String(), "HF_TOKEN") {
+		t.Errorf("help mentions HF_TOKEN:\n%s", help.String())
+	}
+	for _, want := range []string{"Usage: xet-pd gateway", "-xorb-cache-size", "(default 8GiB)", "[env XET_PD_XORB_CACHE_SIZE]", "[env XET_PD_UPSTREAM_TOKEN]", "[env XET_PD_SECRET_FILE]", "(default \":8080\")"} {
 		if !strings.Contains(help.String(), want) {
 			t.Errorf("help lacks %q:\n%s", want, help.String())
 		}

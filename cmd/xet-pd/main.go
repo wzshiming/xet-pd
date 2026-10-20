@@ -230,7 +230,7 @@ func parseGateway(args []string, getenv func(string) string, help io.Writer) (st
 	fs.StringVar(&listen, "listen", ":8080", "listen address", "XET_PD_LISTEN")
 	fs.StringVar(&cfg.StorageDir, "storage-dir", "./xet-pd-gateway", "data directory", "XET_PD_STORAGE_DIR")
 	fs.StringVar(&cfg.Upstream, "upstream", "https://huggingface.co", "upstream hub origin, scheme://host[:port]", "XET_PD_UPSTREAM")
-	fs.StringVar(&cfg.UpstreamToken, "upstream-token", "", "bearer token for the upstream hub", "XET_PD_UPSTREAM_TOKEN", "HF_TOKEN")
+	fs.StringVar(&cfg.UpstreamToken, "upstream-token", "", "bearer token for the upstream hub", "XET_PD_UPSTREAM_TOKEN")
 	fs.StringVar(&cfg.SigningKey, "signing-key", "", "HMAC key of CAS read tokens; empty leaves CAS routes open", "XET_PD_SIGNING_KEY")
 	fs.StringVar(&cfg.ExternalURL, "external-url", "", "origin advertised in hub links; empty derives it from each request", "XET_PD_EXTERNAL_URL")
 	fs.DurationVar(&cfg.PeerTTL, "peer-ttl", 30*time.Second, "validity of a peer announce", "XET_PD_PEER_TTL")

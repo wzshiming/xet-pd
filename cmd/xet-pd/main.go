@@ -192,7 +192,7 @@ func secretFlags(fs *flag.FlagSet) (secret, file *string) {
 	return secret, file
 }
 
-// resolveSecret prefers the flags over the environment; a literal and a file from the same source are an error.
+// resolveSecret prefers the flags over the environment; a literal and a file from the same source, or an empty file, are errors.
 func resolveSecret(flags *flag.FlagSet, secret, file string, getenv func(string) string) (string, error) {
 	explicit := false
 	flags.Visit(func(option *flag.Flag) {
@@ -213,7 +213,11 @@ func resolveSecret(flags *flag.FlagSet, secret, file string, getenv func(string)
 	if err != nil {
 		return "", fmt.Errorf("secret file: %w", err)
 	}
-	return strings.TrimSpace(string(b)), nil
+	secret = strings.TrimSpace(string(b))
+	if secret == "" {
+		return "", errors.New("secret file is empty")
+	}
+	return secret, nil
 }
 
 // parseGateway resolves the gateway command line into the listen address and configuration.

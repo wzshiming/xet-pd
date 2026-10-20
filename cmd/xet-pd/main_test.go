@@ -199,6 +199,10 @@ func TestSecretPolicy(t *testing.T) {
 	if err := os.WriteFile(file, []byte(" s3cr3t \n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	blank := filepath.Join(t.TempDir(), "blank")
+	if err := os.WriteFile(blank, []byte("  \n\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	missing := filepath.Join(t.TempDir(), "missing")
 	tests := []struct {
 		name    string
@@ -216,6 +220,8 @@ func TestSecretPolicy(t *testing.T) {
 		{name: "both flags", args: []string{"-secret", "hunter2", "-secret-file", file}, env: noEnv, wantErr: "mutually exclusive"},
 		{name: "both env", env: env("XET_PD_SECRET", "hunter2", "XET_PD_SECRET_FILE", file), wantErr: "mutually exclusive"},
 		{name: "missing file", args: []string{"-secret-file", missing}, env: noEnv, wantErr: missing},
+		{name: "blank flag file", args: []string{"-secret-file", blank}, env: noEnv, wantErr: "secret file is empty"},
+		{name: "blank env file", env: env("XET_PD_SECRET_FILE", blank), wantErr: "secret file is empty"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -237,6 +243,10 @@ func TestSecretPolicy(t *testing.T) {
 	_, pcfg, err := parsePeer([]string{"-advertise", "http://p:1", "-gateway", "http://g:2"}, env("XET_PD_SECRET_FILE", file), io.Discard)
 	if err != nil || pcfg.Secret != "s3cr3t" {
 		t.Fatalf("peer Secret = %q, %v; want s3cr3t", pcfg.Secret, err)
+	}
+	_, _, err = parsePeer([]string{"-advertise", "http://p:1", "-gateway", "http://g:2"}, env("XET_PD_SECRET_FILE", blank), io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "secret file is empty") {
+		t.Fatalf("peer err = %v, want mention of %q", err, "secret file is empty")
 	}
 }
 

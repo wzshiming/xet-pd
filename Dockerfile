@@ -14,13 +14,12 @@ FROM builder AS build-app
 RUN --mount=type=cache,target=/root/.cache/go-build \
     go build -ldflags='-s -w' -o /out/xet-pd ./cmd/xet-pd
 
-FROM alpine:3.22 AS runtime
+FROM alpine:3.22 AS app
 RUN apk add --no-cache ca-certificates \
     && adduser -D -u 10001 xet-pd \
     && install -d -o xet-pd -g xet-pd /data
-USER xet-pd
-
-FROM runtime AS app
 COPY --from=build-app /out/xet-pd /usr/local/bin/xet-pd
+USER xet-pd
+WORKDIR /data
 VOLUME /data
 ENTRYPOINT ["/usr/local/bin/xet-pd"]

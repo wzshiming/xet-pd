@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -463,4 +464,47 @@ func reserveTaken(t *testing.T) string {
 	}
 	t.Cleanup(func() { _ = ln.Close() })
 	return ln.Addr().String()
+}
+
+func TestSecondSignalEndsDrain(t *testing.T) {
+	gw := startGateway(t, clustertest.NewHub(t).URL, "", nil)
+	gw.discard() // the exit status is asserted below
+	// Shutdown waits about 5s on a connection still sending its first request header.
+	slow, err := net.Dial("tcp", strings.TrimPrefix(gw.URL, "http://"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = slow.Close() }()
+	if _, err := slow.Write([]byte("GET /healthz HTTP/1.1\r\nHost: x\r\n")); err != nil {
+		t.Fatal(err)
+	}
+	// Connections are accepted in order, so answering a later one proves the gateway tracks the slow one.
+	probe := &http.Client{Transport: &http.Transport{DisableKeepAlives: true}, Timeout: readyTimeout}
+	resp, err := probe.Get(gw.URL + "/healthz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+
+	if err := gw.cmd.Process.Signal(syscall.SIGINT); err != nil {
+		t.Fatal(err)
+	}
+	// A race build lingers 1s in os.Exit(0), so only outliving 2s proves the drain.
+	select {
+	case <-gw.done:
+		t.Fatalf("gateway ended with %v within 2s of the first SIGINT, so nothing held the drain", gw.cmd.ProcessState)
+	case <-time.After(2 * time.Second):
+	}
+	if err := gw.cmd.Process.Signal(syscall.SIGINT); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-gw.done:
+	case <-time.After(2 * time.Second):
+		gw.kill()
+		t.Fatal("gateway still alive 2s after the second SIGINT")
+	}
+	if ws, ok := gw.cmd.ProcessState.Sys().(syscall.WaitStatus); !ok || !ws.Signaled() || ws.Signal() != syscall.SIGINT {
+		t.Fatalf("gateway ended with %v after the second SIGINT, want death by SIGINT", gw.cmd.ProcessState)
+	}
 }

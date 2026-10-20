@@ -24,6 +24,8 @@ import (
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	// The first signal restores default handling, so a second one kills the process mid-drain.
+	context.AfterFunc(ctx, stop)
 	code := run(ctx, os.Args[1:], os.Getenv, os.Stdout, os.Stderr)
 	stop()
 	os.Exit(code)

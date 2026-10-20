@@ -1,0 +1,60 @@
+// Package apis defines the xet-pd control wire protocol and the HTTP plumbing the gateway and peers share.
+package apis
+
+import "time"
+
+const (
+	AnnouncePath = "/xet-pd/v1/announce"
+	PullPath     = "/xet-pd/v1/pull"
+	PeersPath    = "/xet-pd/v1/peers"
+	PeerHeader   = "X-Xet-PD-Peer"
+)
+
+// XorbPathPrefix is xet-core's fixed CAS xorb route prefix, advertised by the gateway and fetched by peers.
+const XorbPathPrefix = "/v1/xorbs/default/"
+
+// MaxXorbBytes caps a packed xorb, chunk headers and footer included: peers pull nothing larger and the gateway trusts no offset beyond it.
+const MaxXorbBytes = 128 << 20
+
+type PullRequest struct {
+	Hash string `json:"hash"`
+}
+
+type Peer struct {
+	ID  string `json:"id"`
+	URL string `json:"url"`
+}
+
+type AnnounceRequest struct {
+	Peer   Peer     `json:"peer"`
+	Epoch  string   `json:"epoch"`
+	Full   bool     `json:"full,omitempty"`
+	Add    []string `json:"add,omitempty"`
+	Remove []string `json:"remove,omitempty"`
+}
+
+type AnnounceResponse struct {
+	Resync bool `json:"resync,omitempty"`
+	// TTL is the announce validity in seconds.
+	TTL int64 `json:"ttl"`
+}
+
+type PeerStatus struct {
+	ID       string    `json:"id"`
+	URL      string    `json:"url"`
+	Epoch    string    `json:"epoch"`
+	Expiry   time.Time `json:"expiry"`
+	Holdings int       `json:"holdings"`
+}
+
+type XorbGets struct {
+	Peer   uint64 `json:"peer"`
+	Direct uint64 `json:"direct"`
+}
+
+// PeersResponse is the GET PeersPath schema: the live peer registry and xorb traffic counters.
+type PeersResponse struct {
+	Peers     []PeerStatus `json:"peers"`
+	XorbBytes int64        `json:"xorb_bytes"`
+	XorbGets  XorbGets     `json:"xorb_gets"`
+}

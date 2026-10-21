@@ -31,6 +31,8 @@ type store struct {
 	*local.Storage
 	reg       *registry
 	offsetDir string
+	// sidecar offsets of xorbs without local bytes; 4096 × ≤64 KiB (xet.MaxChunksPerXorb) bounds it at 256 MiB, typically 32 MiB
+	offsets   *storage.Cache[xet.XorbHash, []uint64]
 	transport *http.Transport // relay fetches; carries no upstream credentials
 
 	mu      sync.Mutex // guards pins, writers and local xorb deletion; never held across network I/O
@@ -58,7 +60,7 @@ func newStore(dir string, reg *registry) (*store, error) {
 	if err := os.MkdirAll(offsetDir, 0o755); err != nil {
 		return nil, err
 	}
-	return &store{Storage: st, reg: reg, offsetDir: offsetDir, transport: apis.NewTransport(), pins: map[xet.XorbHash]int{}, writers: map[xet.XorbHash]*writerLock{}}, nil
+	return &store{Storage: st, reg: reg, offsetDir: offsetDir, offsets: storage.NewCache[xet.XorbHash, []uint64](storage.DefaultCacheSize), transport: apis.NewTransport(), pins: map[xet.XorbHash]int{}, writers: map[xet.XorbHash]*writerLock{}}, nil
 }
 
 // lockWriter blocks until this caller is the only writer of hash; the result releases it.
@@ -246,24 +248,38 @@ func (s *store) PutXorb(ctx context.Context, hash xet.XorbHash, r io.Reader) (bo
 	if err != nil {
 		return false, err
 	}
+	s.offsets.Add(hash, offsets)
 	if s.onStored != nil {
 		s.onStored(hash, size, inserted)
 	}
 	return inserted, nil
 }
 
-// localOffsets answers from the local bytes, then the sidecar; a wrapped fs.ErrNotExist means neither exists.
-func (s *store) localOffsets(ctx context.Context, hash xet.XorbHash) ([]uint64, error) {
+// localOffsets answers from the local bytes, the cache, then the sidecar it caches under hash's writer lock, held by the caller when locked; a wrapped fs.ErrNotExist means none exists.
+func (s *store) localOffsets(ctx context.Context, hash xet.XorbHash, locked bool) ([]uint64, error) {
 	offsets, err := s.Storage.GetXorbChunkOffsets(ctx, hash)
 	if err == nil || !errors.Is(err, fs.ErrNotExist) {
 		return offsets, err
 	}
-	return s.readSidecar(hash)
+	if offsets, ok := s.offsets.Get(hash); ok {
+		return offsets, nil
+	}
+	if !locked {
+		// Reading under the lock keeps a concurrent writer's newer offsets from being cached over.
+		defer s.lockWriter(hash)()
+		if offsets, ok := s.offsets.Get(hash); ok {
+			return offsets, nil
+		}
+	}
+	if offsets, err = s.readSidecar(hash); err == nil {
+		s.offsets.Add(hash, offsets)
+	}
+	return offsets, err
 }
 
-// GetXorbChunkOffsets tries local bytes, sidecar, then a holder, persisting what it learns unless local bytes were committed meanwhile.
+// GetXorbChunkOffsets tries local bytes, sidecar, then a holder, persisting what it learns unless local bytes were committed meanwhile; callers must not modify the returned slice.
 func (s *store) GetXorbChunkOffsets(ctx context.Context, hash xet.XorbHash) ([]uint64, error) {
-	offsets, err := s.localOffsets(ctx, hash)
+	offsets, err := s.localOffsets(ctx, hash, false)
 	if err == nil || !errors.Is(err, fs.ErrNotExist) {
 		return offsets, err
 	}
@@ -276,10 +292,13 @@ func (s *store) GetXorbChunkOffsets(ctx context.Context, hash xet.XorbHash) ([]u
 		return nil, fmt.Errorf("read chunk offsets of xorb %s: %w", hash, err)
 	}
 	defer s.lockWriter(hash)()
-	if local, err := s.localOffsets(ctx, hash); err == nil {
+	if local, err := s.localOffsets(ctx, hash, true); err == nil {
 		return local, nil
 	}
-	return offsets, s.writeSidecar(hash, offsets)
+	if err = s.writeSidecar(hash, offsets); err == nil {
+		s.offsets.Add(hash, offsets)
+	}
+	return offsets, err
 }
 
 // remote opens [start, end] of the xorb on a live holder, end -1 meaning EOF; failed holders are skipped before any handle is handed out.

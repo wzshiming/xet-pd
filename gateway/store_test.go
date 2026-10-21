@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -13,6 +14,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -421,6 +423,147 @@ func TestOffsetsFollowReplacedEncoding(t *testing.T) {
 	}
 }
 
+// Offsets of an evicted xorb are read from its sidecar once, then served from memory.
+func TestOffsetsCacheServesEvictedXorbWithoutSidecar(t *testing.T) {
+	x := makeXorb(t, 17, 3, 4<<10)
+	dir := t.TempDir()
+	st, _ := newTestStore(t, dir)
+	ctx := context.Background()
+	want, err := storage.ReadXorbChunkOffsets(bytes.NewReader(x.body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ws, we, _ := xorb.ChunkDataRangeFromOffsets(want, 1, 3)
+	dataRange := func(when string) {
+		t.Helper()
+		if start, end, err := st.GetXorbDataRange(ctx, x.hash, 1, 3); err != nil || start != ws || end != we {
+			t.Fatalf("GetXorbDataRange %s = %d, %d, %v, want %d, %d", when, start, end, err, ws, we)
+		}
+	}
+	if _, err := st.PutXorb(ctx, x.hash, bytes.NewReader(x.body)); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.DeleteXorb(ctx, x.hash); err != nil {
+		t.Fatal(err)
+	}
+	st, _ = newTestStore(t, dir) // restart with no peers: only the sidecar knows the offsets
+	dataRange("from the sidecar")
+	if err := os.Remove(st.sidecar(x.hash)); err != nil {
+		t.Fatal(err)
+	}
+	dataRange("after the sidecar it read was removed")
+	st, _ = newTestStore(t, dir) // restart again so only the next put can fill the cache
+	if _, err := st.PutXorb(ctx, x.hash, bytes.NewReader(x.body)); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(st.sidecar(x.hash)); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.DeleteXorb(ctx, x.hash); err != nil {
+		t.Fatal(err)
+	}
+	dataRange("after the put's sidecar was removed and its bytes evicted")
+}
+
+// Cached offsets follow the encoding the latest put or holder gave the hash, as the sidecar does.
+func TestOffsetsCacheFollowsReplacedEncoding(t *testing.T) {
+	x, raw := compressible(t, 3)
+	packed, _ := storage.ReadXorbChunkOffsets(bytes.NewReader(x.body))
+	plain, _ := storage.ReadXorbChunkOffsets(bytes.NewReader(raw))
+	dir := t.TempDir()
+	st, reg := newTestStore(t, dir)
+	ctx := context.Background()
+	offsets := func(want []uint64, when string) {
+		t.Helper()
+		if got, err := st.GetXorbChunkOffsets(ctx, x.hash); err != nil || !slices.Equal(got, want) {
+			t.Fatalf("GetXorbChunkOffsets %s = %v, %v, want %v", when, got, err, want)
+		}
+	}
+	if _, err := st.PutXorb(ctx, x.hash, bytes.NewReader(x.body)); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.DeleteXorb(ctx, x.hash); err != nil {
+		t.Fatal(err)
+	}
+	offsets(packed, "after the packed copy was evicted")
+	if _, err := st.PutXorb(ctx, x.hash, bytes.NewReader(raw)); err != nil {
+		t.Fatal(err)
+	}
+	offsets(plain, "after the raw re-insertion")
+	if err := os.Remove(st.sidecar(x.hash)); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.DeleteXorb(ctx, x.hash); err != nil {
+		t.Fatal(err)
+	}
+	offsets(plain, "after the raw copy and its sidecar were removed")
+	held := *x
+	held.body = raw
+	h := newHolder(t, reg, "h1", &held)
+	st, err := newStore(dir, reg) // restart: only the holder knows the offsets
+	if err != nil {
+		t.Fatal(err)
+	}
+	offsets(plain, "from the holder")
+	asked := len(h.requests())
+	if err := os.Remove(st.sidecar(x.hash)); err != nil {
+		t.Fatal(err)
+	}
+	h.drop(x.hash)
+	offsets(plain, "after the learned sidecar was removed and the holder dropped the xorb")
+	if n := len(h.requests()); n != asked {
+		t.Fatalf("holder asked %d more times for offsets already learned", n-asked)
+	}
+}
+
+// Readers filling the cache from an evicted copy's sidecar while a put of another encoding commits must not cache over the put's offsets.
+func TestReaderFillRacesPut(t *testing.T) {
+	x, raw := compressible(t, 3)
+	packed, _ := storage.ReadXorbChunkOffsets(bytes.NewReader(x.body))
+	plain, _ := storage.ReadXorbChunkOffsets(bytes.NewReader(raw))
+	// The raw copy's sidecar, padded to the largest one accepted so readers are still parsing it when the put commits.
+	stale, _ := json.Marshal(plain)
+	stale = append(stale, bytes.Repeat([]byte{' '}, maxSidecarBytes-len(stale))...)
+	st, _ := newTestStore(t, t.TempDir())
+	ctx := context.Background()
+	if err := os.MkdirAll(filepath.Dir(st.sidecar(x.hash)), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for round := range 20 {
+		st.offsets.Remove(x.hash)
+		if err := os.WriteFile(st.sidecar(x.hash), stale, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		stop := make(chan struct{})
+		var wg sync.WaitGroup
+		for range 4 {
+			wg.Go(func() {
+				for {
+					_, _ = st.GetXorbChunkOffsets(ctx, x.hash)
+					select {
+					case <-stop:
+						return
+					default:
+						st.offsets.Remove(x.hash) // the next read goes back to the sidecar
+					}
+				}
+			})
+		}
+		_, err := st.PutXorb(ctx, x.hash, bytes.NewReader(x.body))
+		close(stop)
+		wg.Wait()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := st.DeleteXorb(ctx, x.hash); err != nil {
+			t.Fatal(err)
+		}
+		if got, err := st.GetXorbChunkOffsets(ctx, x.hash); err != nil || !slices.Equal(got, packed) {
+			t.Fatalf("round %d: GetXorbChunkOffsets after the put was evicted = %v, %v, want the put's %v", round, got, err, packed)
+		}
+	}
+}
+
 // writers counts the writers holding or queued on hash's writer lock.
 func writers(st *store, hash xet.XorbHash) int {
 	st.mu.Lock()
@@ -521,7 +664,8 @@ func TestRemoteOffsetsYieldToLocalCommit(t *testing.T) {
 
 func TestMalformedSidecarIsRejected(t *testing.T) {
 	x := makeXorb(t, 8, 1, 4<<10)
-	st, _ := newTestStore(t, t.TempDir())
+	dir := t.TempDir()
+	st, _ := newTestStore(t, dir)
 	ctx := context.Background()
 	long := make([]uint64, xet.MaxChunksPerXorb+1)
 	for i := range long {
@@ -538,6 +682,9 @@ func TestMalformedSidecarIsRejected(t *testing.T) {
 		if start, end, err := st.GetXorbDataRange(ctx, x.hash, 0, 1); err == nil || start < 0 || end < 0 {
 			t.Errorf("GetXorbDataRange with sidecar %v... = %d, %d, %v, want an error and no negative bound", offsets[:1], start, end, err)
 		}
+		if _, ok := st.offsets.Get(x.hash); ok {
+			t.Errorf("offsets cache holds the rejected sidecar %v...", offsets[:1])
+		}
 	}
 	malformed := []string{"[8,16]x", "[8,16][24]", "[8,16]" + strings.Repeat(" ", maxSidecarBytes), `{"a":8}`, "[-8]", "[8.5]", "[1e3]"}
 	for _, raw := range malformed {
@@ -547,9 +694,13 @@ func TestMalformedSidecarIsRejected(t *testing.T) {
 		if _, err := st.GetXorbChunkOffsets(ctx, x.hash); err == nil || errors.Is(err, fs.ErrNotExist) {
 			t.Errorf("GetXorbChunkOffsets with sidecar %.12q = %v, want decode error", raw, err)
 		}
+		if _, ok := st.offsets.Get(x.hash); ok {
+			t.Errorf("offsets cache holds the rejected sidecar %.12q", raw)
+		}
 	}
 	accepted := map[string][]uint64{"[]": {}, "null": nil, "[8]": {8}, "[8]" + strings.Repeat(" ", maxSidecarBytes-3): {8}, fmt.Sprintf("[%d]", apis.MaxXorbBytes): {apis.MaxXorbBytes}}
 	for raw, want := range accepted {
+		st, _ = newTestStore(t, dir) // a store keeps the first sidecar it accepts
 		if err := os.WriteFile(st.sidecar(x.hash), []byte(raw), 0o644); err != nil {
 			t.Fatal(err)
 		}

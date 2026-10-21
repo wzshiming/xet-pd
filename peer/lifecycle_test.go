@@ -120,14 +120,21 @@ func TestStartupDropsCorruptObject(t *testing.T) {
 	}
 	g := clustertest.NewFakeGateway(t, clustertest.ServeByHash(nil))
 	p, _ := newTestPeer(t, g.URL, func(c *Config) { c.CacheDir, c.Heartbeat = dir, time.Hour })
-	if got := g.Announce(t, 0).Req; !got.Full || !slices.Equal(got.Add, hashes(a)) {
-		t.Fatalf("startup announce = %+v, want only %s", got, a)
+	if got := g.Announce(t, 0).Req; !got.Full {
+		t.Fatalf("startup announce = %+v, want a Full", got)
 	}
+	clustertest.WaitFor(t, clustertest.WaitTimeout, "startup validation", p.Validated)
 	if _, err := os.Stat(xorbPath(dir, b)); !os.IsNotExist(err) {
 		t.Fatalf("corrupt object kept: %v", err)
 	}
 	if u := usage(p); u != int64(len(bodyA)) {
 		t.Fatalf("usage = %d, want %d", u, len(bodyA))
+	}
+	waitView(t, g, a)
+	for i, x := range g.Announces() {
+		if hasAdd(x, b) {
+			t.Fatalf("announce %d = %+v adds the corrupt %s", i, x.Req, b)
+		}
 	}
 }
 
@@ -732,13 +739,15 @@ func TestRestartRebuildsUsageAndOrder(t *testing.T) {
 	p, srv := newTestPeer(t, g.URL, func(cfg *Config) {
 		cfg.CacheDir, cfg.Heartbeat, cfg.XorbCacheSize = dir, time.Hour, int64(len(bodyA)+len(bodyC))
 	})
-	// Oldest by mtime goes first at startup, and the Full matches what survived.
-	if got := g.Announce(t, 0).Req; !got.Full || !slices.Equal(got.Add, hashes(a, c)) {
-		t.Fatalf("startup Full = %+v, want %v", got, hashes(a, c))
+	if got := g.Announce(t, 0).Req; !got.Full {
+		t.Fatalf("startup announce = %+v, want a Full", got)
 	}
+	// Oldest by mtime goes first at startup, and the gateway ends up holding what survived.
+	clustertest.WaitFor(t, clustertest.WaitTimeout, "startup validation", p.Validated)
 	if clustertest.HasXorb(t, p.store, b) || usage(p) != int64(len(bodyA)+len(bodyC)) {
 		t.Fatalf("startup eviction: b present %v, usage %d", clustertest.HasXorb(t, p.store, b), usage(p))
 	}
+	waitView(t, g, a, c)
 	pullAndSettle(t, p, srv, d, bodyD)
 	if clustertest.HasXorb(t, p.store, c) || !clustertest.HasXorb(t, p.store, a) || !clustertest.HasXorb(t, p.store, d) {
 		t.Fatal("expected c evicted next, a and d kept")

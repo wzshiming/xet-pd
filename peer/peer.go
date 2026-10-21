@@ -22,7 +22,6 @@ import (
 
 	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/storage/local"
-	"github.com/wzshiming/xet/xorb"
 
 	"github.com/wzshiming/xet-pd/apis"
 	"github.com/wzshiming/xet-pd/internal/inventory"
@@ -62,10 +61,11 @@ type Peer struct {
 	sem    chan struct{} // bounds parallel upstream pulls
 	once   sync.Once
 
-	mu       sync.Mutex // guards pulls, cooldown, the inventory and cancel-vs-acquire
-	pulls    map[xet.XorbHash]*pull
-	cooldown map[xet.XorbHash]cooled
-	xorbs    lru.Index[xet.XorbHash, ready] // committed xorbs
+	mu        sync.Mutex // guards pulls, cooldown, the inventory, unchecked and cancel-vs-acquire
+	pulls     map[xet.XorbHash]*pull
+	cooldown  map[xet.XorbHash]cooled
+	xorbs     lru.Index[xet.XorbHash, ready] // committed xorbs
+	unchecked map[xet.XorbHash]bool          // files of the startup scan awaiting validation; true: invalid, left to the in-flight pull
 }
 
 func New(cfg Config) (*Peer, error) {
@@ -125,26 +125,16 @@ func New(cfg Config) (*Peer, error) {
 		cancel()
 		return nil, err
 	}
-	p.mu.Lock()
+	p.unchecked = make(map[xet.XorbHash]bool, len(xorbs))
 	for _, x := range xorbs {
-		obj, err := p.store.GetXorbReadSeekCloser(context.Background(), x.Hash)
-		if err == nil {
-			err = xorb.Validate(obj, x.Hash)
-			_ = obj.Close()
-		}
-		if err != nil {
-			slog.Warn("peer: dropping invalid xorb", "hash", x.Hash, "err", err)
-			if err := p.store.DeleteXorb(context.Background(), x.Hash); err != nil {
-				p.mu.Unlock()
-				cancel()
-				return nil, err
-			}
-			continue
-		}
-		p.admit(x.Hash, x.Size, nil)
+		p.unchecked[x.Hash] = false
 	}
-	p.evict()
-	p.mu.Unlock()
+	// Validation reads every byte, so it runs behind New and admits the files as they pass.
+	p.wg.Add(1)
+	go func() {
+		defer p.wg.Done()
+		p.validateUnchecked(xorbs)
+	}()
 	// The announcer reconciles the gateway's view with the inventory.
 	p.wg.Add(1)
 	go func() {
@@ -227,7 +217,14 @@ func (p *Peer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	p.mux.ServeHTTP(w, r)
 }
 
-// Close stops the announcer, cancels in-flight pulls, waits for them and drops idle upstream connections.
+// Validated reports whether every xorb found on disk at startup has been validated, deleted or replaced; it stays false once Close interrupts that.
+func (p *Peer) Validated() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.unchecked) == 0
+}
+
+// Close stops the announcer and the startup validation, cancels in-flight pulls, waits for them and drops idle upstream connections.
 func (p *Peer) Close() error {
 	p.once.Do(func() {
 		p.mu.Lock()

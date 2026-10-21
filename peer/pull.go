@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"time"
@@ -126,13 +127,25 @@ func (p *Peer) acquire(hash xet.XorbHash, force bool) (*pull, *lru.Entry[xet.Xor
 							err = fmt.Errorf("short body: %d of %d bytes", n, resp.ContentLength)
 						default:
 							f.size = n
-							rs, _ := f.stream.NewReadSeeker(0, int(n))
+							p.mu.Lock()
+							_, took := p.unchecked[f.hash]
+							if took { // an unvalidated file is replaced, never deduplicated against
+								err = p.discard(f.hash)
+							}
+							p.mu.Unlock()
 							var stored bool
-							stored, err = p.store.PutXorb(ctx, f.hash, rs)
-							_ = rs.Close()
-							if err == nil && !stored {
+							if err == nil {
+								rs, _ := f.stream.NewReadSeeker(0, int(n))
+								stored, err = p.store.PutXorb(ctx, f.hash, rs)
+								_ = rs.Close()
+							}
+							switch {
+							case err != nil || stored:
+							case took:
+								err = errors.New("replaced xorb reappeared")
+							default:
 								// The store deduplicated against an existing object without reading this spool.
-								rs, _ = f.stream.NewReadSeeker(0, int(n))
+								rs, _ := f.stream.NewReadSeeker(0, int(n))
 								err = xorb.Validate(rs, f.hash)
 								_ = rs.Close()
 							}
@@ -159,6 +172,11 @@ func (p *Peer) acquire(hash xet.XorbHash, force bool) (*pull, *lru.Entry[xet.Xor
 			p.admit(f.hash, f.size, f)
 		} else if !errors.Is(err, context.Canceled) { // abandoned or closed is no fault of the xorb
 			p.cooldown[f.hash] = cooled{until: time.Now().Add(failedCooldown), err: err}
+		}
+		if err != nil && p.unchecked[f.hash] { // the validator left its invalid file to this pull
+			if err := p.discard(f.hash); err != nil {
+				slog.Warn("peer: delete invalid xorb", "hash", f.hash, "err", err)
+			}
 		}
 		p.mu.Unlock()
 		close(f.done)

@@ -138,19 +138,23 @@ func TestStartupFullAnnouncesSeededInventory(t *testing.T) {
 		c.CacheDir, c.Heartbeat, c.Secret = dir, time.Hour, "s3cret"
 	})
 	first := g.Announce(t, 0)
-	want := apis.AnnounceRequest{Peer: apis.Peer{ID: p.id, URL: "http://seed.test"}, Epoch: p.epoch, Full: true, Add: hashes(a, b)}
-	if got := first.Req; !slices.Equal(got.Add, want.Add) || got.Peer != want.Peer || got.Epoch != want.Epoch || !got.Full || len(got.Remove) != 0 {
-		t.Fatalf("startup announce = %+v, want %+v", got, want)
+	want := apis.AnnounceRequest{Peer: apis.Peer{ID: p.id, URL: "http://seed.test"}, Epoch: p.epoch, Full: true}
+	if got := first.Req; got.Peer != want.Peer || got.Epoch != want.Epoch || !got.Full || len(got.Remove) != 0 {
+		t.Fatalf("startup announce = %+v, want a Full from %+v in epoch %s", got, want.Peer, want.Epoch)
 	}
 	if first.Header.Get("Authorization") != "Bearer s3cret" || first.Header.Get("Content-Type") != "application/json" || first.Header.Get(apis.PeerHeader) != "" {
 		t.Fatalf("announce headers = %v", first.Header)
 	}
+	// Seeded objects reach the gateway as background validation admits them.
+	clustertest.WaitFor(t, clustertest.WaitTimeout, "startup validation", p.Validated)
+	waitView(t, g, a, b)
+	n := len(g.Announces())
 	resp, got, err := do(t, http.MethodGet, xorbURL(srv, a))
 	if err != nil || resp.StatusCode != http.StatusOK || !bytes.Equal(got, bodyA) {
 		t.Fatalf("GET seeded = %d, %d bytes, %v", resp.StatusCode, len(got), err)
 	}
-	if n := len(g.Announces()); n != 1 {
-		t.Fatalf("announces after startup = %d, want 1", n)
+	if got := len(g.Announces()); got != n {
+		t.Fatalf("announces after the GET = %d, want %d", got, n)
 	}
 }
 

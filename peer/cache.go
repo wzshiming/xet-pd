@@ -5,7 +5,9 @@ import (
 	"log/slog"
 
 	"github.com/wzshiming/xet"
+	"github.com/wzshiming/xet/xorb"
 
+	"github.com/wzshiming/xet-pd/internal/inventory"
 	"github.com/wzshiming/xet-pd/internal/lru"
 )
 
@@ -27,6 +29,49 @@ func (p *Peer) admit(hash xet.XorbHash, size int64, f *pull) {
 	p.xorbs.Add(hash, size, ready{pull: f})
 	p.kick()
 	p.evict()
+}
+
+// validateUnchecked validates the startup scan in its order, admitting the files that pass and deleting the rest; Close stops it before its next verdict.
+func (p *Peer) validateUnchecked(xorbs []inventory.Xorb) {
+	for _, x := range xorbs {
+		if p.ctx.Err() != nil {
+			return
+		}
+		obj, err := p.store.GetXorbReadSeekCloser(p.ctx, x.Hash)
+		if err == nil {
+			err = xorb.Validate(obj, x.Hash)
+			_ = obj.Close()
+		}
+		p.mu.Lock()
+		if p.ctx.Err() != nil { // the read may have failed for the cancellation rather than the file
+			p.mu.Unlock()
+			return
+		}
+		_, ok := p.unchecked[x.Hash]
+		switch {
+		case !ok: // a pull replaced the file meanwhile
+		case err == nil:
+			delete(p.unchecked, x.Hash)
+			p.admit(x.Hash, x.Size, nil)
+		default:
+			slog.Warn("peer: dropping invalid xorb", "hash", x.Hash, "err", err)
+			if p.pulls[x.Hash] != nil {
+				p.unchecked[x.Hash] = true // the pull replaces the file, or deletes it if the pull fails
+			} else if err := p.discard(x.Hash); err != nil {
+				slog.Warn("peer: delete invalid xorb", "hash", x.Hash, "err", err)
+			}
+		}
+		p.mu.Unlock()
+	}
+}
+
+// discard deletes the file of an unchecked hash, which stays unchecked until the file is gone; caller holds p.mu.
+func (p *Peer) discard(hash xet.XorbHash) error {
+	if err := p.store.DeleteXorb(context.Background(), hash); err != nil {
+		return err
+	}
+	delete(p.unchecked, hash)
+	return nil
 }
 
 // evict deletes least recently used objects nobody reads until usage fits; caller holds p.mu.

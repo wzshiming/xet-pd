@@ -213,6 +213,10 @@ func (s *store) readSidecar(hash xet.XorbHash) ([]uint64, error) {
 }
 
 func (s *store) writeSidecar(hash xet.XorbHash, offsets []uint64) error {
+	data, err := json.Marshal(offsets)
+	if err != nil {
+		return fmt.Errorf("offsets sidecar of xorb %s: %w", hash, err)
+	}
 	path := s.sidecar(hash)
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
@@ -221,7 +225,6 @@ func (s *store) writeSidecar(hash xet.XorbHash, offsets []uint64) error {
 	if err != nil {
 		return err
 	}
-	data, _ := json.Marshal(offsets)
 	_, err = f.Write(data)
 	if cerr := f.Close(); err == nil {
 		err = cerr

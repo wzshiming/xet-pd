@@ -162,6 +162,9 @@ func TestPutSeedsReplicasOnce(t *testing.T) {
 		seeds[id] = newSeed(t, st, id)
 	}
 	m := newTestStaging(t, st, stagingConfig{secret: "tok"})
+	if got := m.client.Transport.(*http.Transport).MaxIdleConnsPerHost; got != maxPulls {
+		t.Fatalf("pull client keeps %d idle conns per seed, want maxPulls = %d", got, maxPulls)
+	}
 	ctx := context.Background()
 	if _, err := st.PutXorb(ctx, x.hash, bytes.NewReader(x.body)); err != nil {
 		t.Fatal(err)

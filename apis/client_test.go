@@ -11,9 +11,18 @@ import (
 
 func TestNewTransport(t *testing.T) {
 	t.Parallel()
-	tr := NewTransport()
-	if tr == http.DefaultTransport || !tr.DisableCompression || tr.ResponseHeaderTimeout != 30*time.Second {
-		t.Fatalf("NewTransport: shared %v, DisableCompression %v, ResponseHeaderTimeout %v, want a clone, true, 30s", tr == http.DefaultTransport, tr.DisableCompression, tr.ResponseHeaderTimeout)
+	def := http.DefaultTransport.(*http.Transport)
+	for _, tt := range []struct{ idlePerHost, want int }{{-1, def.MaxIdleConnsPerHost}, {0, def.MaxIdleConnsPerHost}, {1, 1}, {8, 8}} {
+		tr := NewTransport(tt.idlePerHost)
+		if tr == def || !tr.DisableCompression || tr.ResponseHeaderTimeout != 30*time.Second {
+			t.Fatalf("NewTransport(%d): shared %v, DisableCompression %v, ResponseHeaderTimeout %v, want a clone, true, 30s", tt.idlePerHost, tr == def, tr.DisableCompression, tr.ResponseHeaderTimeout)
+		}
+		if tr.MaxIdleConnsPerHost != tt.want {
+			t.Errorf("NewTransport(%d).MaxIdleConnsPerHost = %d, want %d", tt.idlePerHost, tr.MaxIdleConnsPerHost, tt.want)
+		}
+	}
+	if def.MaxIdleConnsPerHost != 0 {
+		t.Errorf("http.DefaultTransport.MaxIdleConnsPerHost = %d after NewTransport, want 0", def.MaxIdleConnsPerHost)
 	}
 }
 

@@ -102,7 +102,7 @@ func New(cfg Config) (*Peer, error) {
 		return nil, err
 	}
 	sum := sha256.Sum256([]byte(cfg.Advertise))
-	transport := apis.NewTransport()
+	transport := apis.NewTransport(cfg.MaxPulls + 1) // shared by the pulls and the announcer
 	ctx, cancel := context.WithCancel(context.Background())
 	p := &Peer{
 		cfg:      cfg,

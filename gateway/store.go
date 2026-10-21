@@ -26,6 +26,9 @@ import (
 // relayAttempts bounds the holders tried per remote open.
 const relayAttempts = 3
 
+// relayIdleConns is the idle connections kept per holder, sized to concurrent inbound reads rather than to relayAttempts.
+const relayIdleConns = 8
+
 // store keeps shards and indexes in the local store while xorb bytes may live only on peers; reads fall back to live holders.
 type store struct {
 	*local.Storage
@@ -60,7 +63,7 @@ func newStore(dir string, reg *registry) (*store, error) {
 	if err := os.MkdirAll(offsetDir, 0o755); err != nil {
 		return nil, err
 	}
-	return &store{Storage: st, reg: reg, offsetDir: offsetDir, offsets: storage.NewCache[xet.XorbHash, []uint64](storage.DefaultCacheSize), transport: apis.NewTransport(), pins: map[xet.XorbHash]int{}, writers: map[xet.XorbHash]*writerLock{}}, nil
+	return &store{Storage: st, reg: reg, offsetDir: offsetDir, offsets: storage.NewCache[xet.XorbHash, []uint64](storage.DefaultCacheSize), transport: apis.NewTransport(relayIdleConns), pins: map[xet.XorbHash]int{}, writers: map[xet.XorbHash]*writerLock{}}, nil
 }
 
 // lockWriter blocks until this caller is the only writer of hash; the result releases it.

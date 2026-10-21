@@ -66,7 +66,7 @@ func newStaging(st *store, cfg stagingConfig) (*staging, error) {
 		cfg:    cfg,
 		st:     st,
 		reg:    st.reg,
-		client: apis.NewClient(apis.NewTransport()),
+		client: apis.NewClient(apis.NewTransport(maxPulls)),
 		wake:   make(chan struct{}, 1),
 		sem:    make(chan struct{}, maxPulls),
 		ctx:    ctx,

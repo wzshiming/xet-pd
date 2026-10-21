@@ -10,11 +10,14 @@ import (
 	"time"
 )
 
-// NewTransport returns a transport that never asks for gzip, so lengths and ranges stay byte-exact, and waits at most 30s for response headers.
-func NewTransport() *http.Transport {
+// NewTransport returns a transport that never asks for gzip, so lengths and ranges stay byte-exact, waits at most 30s for response headers and keeps up to idlePerHost idle connections per host, http.DefaultMaxIdleConnsPerHost if it is below 1.
+func NewTransport(idlePerHost int) *http.Transport {
 	t := http.DefaultTransport.(*http.Transport).Clone()
 	t.DisableCompression = true
 	t.ResponseHeaderTimeout = 30 * time.Second
+	if idlePerHost > 0 {
+		t.MaxIdleConnsPerHost = idlePerHost
+	}
 	return t
 }
 

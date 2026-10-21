@@ -714,6 +714,9 @@ func TestRelayReadsFromLiveHolder(t *testing.T) {
 	t.Setenv("HF_TOKEN", "hf_must_not_leak")
 	x := makeXorb(t, 9, 4, 8<<10)
 	st, reg := newTestStore(t, t.TempDir())
+	if st.transport.MaxIdleConnsPerHost != relayIdleConns {
+		t.Fatalf("relay transport keeps %d idle conns per holder, want relayIdleConns = %d", st.transport.MaxIdleConnsPerHost, relayIdleConns)
+	}
 	h := newHolder(t, reg, "h1", x)
 	ctx := context.Background()
 	rs, err := st.GetXorbReadSeekCloser(ctx, x.hash)

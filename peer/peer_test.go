@@ -203,6 +203,9 @@ func TestConfigValidation(t *testing.T) {
 	if p.cfg.MaxPulls != 8 || p.cfg.PullTimeout != 10*time.Minute || p.cfg.Heartbeat != 10*time.Second {
 		t.Fatalf("defaults = %+v", p.cfg)
 	}
+	if tr := p.client.Transport.(*http.Transport); tr.MaxIdleConnsPerHost != p.cfg.MaxPulls+1 || p.control.Transport != p.client.Transport {
+		t.Fatalf("gateway transport keeps %d idle conns per host, shared with control %v, want MaxPulls+1 = %d, true", tr.MaxIdleConnsPerHost, p.control.Transport == p.client.Transport, p.cfg.MaxPulls+1)
+	}
 }
 
 func TestNewIdentityAndSpoolCleanup(t *testing.T) {

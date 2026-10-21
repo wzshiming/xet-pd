@@ -34,6 +34,7 @@ type Config struct {
 	RelayTimeout  time.Duration // dial, TLS handshake and response headers of one relay attempt, default 5s
 	Replicas      int           // seeds asked to hold each xorb, default 2
 	MinSeeds      int           // live holders before the local copy may go, default 1
+	MaxPulls      int           // parallel pull requests to seeds, default 8
 	XorbCacheSize int64         // bytes of local xorbs kept, 0 unlimited
 }
 
@@ -68,7 +69,7 @@ func New(cfg Config) (*Gateway, error) {
 			return nil, fmt.Errorf("gateway: external url: %w", err)
 		}
 	}
-	if cfg.PeerTTL < 0 || cfg.RelayTimeout < 0 || cfg.Replicas < 0 || cfg.MinSeeds < 0 || cfg.XorbCacheSize < 0 {
+	if cfg.PeerTTL < 0 || cfg.RelayTimeout < 0 || cfg.Replicas < 0 || cfg.MinSeeds < 0 || cfg.MaxPulls < 0 || cfg.XorbCacheSize < 0 {
 		return nil, errors.New("gateway: negative config value")
 	}
 	cfg.PeerTTL = cmp.Or(cfg.PeerTTL, 30*time.Second)
@@ -78,6 +79,7 @@ func New(cfg Config) (*Gateway, error) {
 	cfg.RelayTimeout = cmp.Or(cfg.RelayTimeout, 5*time.Second)
 	cfg.Replicas = cmp.Or(cfg.Replicas, 2)
 	cfg.MinSeeds = cmp.Or(cfg.MinSeeds, 1)
+	cfg.MaxPulls = cmp.Or(cfg.MaxPulls, 8)
 	if cfg.MinSeeds > cfg.Replicas {
 		return nil, errors.New("gateway: min seeds exceed replicas")
 	}
@@ -118,7 +120,7 @@ func New(cfg Config) (*Gateway, error) {
 		authorizer = issuer
 	}
 	cas := server.NewHandler(server.WithStorage(st), server.WithAuthorizer(authorizer), server.WithNext(hub))
-	staging, err := newStaging(st, stagingConfig{replicas: cfg.Replicas, minSeeds: cfg.MinSeeds, cacheSize: cfg.XorbCacheSize, secret: cfg.Secret})
+	staging, err := newStaging(st, stagingConfig{replicas: cfg.Replicas, minSeeds: cfg.MinSeeds, maxPulls: cfg.MaxPulls, cacheSize: cfg.XorbCacheSize, secret: cfg.Secret})
 	if err != nil {
 		return nil, fmt.Errorf("gateway: %w", err)
 	}

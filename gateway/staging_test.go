@@ -101,11 +101,21 @@ func (s *seed) answer(status int, redirect string) {
 	s.status, s.redirect = status, redirect
 }
 
-// hang makes every following request wait until its client gives up.
+// hang holds every following pull request until release or its client gives up.
 func (s *seed) hang() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.block = make(chan struct{})
+}
+
+// release answers the requests hang holds and lets later ones through.
+func (s *seed) release() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.block != nil {
+		close(s.block)
+		s.block = nil
+	}
 }
 
 func (s *seed) cancellations() int {
@@ -162,8 +172,8 @@ func TestPutSeedsReplicasOnce(t *testing.T) {
 		seeds[id] = newSeed(t, st, id)
 	}
 	m := newTestStaging(t, st, stagingConfig{secret: "tok"})
-	if got := m.client.Transport.(*http.Transport).MaxIdleConnsPerHost; got != maxPulls {
-		t.Fatalf("pull client keeps %d idle conns per seed, want maxPulls = %d", got, maxPulls)
+	if got := m.client.Transport.(*http.Transport).MaxIdleConnsPerHost; got != cap(m.sem) {
+		t.Fatalf("pull client keeps %d idle conns per seed, want maxPulls = %d", got, cap(m.sem))
 	}
 	ctx := context.Background()
 	if _, err := st.PutXorb(ctx, x.hash, bytes.NewReader(x.body)); err != nil {
@@ -501,6 +511,32 @@ func TestCloseCancelsHungPull(t *testing.T) {
 		t.Fatalf("%d pull requests after Close, want the 1 from before", n)
 	}
 	_ = m.Close()
+}
+
+// One pull slot holds the other seed's request back until the first one is answered.
+func TestMaxPullsBoundsInFlightRequests(t *testing.T) {
+	x := makeXorb(t, 63, 2, 4<<10)
+	st, _ := newTestStore(t, t.TempDir())
+	s1, s2 := newSeed(t, st, "s1"), newSeed(t, st, "s2")
+	s1.hang()
+	s2.hang()
+	m := newTestStaging(t, st, stagingConfig{maxPulls: 1})
+	t.Cleanup(func() { s1.release(); s2.release() })
+	if _, err := st.PutXorb(context.Background(), x.hash, bytes.NewReader(x.body)); err != nil {
+		t.Fatal(err)
+	}
+	arrived := func() int { return len(s1.requests()) + len(s2.requests()) }
+	// A held request keeps its slot, so once the arrivals match the slots taken none is still on its way.
+	clustertest.WaitFor(t, clustertest.WaitTimeout, "the requests holding pull slots to arrive", func() bool {
+		n := arrived()
+		return n > 0 && n == len(m.sem)
+	})
+	if n := arrived(); n != 1 {
+		t.Fatalf("%d pull requests in flight with maxPulls 1, want 1", n)
+	}
+	s1.release()
+	s2.release()
+	clustertest.WaitFor(t, clustertest.WaitTimeout, "the other seed's request once the first is answered", func() bool { return arrived() == 2 })
 }
 
 // The staging index stays free to uploads and reads while a large Full announce holds the registry write lock.

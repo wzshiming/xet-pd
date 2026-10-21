@@ -30,14 +30,15 @@ import (
 )
 
 type Config struct {
-	Advertise     string        // public origin of this peer, scheme://host[:port]
-	Gateway       string        // upstream gateway origin
-	CacheDir      string        // data directory: xorbs/ committed objects, spool/ in-flight pulls
-	XorbCacheSize int64         // bytes of committed xorbs to keep, 0 unlimited; spools are extra
-	MaxPulls      int           // parallel pulls from the gateway, default 8
-	PullTimeout   time.Duration // per pull including queueing, default 10m
-	Heartbeat     time.Duration // announce interval, default 10s
-	Secret        string        // optional bearer token shared with the gateway for pull and announce
+	Advertise       string        // public origin of this peer, scheme://host[:port]
+	Gateway         string        // upstream gateway origin
+	CacheDir        string        // data directory: xorbs/ committed objects, spool/ in-flight pulls
+	XorbCacheSize   int64         // bytes of committed xorbs to keep, 0 unlimited; spools are extra
+	MaxPulls        int           // parallel pulls from the gateway, default 8
+	PullTimeout     time.Duration // per pull including queueing, default 10m
+	FailureCooldown time.Duration // pause before a failed pull may be retried, default 15s
+	Heartbeat       time.Duration // announce interval, default 10s
+	Secret          string        // optional bearer token shared with the gateway for pull and announce
 }
 
 const (
@@ -82,11 +83,12 @@ func New(cfg Config) (*Peer, error) {
 	if cfg.CacheDir == "" {
 		return nil, errors.New("cache dir is required")
 	}
-	if cfg.XorbCacheSize < 0 || cfg.MaxPulls < 0 || cfg.PullTimeout < 0 || cfg.Heartbeat < 0 {
+	if cfg.XorbCacheSize < 0 || cfg.MaxPulls < 0 || cfg.PullTimeout < 0 || cfg.FailureCooldown < 0 || cfg.Heartbeat < 0 {
 		return nil, errors.New("negative config value")
 	}
 	cfg.MaxPulls = cmp.Or(cfg.MaxPulls, 8)
 	cfg.PullTimeout = cmp.Or(cfg.PullTimeout, 10*time.Minute)
+	cfg.FailureCooldown = cmp.Or(cfg.FailureCooldown, 15*time.Second)
 	cfg.Heartbeat = cmp.Or(cfg.Heartbeat, 10*time.Second)
 	store, err := local.NewStorage(local.WithBasePath(cfg.CacheDir))
 	if err != nil {

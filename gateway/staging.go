@@ -25,14 +25,12 @@ const pullTimeout = 2 * time.Second
 type stagingConfig struct {
 	replicas  int           // seeds asked to pull each local xorb
 	minSeeds  int           // live holders required before a local copy may be evicted
+	maxPulls  int           // parallel pull requests to seeds, default 8
 	cacheSize int64         // soft cap on local xorb bytes, 0 unlimited
 	secret    string        // bearer token of control requests; never sent on data requests
 	retry     time.Duration // pause per (xorb, seed) after a pull request, default 1m
 	tick      time.Duration // maintenance period besides wakes, default 1s
 }
-
-// maxPulls bounds parallel pull requests.
-const maxPulls = 8
 
 // staged is the seeding state of one durable local xorb.
 type staged struct {
@@ -59,6 +57,7 @@ type staging struct {
 
 // newStaging indexes the store's local xorbs and hooks the store; call before the store is shared.
 func newStaging(st *store, cfg stagingConfig) (*staging, error) {
+	cfg.maxPulls = cmp.Or(cfg.maxPulls, 8)
 	cfg.retry = cmp.Or(cfg.retry, time.Minute)
 	cfg.tick = cmp.Or(cfg.tick, time.Second)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -66,9 +65,9 @@ func newStaging(st *store, cfg stagingConfig) (*staging, error) {
 		cfg:    cfg,
 		st:     st,
 		reg:    st.reg,
-		client: apis.NewClient(apis.NewTransport(maxPulls)),
+		client: apis.NewClient(apis.NewTransport(cfg.maxPulls)),
 		wake:   make(chan struct{}, 1),
-		sem:    make(chan struct{}, maxPulls),
+		sem:    make(chan struct{}, cfg.maxPulls),
 		ctx:    ctx,
 		cancel: cancel,
 	}

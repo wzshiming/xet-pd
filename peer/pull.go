@@ -18,8 +18,6 @@ import (
 	"github.com/wzshiming/xet-pd/internal/lru"
 )
 
-const failedCooldown = 15 * time.Second
-
 var (
 	errNotFound = errors.New("xorb not found at gateway")
 	errClosed   = errors.New("peer closed")
@@ -183,7 +181,7 @@ func (p *Peer) acquire(hash xet.XorbHash, force bool) (*pull, *lru.Entry[xet.Xor
 		if err == nil {
 			p.admit(f.hash, f.size, f)
 		} else if !errors.Is(err, context.Canceled) { // abandoned or closed is no fault of the xorb
-			p.cooldown[f.hash] = cooled{until: time.Now().Add(failedCooldown), err: err}
+			p.cooldown[f.hash] = cooled{until: time.Now().Add(p.cfg.FailureCooldown), err: err}
 		}
 		if err != nil && p.unchecked[f.hash] { // the validator left its invalid file to this pull
 			if err := p.discard(f.hash); err != nil {

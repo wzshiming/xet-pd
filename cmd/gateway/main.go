@@ -46,6 +46,7 @@ func parse(args []string, getenv func(string) string, help io.Writer) (string, g
 	fs.DurationVar(&cfg.RelayTimeout, "relay-timeout", 5*time.Second, "dial, TLS handshake and response header limit of one relay attempt to a holder", "XET_PD_RELAY_TIMEOUT")
 	fs.IntVar(&cfg.Replicas, "replicas", 2, "peers asked to hold each xorb", "XET_PD_REPLICAS")
 	fs.IntVar(&cfg.MinSeeds, "min-seeds", 1, "live holders before the local xorb copy may go", "XET_PD_MIN_SEEDS")
+	fs.IntVar(&cfg.MaxPulls, "max-pulls", 8, "parallel pull requests to seeds", "XET_PD_MAX_PULLS")
 	fs.SizeVar(&cfg.XorbCacheSize, "xorb-cache-size", 8<<30, "bytes of local xorbs kept, 0 unlimited", "XET_PD_XORB_CACHE_SIZE")
 	secret, secretFile := fs.SecretFlags()
 	if err := fs.Parse(args, getenv, help); err != nil {

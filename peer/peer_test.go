@@ -369,10 +369,15 @@ func TestGatedPullServesPrefixBeforeUpstreamCompletes(t *testing.T) {
 		t.Fatalf("HEAD while gated = %d, length %d", resp.StatusCode, resp.ContentLength)
 	}
 	late := doAsync(t, u, "Range", fmt.Sprintf("bytes=%d-%d", prefix, prefix))
+	// The last flushed byte proves the peer has consumed all the gateway sent before release.
+	resp, got, err = do(t, http.MethodGet, u, "Range", fmt.Sprintf("bytes=%d-%d", prefix-1, prefix-1))
+	if err != nil || resp.StatusCode != http.StatusPartialContent || !bytes.Equal(got, body[prefix-1:prefix]) {
+		t.Fatalf("last flushed byte while gated = %d, %q, %v", resp.StatusCode, got, err)
+	}
 	select {
 	case r := <-late:
 		t.Fatalf("range past the flushed prefix returned %d before release", r.resp.StatusCode)
-	case <-time.After(100 * time.Millisecond):
+	default:
 	}
 	if clustertest.HasXorb(t, p.store, hash) {
 		t.Fatal("xorb published before upstream finished")

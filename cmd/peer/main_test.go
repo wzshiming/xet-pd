@@ -174,9 +174,9 @@ func TestRunListenFailureClosesService(t *testing.T) {
 		t.Fatalf("stdout %d writes, stderr %q", len(stdout), stderr.String())
 	}
 	// A closed peer announces no more; an unclosed one would announce every 20ms.
-	time.Sleep(50 * time.Millisecond)
+	time.Sleep(50 * time.Millisecond) // lets an announce in flight at Close land before the count
 	n := len(gw.Announces())
-	time.Sleep(200 * time.Millisecond)
+	time.Sleep(200 * time.Millisecond) // a leaked announcer shows only as more announces, so no event can end this window
 	if got := len(gw.Announces()); got != n {
 		t.Fatalf("announces kept coming after exit: %d -> %d", n, got)
 	}

@@ -120,14 +120,14 @@ func TestQueuedGatewayPullKeptWithoutClients(t *testing.T) {
 	if code := postPull(t, srv, b); code != http.StatusAccepted {
 		t.Fatalf("pull b = %d, want 202", code)
 	}
-	clustertest.WaitFor(t, clustertest.WaitTimeout, "b queued behind a", func() bool { return pullOf(p, b) != nil })
-	time.Sleep(300 * time.Millisecond)
+	// The handler's release, which settles any drop under p.mu, ran before the 202.
 	p.mu.Lock()
-	queued := p.pulls[b] != nil
+	fb := p.pulls[b]
+	kept := fb != nil && fb.queued && fb.keep
 	_, cooling := p.cooldown[b]
 	p.mu.Unlock()
-	if !queued || cooling {
-		t.Fatalf("gateway pull of b 300ms into the queue: queued %v, cooling %v, want true and false", queued, cooling)
+	if !kept || cooling {
+		t.Fatalf("gateway pull of b after the 202: queued and kept %v, cooling %v, want true and false", kept, cooling)
 	}
 	release()
 	clustertest.WaitFor(t, clustertest.WaitTimeout, "b committed", admitted(p, b))
@@ -137,40 +137,58 @@ func TestQueuedGatewayPullKeptWithoutClients(t *testing.T) {
 }
 
 func TestQueuedGatewayPullKeptWhenJoinedClientLeaves(t *testing.T) {
-	p, srv, _, b, release := backlogged(t)
+	p, srv, g, b, release := backlogged(t)
 	if code := postPull(t, srv, b); code != http.StatusAccepted {
 		t.Fatalf("pull b = %d, want 202", code)
 	}
 	leave := clientGet(t, p, b)
 	// The pull goroutine holds one reference, the joined client the other.
+	var fb *pull
 	clustertest.WaitFor(t, clustertest.WaitTimeout, "a client joining the pull of b", func() bool {
 		p.mu.Lock()
 		defer p.mu.Unlock()
-		return p.pulls[b] != nil && p.pulls[b].refs == 2
+		fb = p.pulls[b]
+		return fb != nil && fb.refs == 2
 	})
 	leave()
-	time.Sleep(300 * time.Millisecond)
-	if pullOf(p, b) == nil {
+	// leave returns after the handler's release, which settles any drop under p.mu.
+	p.mu.Lock()
+	kept := p.pulls[b] == fb && fb.queued && fb.keep
+	p.mu.Unlock()
+	if !kept {
 		t.Fatal("gateway pull of b dropped when a joined client left")
 	}
 	release()
 	clustertest.WaitFor(t, clustertest.WaitTimeout, "b committed", admitted(p, b))
+	if n := len(g.Requests()); n != 2 {
+		t.Fatalf("gateway GETs = %d, want 2", n)
+	}
 }
 
 func TestQueuedPullKeptOnceGatewayJoins(t *testing.T) {
-	p, srv, _, b, release := backlogged(t)
+	p, srv, g, b, release := backlogged(t)
 	leave := clientGet(t, p, b)
-	clustertest.WaitFor(t, clustertest.WaitTimeout, "b queued behind a", func() bool { return pullOf(p, b) != nil })
+	var fb *pull
+	clustertest.WaitFor(t, clustertest.WaitTimeout, "b queued behind a", func() bool {
+		fb = pullOf(p, b)
+		return fb != nil
+	})
 	if code := postPull(t, srv, b); code != http.StatusAccepted {
 		t.Fatalf("pull b = %d, want 202", code)
 	}
 	leave()
-	time.Sleep(300 * time.Millisecond)
-	if pullOf(p, b) == nil {
+	// leave returns after the handler's release, which settles any drop under p.mu.
+	p.mu.Lock()
+	kept := p.pulls[b] == fb && fb.queued && fb.keep
+	p.mu.Unlock()
+	if !kept {
 		t.Fatal("pull of b dropped when its client left after the gateway joined it")
 	}
 	release()
 	clustertest.WaitFor(t, clustertest.WaitTimeout, "b committed", admitted(p, b))
+	if n := len(g.Requests()); n != 2 {
+		t.Fatalf("gateway GETs = %d, want 2", n)
+	}
 }
 
 func TestQueuedPullUnlistedBeforeHandlerReturns(t *testing.T) {

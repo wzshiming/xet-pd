@@ -311,12 +311,15 @@ func TestServeWhilePulling(t *testing.T) {
 	}
 	late := requestAsync(t, u, "Range", fmt.Sprintf("bytes=%d-%d", prefix, prefix))
 	whole := requestAsync(t, u)
+	// The second heartbeat from here snapshots the inventory after both readers started.
+	before := len(fake.Announces())
+	clustertest.WaitFor(t, clustertest.WaitTimeout, "heartbeats while the gateway stalls", func() bool { return len(fake.Announces()) >= before+2 })
 	select {
 	case r := <-late:
 		t.Fatalf("range past the flushed prefix answered %v %v before the gateway resumed", r.resp, r.err)
 	case r := <-whole:
 		t.Fatalf("whole GET completed %v %v before the gateway resumed", r.resp, r.err)
-	case <-time.After(200 * time.Millisecond):
+	default:
 	}
 	if got := xorbHashes(t, p.CacheDir); len(got) != 0 {
 		t.Fatalf("xorb %v committed before the gateway finished", got)

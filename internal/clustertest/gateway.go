@@ -109,6 +109,16 @@ func (g *FakeGateway) Announce(t testing.TB, i int) Announce {
 	return g.Announces()[i]
 }
 
+// Replied waits for the i-th announce to be answered.
+func (g *FakeGateway) Replied(t testing.TB, i int) Announce {
+	t.Helper()
+	WaitFor(t, WaitTimeout, fmt.Sprintf("reply to announce %d", i), func() bool {
+		announces := g.Announces()
+		return len(announces) > i && announces[i].Code != 0
+	})
+	return g.Announces()[i]
+}
+
 // FindAnnounce waits for the first announce at or after index from that matches and returns it with its index.
 func (g *FakeGateway) FindAnnounce(t testing.TB, from int, match func(Announce) bool) (Announce, int) {
 	t.Helper()

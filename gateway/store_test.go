@@ -39,6 +39,7 @@ type fixture struct {
 }
 
 func makeXorb(t *testing.T, seed byte, n, size int) *fixture {
+	t.Helper()
 	return buildXorb(t, clustertest.RandomChunks(seed, n, size))
 }
 
@@ -420,6 +421,16 @@ func TestOffsetsFollowReplacedEncoding(t *testing.T) {
 	}
 }
 
+// writers counts the writers holding or queued on hash's writer lock.
+func writers(st *store, hash xet.XorbHash) int {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if w := st.writers[hash]; w != nil {
+		return w.users
+	}
+	return 0
+}
+
 // Concurrent puts of one hash may carry different encodings; writers serialize so one inserts and the other dedups and re-records.
 func TestConcurrentSameHashPutsSerialize(t *testing.T) {
 	x, raw := compressible(t, 3)
@@ -438,9 +449,11 @@ func TestConcurrentSameHashPutsSerialize(t *testing.T) {
 	go put(g1, x.body)
 	<-g1.started // passed the local existence check and is streaming
 	go put(g2, raw)
+	clustertest.WaitFor(t, clustertest.WaitTimeout, "the second writer to queue", func() bool { return writers(st, x.hash) == 2 })
 	select {
-	case <-g2.started: // unserialized: the second writer streams while the first still does
-	case <-time.After(100 * time.Millisecond):
+	case <-g2.started:
+		t.Fatal("second writer streams while the first still does")
+	default:
 	}
 	close(g1.release)
 	close(g2.release)

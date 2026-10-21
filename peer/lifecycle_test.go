@@ -329,7 +329,7 @@ func TestResyncSendsFullWithCurrentInventory(t *testing.T) {
 	// The eviction of a is lost with this delta; the retry is a Full with the exact inventory.
 	mode.Store(1)
 	pullAndSettle(t, p, srv, c, bodyC)
-	lost := g.Announce(t, n)
+	lost := g.Replied(t, n)
 	if lost.Code != http.StatusInternalServerError || !hasAdd(lost, c) || !hasRemove(lost, a) {
 		t.Fatalf("lost delta = %d %+v", lost.Code, lost.Req)
 	}
@@ -370,8 +370,8 @@ func TestAnnounceNeverFollowsRedirects(t *testing.T) {
 		return http.StatusOK, apis.AnnounceResponse{TTL: 30}
 	})
 	newTestPeer(t, g.URL, func(c *Config) { c.Heartbeat, c.Secret = 20*time.Millisecond, "s3cret" })
-	first := g.Announce(t, 0)
-	second := g.Announce(t, 1)
+	first := g.Replied(t, 0)
+	second := g.Replied(t, 1)
 	if first.Code != http.StatusTemporaryRedirect || !second.Req.Full || second.Code != http.StatusOK {
 		t.Fatalf("announces = %d %+v, %d %+v", first.Code, first.Req, second.Code, second.Req)
 	}
@@ -524,12 +524,28 @@ func TestStaleDropDoesNotAnnounce(t *testing.T) {
 	}
 	_ = p.serveStored(httptest.NewRecorder(), req, first) // confirms the miss: drops the first generation and announces it
 	_, j := g.FindAnnounce(t, i+1, func(x clustertest.Announce) bool { return hasRemove(x, hash) })
+	hold := make(chan struct{})
+	g.SetReply(func(_ http.ResponseWriter, r *http.Request, _ apis.AnnounceRequest) (int, apis.AnnounceResponse) {
+		select {
+		case <-hold:
+		case <-r.Context().Done():
+		}
+		return http.StatusOK, apis.AnnounceResponse{TTL: 30}
+	})
 	commitDirect(t, p, hash, body)
-	g.FindAnnounce(t, j+1, func(x clustertest.Announce) bool { return hasAdd(x, hash) })
+	// The announcer drained wake for this Add and is held in its post, so any kick from here stays in wake.
+	_, k := g.FindAnnounce(t, j+1, func(x clustertest.Announce) bool { return hasAdd(x, hash) })
 	n := len(g.Announces())
 	p.drop(second)
 	p.unpin(second)
-	time.Sleep(150 * time.Millisecond)
+	if len(p.wake) != 0 {
+		t.Fatal("stale drop woke the announcer")
+	}
+	g.SetReply(nil)
+	close(hold)
+	if code := g.Replied(t, k).Code; code != http.StatusOK {
+		t.Fatalf("held Add answered %d, want 200", code)
+	}
 	if got := len(g.Announces()); got != n {
 		t.Fatalf("stale drop woke the announcer: %d announces, want %d", got, n)
 	}

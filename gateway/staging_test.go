@@ -7,10 +7,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -27,7 +29,8 @@ import (
 // pull is one pull request as a fake seed saw it.
 type pull struct {
 	auth, ctype, body string
-	staged            bool // the gateway held the complete bytes and the offsets sidecar when it asked
+	staged            bool      // the gateway held the complete bytes and the offsets sidecar when it asked
+	at                time.Time // arrival
 }
 
 // seed is a fake peer registered in the store's registry; it records pull requests and answers status.
@@ -54,6 +57,7 @@ func newSeed(t *testing.T, st *store, id string) *seed {
 }
 
 func (s *seed) serve(w http.ResponseWriter, r *http.Request) {
+	at := time.Now()
 	if r.Method != http.MethodPost || r.URL.Path != apis.PullPath {
 		http.NotFound(w, r)
 		return
@@ -65,7 +69,7 @@ func (s *seed) serve(w http.ResponseWriter, r *http.Request) {
 	ok, _ := s.st.Storage.HasXorb(r.Context(), hash)
 	_, serr := s.st.readSidecar(hash)
 	s.mu.Lock()
-	s.pulls = append(s.pulls, pull{r.Header.Get("Authorization"), r.Header.Get("Content-Type"), string(body), ok && serr == nil})
+	s.pulls = append(s.pulls, pull{r.Header.Get("Authorization"), r.Header.Get("Content-Type"), string(body), ok && serr == nil, at})
 	status, redirect, block := s.status, s.redirect, s.block
 	s.mu.Unlock()
 	if block != nil {
@@ -133,6 +137,20 @@ func newTestStaging(t *testing.T, st *store, cfg stagingConfig) *staging {
 	return m
 }
 
+// awaitPass waits for a maintenance pass whose check runs after the call to find the cache over its cap with nothing evictable.
+func awaitPass(t *testing.T, m *staging) {
+	t.Helper()
+	m.mu.Lock()
+	m.warned = false
+	m.mu.Unlock()
+	m.kick()
+	clustertest.WaitFor(t, clustertest.WaitTimeout, "a maintenance pass to find nothing evictable", func() bool {
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		return m.warned
+	})
+}
+
 func TestPutSeedsReplicasOnce(t *testing.T) {
 	x := makeXorb(t, 21, 2, 4<<10)
 	st, reg := newTestStore(t, t.TempDir())
@@ -149,11 +167,22 @@ func TestPutSeedsReplicasOnce(t *testing.T) {
 	for _, p := range selected {
 		clustertest.WaitFor(t, clustertest.WaitTimeout, "pull at "+p.ID, func() bool { return len(seeds[p.ID].requests()) == 1 })
 	}
+	m.mu.Lock()
+	before := maps.Clone(m.xorbs.Get(x.hash).V.asked)
+	m.mu.Unlock()
 	if inserted, err := st.PutXorb(ctx, x.hash, bytes.NewReader(x.body)); err != nil || inserted {
 		t.Fatalf("dedup PutXorb = %v, %v", inserted, err)
 	}
-	m.kick()
-	time.Sleep(30 * time.Millisecond)
+	// asked alone gates another pull, and a pass may already have refilled a reset one, so the dedup must leave it unchanged.
+	m.mu.Lock()
+	asked := maps.Clone(m.xorbs.Get(x.hash).V.asked)
+	m.mu.Unlock()
+	if !reflect.DeepEqual(asked, before) {
+		t.Fatalf("asked after the dedup PutXorb = %v, want it unchanged from %v", asked, before)
+	}
+	if len(asked) != len(selected) {
+		t.Fatalf("asked after the dedup PutXorb = %v, want only the selected seeds", asked)
+	}
 	want, _ := json.Marshal(apis.PullRequest{Hash: x.hash.String()})
 	for id, s := range seeds {
 		reqs := s.requests()
@@ -208,14 +237,14 @@ func TestAcceptedIsNotAHolding(t *testing.T) {
 					return len(s.requests()) == 1
 				})
 			}
-			time.Sleep(30 * time.Millisecond)
+			awaitPass(t, m)
 			if !clustertest.HasXorb(t, st.Storage, x.hash) {
 				t.Fatal("xorb evicted on 202 alone")
 			}
 			s1.holds(x.hash)
 			m.kick()
 			if minSeeds == 2 {
-				time.Sleep(30 * time.Millisecond)
+				awaitPass(t, m)
 				if !clustertest.HasXorb(t, st.Storage, x.hash) {
 					t.Fatal("xorb evicted with one holder, want two")
 				}
@@ -243,7 +272,7 @@ func TestNoPeersRetainsUntilRegistered(t *testing.T) {
 	if _, err := st.PutXorb(context.Background(), x.hash, bytes.NewReader(x.body)); err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(30 * time.Millisecond)
+	awaitPass(t, m)
 	if !clustertest.HasXorb(t, st.Storage, x.hash) {
 		t.Fatal("xorb evicted with no seed at all")
 	}
@@ -264,16 +293,18 @@ func TestFailedPullRetriesAfterBackoff(t *testing.T) {
 	t.Cleanup(other.Close)
 	s := newSeed(t, st, "s1")
 	s.answer(http.StatusInternalServerError, "")
-	newTestStaging(t, st, stagingConfig{secret: "tok", retry: 150 * time.Millisecond, tick: 5 * time.Millisecond})
+	const retry = 150 * time.Millisecond
+	before := time.Now()
+	newTestStaging(t, st, stagingConfig{secret: "tok", retry: retry, tick: 5 * time.Millisecond})
 	if _, err := st.PutXorb(context.Background(), x.hash, bytes.NewReader(x.body)); err != nil {
 		t.Fatal(err)
 	}
 	clustertest.WaitFor(t, clustertest.WaitTimeout, "first pull", func() bool { return len(s.requests()) == 1 })
-	time.Sleep(40 * time.Millisecond)
-	if n := len(s.requests()); n != 1 {
-		t.Fatalf("%d pulls within the backoff, want 1", n)
-	}
 	clustertest.WaitFor(t, clustertest.WaitTimeout, "retry after backoff", func() bool { return len(s.requests()) == 2 })
+	// A re-ask needs now >= first ask + retry, and every ask comes from maintenance started after before.
+	if at := s.requests()[1].at; at.Before(before.Add(retry)) {
+		t.Fatalf("retry arrived %v after staging started, want no earlier than the %v backoff", at.Sub(before), retry)
+	}
 	s.answer(0, other.URL+apis.PullPath)
 	clustertest.WaitFor(t, clustertest.WaitTimeout, "retries past a redirect", func() bool { return len(s.requests()) >= 4 })
 	if n := elsewhere.Load(); n != 0 {
@@ -314,7 +345,7 @@ func TestEvictionIsLRU(t *testing.T) {
 				t.Fatal(err)
 			}
 			_ = rd.Close()
-			time.Sleep(30 * time.Millisecond)
+			awaitPass(t, m)
 			if !clustertest.HasXorb(t, st.Storage, a.hash) || !clustertest.HasXorb(t, st.Storage, b.hash) {
 				t.Fatal("evicted without holders")
 			}
@@ -344,10 +375,14 @@ func TestPinnedXorbEvictedAfterUnpin(t *testing.T) {
 		t.Fatal(err)
 	}
 	s.holds(x.hash)
-	m.kick()
-	time.Sleep(30 * time.Millisecond)
+	awaitPass(t, m)
 	if !clustertest.HasXorb(t, st.Storage, x.hash) {
 		t.Fatal("pinned xorb evicted")
+	}
+	// A pass already under way at awaitPass's kick leaves that kick in wake, where it would stand in for unpin's.
+	select {
+	case <-m.wake:
+	default:
 	}
 	st.unpin(x.hash)
 	clustertest.WaitFor(t, clustertest.WaitTimeout, "eviction after unpin", func() bool { return !clustertest.HasXorb(t, st.Storage, x.hash) && m.snapshot() == 0 })
@@ -455,7 +490,7 @@ func TestCloseCancelsHungPull(t *testing.T) {
 	if _, err := st.PutXorb(ctx, y.hash, bytes.NewReader(y.body)); err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(30 * time.Millisecond)
+	// Close reaped maintenance and every pull goroutine, so nothing is left to send another pull.
 	if n := len(s.requests()) + len(s2.requests()); n != 1 {
 		t.Fatalf("%d pull requests after Close, want the 1 from before", n)
 	}

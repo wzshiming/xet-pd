@@ -49,7 +49,7 @@ type cooled struct {
 }
 
 // acquire returns exactly one of a joined or new pull (release it) or a pinned committed xorb (unpin it); force clears a failure cooldown.
-func (p *Peer) acquire(hash xet.XorbHash, force bool) (*pull, *lru.Entry[ready], error) {
+func (p *Peer) acquire(hash xet.XorbHash, force bool) (*pull, *lru.Entry[xet.XorbHash, ready], error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if f := p.pulls[hash]; f != nil {

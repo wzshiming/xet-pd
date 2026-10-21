@@ -25,6 +25,7 @@ import (
 	"github.com/wzshiming/xet/xorb"
 
 	"github.com/wzshiming/xet-pd/apis"
+	"github.com/wzshiming/xet-pd/internal/inventory"
 	"github.com/wzshiming/xet-pd/internal/lru"
 )
 
@@ -64,7 +65,7 @@ type Peer struct {
 	mu       sync.Mutex // guards pulls, cooldown, the inventory and cancel-vs-acquire
 	pulls    map[xet.XorbHash]*pull
 	cooldown map[xet.XorbHash]cooled
-	xorbs    lru.Index[ready] // committed xorbs
+	xorbs    lru.Index[xet.XorbHash, ready] // committed xorbs
 }
 
 func New(cfg Config) (*Peer, error) {
@@ -119,7 +120,7 @@ func New(cfg Config) (*Peer, error) {
 		pulls:    map[xet.XorbHash]*pull{},
 		cooldown: map[xet.XorbHash]cooled{},
 	}
-	xorbs, err := lru.Scan(context.Background(), p.store)
+	xorbs, err := inventory.Scan(context.Background(), p.store)
 	if err != nil {
 		cancel()
 		return nil, err
@@ -162,7 +163,7 @@ func New(cfg Config) (*Peer, error) {
 			}
 			snap := make(map[string]struct{}, p.xorbs.Len())
 			for e := range p.xorbs.Oldest() {
-				snap[e.Hash.String()] = struct{}{}
+				snap[e.Key.String()] = struct{}{}
 			}
 			p.mu.Unlock()
 			req := apis.AnnounceRequest{Peer: apis.Peer{ID: p.id, URL: p.cfg.Advertise}, Epoch: p.epoch, Full: full}
@@ -245,9 +246,9 @@ func serveContent(w http.ResponseWriter, r *http.Request, hash xet.XorbHash, con
 }
 
 // serveStored serves a pinned committed xorb and releases the pin; a missing file leaves the inventory so the next request pulls again.
-func (p *Peer) serveStored(w http.ResponseWriter, r *http.Request, rd *lru.Entry[ready]) error {
+func (p *Peer) serveStored(w http.ResponseWriter, r *http.Request, rd *lru.Entry[xet.XorbHash, ready]) error {
 	defer p.unpin(rd)
-	obj, err := p.store.GetXorbReadSeekCloser(r.Context(), rd.Hash)
+	obj, err := p.store.GetXorbReadSeekCloser(r.Context(), rd.Key)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			p.drop(rd)
@@ -255,7 +256,7 @@ func (p *Peer) serveStored(w http.ResponseWriter, r *http.Request, rd *lru.Entry
 		return err
 	}
 	defer func() { _ = obj.Close() }()
-	serveContent(w, r, rd.Hash, obj)
+	serveContent(w, r, rd.Key, obj)
 	return nil
 }
 

@@ -36,8 +36,8 @@ func (p *Peer) evict() {
 			return
 		}
 		if e.V.pins == 0 && (e.V.pull == nil || e.V.pull.refs == 0) {
-			if err := p.store.DeleteXorb(context.Background(), e.Hash); err != nil {
-				slog.Warn("peer: evict", "hash", e.Hash, "err", err)
+			if err := p.store.DeleteXorb(context.Background(), e.Key); err != nil {
+				slog.Warn("peer: evict", "hash", e.Key, "err", err)
 			} else {
 				p.forget(e)
 			}
@@ -46,28 +46,28 @@ func (p *Peer) evict() {
 }
 
 // forget removes a committed xorb from the inventory; caller holds p.mu.
-func (p *Peer) forget(e *lru.Entry[ready]) {
+func (p *Peer) forget(e *lru.Entry[xet.XorbHash, ready]) {
 	p.xorbs.Remove(e)
 	p.kick()
 }
 
 // drop forgets e after its file was confirmed missing; a newer generation of the same hash stays.
-func (p *Peer) drop(e *lru.Entry[ready]) {
+func (p *Peer) drop(e *lru.Entry[xet.XorbHash, ready]) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.xorbs.Get(e.Hash) == e {
+	if p.xorbs.Get(e.Key) == e {
 		p.forget(e)
 	}
 }
 
 // pin marks hash as in use and most recently used; the file stays until unpin.
-func (p *Peer) pin(hash xet.XorbHash) *lru.Entry[ready] {
+func (p *Peer) pin(hash xet.XorbHash) *lru.Entry[xet.XorbHash, ready] {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.pinLocked(hash)
 }
 
-func (p *Peer) pinLocked(hash xet.XorbHash) *lru.Entry[ready] {
+func (p *Peer) pinLocked(hash xet.XorbHash) *lru.Entry[xet.XorbHash, ready] {
 	e := p.xorbs.Get(hash)
 	if e != nil {
 		e.V.pins++
@@ -76,7 +76,7 @@ func (p *Peer) pinLocked(hash xet.XorbHash) *lru.Entry[ready] {
 	return e
 }
 
-func (p *Peer) unpin(e *lru.Entry[ready]) {
+func (p *Peer) unpin(e *lru.Entry[xet.XorbHash, ready]) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	e.V.pins--

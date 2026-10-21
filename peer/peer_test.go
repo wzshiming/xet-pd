@@ -912,7 +912,7 @@ func TestAcquireAfterCommitReportsReady(t *testing.T) {
 		f.release()
 		t.Fatal("acquire started a redundant pull for a committed xorb")
 	}
-	if rd == nil || rd.Hash != hash {
+	if rd == nil || rd.Key != hash {
 		t.Fatalf("acquire did not reserve the committed xorb: %+v", rd)
 	}
 	p.unpin(rd)

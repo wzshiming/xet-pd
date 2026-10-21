@@ -13,6 +13,7 @@ import (
 	"github.com/wzshiming/xet"
 
 	"github.com/wzshiming/xet-pd/apis"
+	"github.com/wzshiming/xet-pd/internal/inventory"
 	"github.com/wzshiming/xet-pd/internal/lru"
 )
 
@@ -50,9 +51,9 @@ type staging struct {
 	wg     sync.WaitGroup
 	once   sync.Once
 
-	mu     sync.Mutex        // guards the fields below; never held across store or network calls
-	xorbs  lru.Index[staged] // local copies
-	warned bool              // over the cap with nothing evictable, logged once until it clears
+	mu     sync.Mutex                      // guards the fields below; never held across store or network calls
+	xorbs  lru.Index[xet.XorbHash, staged] // local copies
+	warned bool                            // over the cap with nothing evictable, logged once until it clears
 }
 
 // newStaging indexes the store's local xorbs and hooks the store; call before the store is shared.
@@ -70,7 +71,7 @@ func newStaging(st *store, cfg stagingConfig) (*staging, error) {
 		ctx:    ctx,
 		cancel: cancel,
 	}
-	xorbs, err := lru.Scan(context.Background(), st)
+	xorbs, err := inventory.Scan(context.Background(), st)
 	if err != nil {
 		cancel()
 		return nil, err
@@ -86,7 +87,7 @@ func newStaging(st *store, cfg stagingConfig) (*staging, error) {
 		defer tick.Stop()
 		for {
 			if m.cfg.cacheSize > 0 {
-				skip := map[*lru.Entry[staged]]bool{}
+				skip := map[*lru.Entry[xet.XorbHash, staged]]bool{}
 				var skipErr error
 				for {
 					m.mu.Lock()
@@ -95,9 +96,9 @@ func newStaging(st *store, cfg stagingConfig) (*staging, error) {
 						m.mu.Unlock()
 						break
 					}
-					var victim *lru.Entry[staged]
+					var victim *lru.Entry[xet.XorbHash, staged]
 					for e := range m.xorbs.Oldest() {
-						if !skip[e] && m.reg.aliveHolders(e.Hash.String()) >= m.cfg.minSeeds {
+						if !skip[e] && m.reg.aliveHolders(e.Key.String()) >= m.cfg.minSeeds {
 							victim = e
 							break
 						}
@@ -111,7 +112,7 @@ func newStaging(st *store, cfg stagingConfig) (*staging, error) {
 						break
 					}
 					m.mu.Unlock()
-					err := m.st.DeleteXorb(context.Background(), victim.Hash)
+					err := m.st.DeleteXorb(context.Background(), victim.Key)
 					m.mu.Lock()
 					if err != nil {
 						skip[victim], skipErr = true, err
@@ -130,7 +131,7 @@ func newStaging(st *store, cfg stagingConfig) (*staging, error) {
 						delete(e.V.asked, id)
 					}
 				}
-				ranked := m.reg.rank(e.Hash.String())
+				ranked := m.reg.rank(e.Key.String())
 				for _, p := range ranked[:min(len(ranked), m.cfg.replicas)] {
 					if _, asked := e.V.asked[p.ID]; p.holder || asked {
 						continue
@@ -159,7 +160,7 @@ func newStaging(st *store, cfg stagingConfig) (*staging, error) {
 						if err != nil && m.ctx.Err() == nil {
 							slog.Warn("gateway: pull request", "peer", p.ID, "hash", hash, "err", err)
 						}
-					}(p.Peer, e.Hash)
+					}(p.Peer, e.Key)
 				}
 			}
 			m.mu.Unlock()

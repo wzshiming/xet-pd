@@ -1,14 +1,19 @@
 package gateway
 
 import (
+	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"runtime"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/wzshiming/xet-pd/apis"
+	"github.com/wzshiming/xet-pd/internal/clustertest"
 )
 
 func testPeer(i int) apis.Peer {
@@ -141,6 +146,60 @@ func TestConcurrentAnnounceAndLookup(t *testing.T) {
 	wg.Wait()
 	if got := r.rank("h1"); len(got) != 8 {
 		t.Fatalf("live peers = %d, want 8", len(got))
+	}
+}
+
+// A large Full announce must not keep rank waiting while it builds the peer's inventory.
+func TestFullAnnounceDoesNotStallRank(t *testing.T) {
+	if testing.Short() {
+		t.Skip("times a large Full announce")
+	}
+	if runtime.GOMAXPROCS(0) < 2 {
+		t.Skip("rank needs a second P to run beside the announce")
+	}
+	r := newRegistry(time.Minute)
+	for i := 1; i <= 3; i++ {
+		r.announce(fullReq(testPeer(i), "e", fmt.Sprintf("a%d", i), fmt.Sprintf("b%d", i), fmt.Sprintf("c%d", i)))
+	}
+	const n = 500_000
+	hashes := make([]string, n)
+	var sum [32]byte
+	for i := range hashes {
+		binary.BigEndian.PutUint64(sum[24:], uint64(i))
+		hashes[i] = hex.EncodeToString(sum[:])
+	}
+	sample := hashes[n-1]
+	var calls atomic.Int64
+	var slowest time.Duration
+	done, stopped := make(chan struct{}), make(chan struct{})
+	go func() {
+		defer close(stopped)
+		for {
+			select {
+			case <-done:
+				return
+			default:
+			}
+			start := time.Now()
+			r.rank(sample)
+			slowest = max(slowest, time.Since(start))
+			calls.Add(1)
+		}
+	}()
+	clustertest.WaitFor(t, clustertest.WaitTimeout, "rank to start", func() bool { return calls.Load() > 0 })
+	before, start := calls.Load(), time.Now()
+	r.announce(fullReq(testPeer(0), "e", hashes...))
+	total, during := time.Since(start), calls.Load()-before
+	close(done)
+	<-stopped
+	if got := r.aliveHolders(sample); got != 1 {
+		t.Fatalf("aliveHolders after the Full = %d, want 1", got)
+	}
+	if slowest >= total/2 {
+		t.Fatalf("slowest rank took %v beside a %v Full announce of %d hashes, want under half: the announce must build the inventory outside the registry write lock", slowest, total, n)
+	}
+	if during < 1 {
+		t.Fatalf("no rank call completed during the %v Full announce", total)
 	}
 }
 

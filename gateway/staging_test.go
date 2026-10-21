@@ -140,15 +140,18 @@ func newTestStaging(t *testing.T, st *store, cfg stagingConfig) *staging {
 // awaitPass waits for a maintenance pass whose check runs after the call to find the cache over its cap with nothing evictable.
 func awaitPass(t *testing.T, m *staging) {
 	t.Helper()
-	m.mu.Lock()
-	m.warned = false
-	m.mu.Unlock()
-	m.kick()
-	clustertest.WaitFor(t, clustertest.WaitTimeout, "a maintenance pass to find nothing evictable", func() bool {
+	// A pass may take its view before the call yet warn after the reset; one starting after that warning cannot.
+	for range 2 {
 		m.mu.Lock()
-		defer m.mu.Unlock()
-		return m.warned
-	})
+		m.warned = false
+		m.mu.Unlock()
+		m.kick()
+		clustertest.WaitFor(t, clustertest.WaitTimeout, "a maintenance pass to find nothing evictable", func() bool {
+			m.mu.Lock()
+			defer m.mu.Unlock()
+			return m.warned
+		})
+	}
 }
 
 func TestPutSeedsReplicasOnce(t *testing.T) {
@@ -495,4 +498,54 @@ func TestCloseCancelsHungPull(t *testing.T) {
 		t.Fatalf("%d pull requests after Close, want the 1 from before", n)
 	}
 	_ = m.Close()
+}
+
+// The staging index stays free to uploads and reads while a large Full announce holds the registry write lock.
+func TestRegistryStallLeavesIndexFree(t *testing.T) {
+	// A zero cache size skips eviction, so the pass first reaches the registry while seeding.
+	for _, tc := range []struct {
+		phase     string
+		cacheSize int64
+	}{{"seeding", 0}, {"eviction", 1}} {
+		t.Run(tc.phase, func(t *testing.T) {
+			x := makeXorb(t, 62, 2, 4<<10)
+			st, _ := newTestStore(t, t.TempDir())
+			newSeed(t, st, "s1")
+			if _, err := st.PutXorb(context.Background(), x.hash, bytes.NewReader(x.body)); err != nil {
+				t.Fatal(err)
+			}
+			var held atomic.Bool
+			var first sync.Once
+			resume := make(chan struct{})
+			st.reg.now = func() time.Time { // set before the maintenance goroutine exists
+				first.Do(func() { held.Store(true); <-resume }) // the first pass waits here for its first view
+				return time.Now()
+			}
+			release := sync.OnceFunc(func() { close(resume) })
+			m := newTestStaging(t, st, stagingConfig{cacheSize: tc.cacheSize})
+			t.Cleanup(release) // runs before m's Close, so a held pass can end
+			free := func(state string) {
+				t.Helper()
+				for i := range 10 {
+					usage := make(chan int64, 1)
+					go func() { usage <- m.snapshot() }()
+					select {
+					case <-usage:
+					case <-time.After(time.Second):
+						t.Fatalf("snapshot %d blocked over 1s while %s: the %s pass holds the staging index across a registry call", i, state, tc.phase)
+					}
+					time.Sleep(10 * time.Millisecond)
+				}
+			}
+			clustertest.WaitFor(t, clustertest.WaitTimeout, "the first pass to ask for its view", held.Load)
+			m.reg.mu.Lock()
+			t.Cleanup(m.reg.mu.Unlock) // registered after m's Close cleanup, so it runs first and the stalled pass can end
+			release()
+			time.Sleep(20 * time.Millisecond) // the released pass reaches live()'s read lock within nanoseconds
+			free("the pass waits for its view")
+			m.reg.mu.Unlock()
+			m.reg.mu.Lock() // live() completes under the handoff; the pass now waits in rank or holderCount
+			free("the pass ranks or counts holders")
+		})
+	}
 }

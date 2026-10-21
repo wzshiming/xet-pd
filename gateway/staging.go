@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"slices"
 	"sync"
 	"time"
 
@@ -51,7 +52,7 @@ type staging struct {
 	wg     sync.WaitGroup
 	once   sync.Once
 
-	mu     sync.Mutex                      // guards the fields below; never held across store or network calls
+	mu     sync.Mutex                      // guards the fields below; never held across registry, store or network calls
 	xorbs  lru.Index[xet.XorbHash, staged] // local copies
 	warned bool                            // over the cap with nothing evictable, logged once until it clears
 }
@@ -85,53 +86,78 @@ func newStaging(st *store, cfg stagingConfig) (*staging, error) {
 		defer m.wg.Done()
 		tick := time.NewTicker(m.cfg.tick)
 		defer tick.Stop()
+		type ask struct {
+			p    apis.Peer
+			hash xet.XorbHash
+		}
+		var order []*lru.Entry[xet.XorbHash, staged]
 		for {
 			if m.cfg.cacheSize > 0 {
-				skip := map[*lru.Entry[xet.XorbHash, staged]]bool{}
-				var skipErr error
-				for {
-					m.mu.Lock()
-					if m.xorbs.Usage() <= m.cfg.cacheSize {
-						m.warned = false
+				m.mu.Lock()
+				over := m.xorbs.Usage() > m.cfg.cacheSize
+				if over {
+					order = slices.AppendSeq(order[:0], m.xorbs.Oldest())
+				} else {
+					m.warned = false
+				}
+				m.mu.Unlock()
+				if over {
+					view := m.reg.live()
+					var skipErr error
+					for _, e := range order {
+						if view.holderCount(e.Key.String()) < m.cfg.minSeeds {
+							continue
+						}
+						m.mu.Lock()
+						current := m.xorbs.Get(e.Key) == e
 						m.mu.Unlock()
-						break
-					}
-					var victim *lru.Entry[xet.XorbHash, staged]
-					for e := range m.xorbs.Oldest() {
-						if !skip[e] && m.reg.aliveHolders(e.Key.String()) >= m.cfg.minSeeds {
-							victim = e
+						if !current {
+							continue
+						}
+						err := m.st.DeleteXorb(context.Background(), e.Key)
+						m.mu.Lock()
+						if err != nil {
+							skipErr = err
+						} else {
+							m.xorbs.Remove(e) // a copy re-inserted meanwhile is a new entry and stays
+							if over = m.xorbs.Usage() > m.cfg.cacheSize; !over {
+								m.warned = false
+							}
+						}
+						m.mu.Unlock()
+						if !over {
 							break
 						}
 					}
-					if victim == nil {
+					if over {
+						m.mu.Lock()
 						if !m.warned {
 							slog.Warn("gateway: local xorbs over the cache size, nothing evictable yet", "usage", m.xorbs.Usage(), "limit", m.cfg.cacheSize, "err", skipErr)
 							m.warned = true
 						}
 						m.mu.Unlock()
-						break
 					}
-					m.mu.Unlock()
-					err := m.st.DeleteXorb(context.Background(), victim.Key)
-					m.mu.Lock()
-					if err != nil {
-						skip[victim], skipErr = true, err
-					} else {
-						m.xorbs.Remove(victim) // a copy re-inserted meanwhile is a new entry and stays
-					}
-					m.mu.Unlock()
 				}
 			}
+			view := m.reg.live()
 			now := time.Now()
 			m.mu.Lock()
+			order = slices.AppendSeq(order[:0], m.xorbs.Oldest())
+			m.mu.Unlock()
+			var asks []ask
 		seeding:
-			for e := range m.xorbs.Oldest() {
+			for _, e := range order {
+				ranked := view.rank(e.Key.String())
+				m.mu.Lock()
+				if m.xorbs.Get(e.Key) != e {
+					m.mu.Unlock()
+					continue
+				}
 				for id, next := range e.V.asked {
 					if !now.Before(next) {
 						delete(e.V.asked, id)
 					}
 				}
-				ranked := m.reg.rank(e.Key.String())
 				for _, p := range ranked[:min(len(ranked), m.cfg.replicas)] {
 					if _, asked := e.V.asked[p.ID]; p.holder || asked {
 						continue
@@ -139,31 +165,35 @@ func newStaging(st *store, cfg stagingConfig) (*staging, error) {
 					select {
 					case m.sem <- struct{}{}:
 					default:
+						m.mu.Unlock()
 						break seeding
 					}
 					e.V.asked[p.ID] = now.Add(m.cfg.retry)
-					m.wg.Add(1)
-					go func(p apis.Peer, hash xet.XorbHash) {
-						defer m.wg.Done()
-						defer m.kick()
-						defer func() { <-m.sem }()
-						ctx, cancel := context.WithTimeout(m.ctx, pullTimeout)
-						resp, err := apis.PostJSON(ctx, m.client, p.URL+apis.PullPath, m.cfg.secret, apis.PullRequest{Hash: hash.String()})
-						if err == nil {
-							_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
-							_ = resp.Body.Close()
-							if resp.StatusCode != http.StatusAccepted {
-								err = errors.New(resp.Status)
-							}
-						}
-						cancel()
-						if err != nil && m.ctx.Err() == nil {
-							slog.Warn("gateway: pull request", "peer", p.ID, "hash", hash, "err", err)
-						}
-					}(p.Peer, e.Key)
+					asks = append(asks, ask{p.Peer, e.Key})
 				}
+				m.mu.Unlock()
 			}
-			m.mu.Unlock()
+			for _, a := range asks {
+				m.wg.Add(1)
+				go func(p apis.Peer, hash xet.XorbHash) {
+					defer m.wg.Done()
+					defer m.kick()
+					defer func() { <-m.sem }()
+					ctx, cancel := context.WithTimeout(m.ctx, pullTimeout)
+					resp, err := apis.PostJSON(ctx, m.client, p.URL+apis.PullPath, m.cfg.secret, apis.PullRequest{Hash: hash.String()})
+					if err == nil {
+						_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+						_ = resp.Body.Close()
+						if resp.StatusCode != http.StatusAccepted {
+							err = errors.New(resp.Status)
+						}
+					}
+					cancel()
+					if err != nil && m.ctx.Err() == nil {
+						slog.Warn("gateway: pull request", "peer", p.ID, "hash", hash, "err", err)
+					}
+				}(a.p, a.hash)
+			}
 			select {
 			case <-m.ctx.Done():
 				return

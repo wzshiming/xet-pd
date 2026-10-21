@@ -9,7 +9,10 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"log"
+	"log/slog"
 	"math"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -19,6 +22,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -141,10 +145,11 @@ func decodeAll(t *testing.T, r io.Reader) []byte {
 	}
 }
 
+// newTestStore keeps the former 30s relay header limit.
 func newTestStore(t *testing.T, dir string) (*store, *registry) {
 	t.Helper()
 	reg := newRegistry(time.Minute)
-	st, err := newStore(dir, reg)
+	st, err := newStore(dir, reg, 30*time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -236,6 +241,90 @@ func (h *holder) assertRelayed(t *testing.T, min int) {
 			t.Fatalf("relay request %+v must carry %s and no Authorization", r, apis.PeerHeader)
 		}
 	}
+}
+
+// darkHolder accepts relay connections and never answers on them, like a hung holder process.
+type darkHolder struct {
+	addr  string
+	conns atomic.Int64 // accepted so far
+}
+
+func newDarkHolder(t *testing.T) *darkHolder {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := &darkHolder{addr: ln.Addr().String()}
+	var held []net.Conn
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			held = append(held, c)
+			d.conns.Add(1)
+		}
+	}()
+	t.Cleanup(func() {
+		_ = ln.Close()
+		<-done // the accept loop has returned, so held is complete
+		for _, c := range held {
+			_ = c.Close()
+		}
+	})
+	return d
+}
+
+// rankOrder lists ids best first for hash; ranks depend only on the hash and the IDs, so a throwaway registry tells them.
+func rankOrder(hash xet.XorbHash, ids ...string) []string {
+	r := newRegistry(time.Minute)
+	for _, id := range ids {
+		r.announce(fullReq(apis.Peer{ID: id, URL: "http://" + id}, "e", hash.String()))
+	}
+	var out []string
+	for _, p := range r.holders(hash.String()) {
+		out = append(out, p.ID)
+	}
+	return out
+}
+
+// cooledWarnings counts the warnings that a holder of hash started cooling; it swaps the default logger, so its test must not run in parallel.
+func cooledWarnings(t *testing.T, hash xet.XorbHash) *atomic.Int64 {
+	t.Helper()
+	c := &warnCounter{hash: hash.String()}
+	prev, out, flags := slog.Default(), log.Writer(), log.Flags()
+	slog.SetDefault(slog.New(c))
+	t.Cleanup(func() {
+		slog.SetDefault(prev)
+		log.SetOutput(out) // SetDefault also redirected the log package
+		log.SetFlags(flags)
+	})
+	return &c.n
+}
+
+type warnCounter struct {
+	hash string
+	n    atomic.Int64
+}
+
+func (c *warnCounter) Enabled(context.Context, slog.Level) bool { return true }
+func (c *warnCounter) WithAttrs([]slog.Attr) slog.Handler       { return c }
+func (c *warnCounter) WithGroup(string) slog.Handler            { return c }
+
+func (c *warnCounter) Handle(_ context.Context, r slog.Record) error {
+	if r.Level == slog.LevelWarn && r.Message == "gateway: relay holder cooled" {
+		r.Attrs(func(a slog.Attr) bool {
+			if a.Key == "hash" && a.Value.String() == c.hash {
+				c.n.Add(1)
+			}
+			return true
+		})
+	}
+	return nil
 }
 
 func TestGetXorbURLPrefersLiveHolder(t *testing.T) {
@@ -393,7 +482,7 @@ func TestOffsetsFollowReplacedEncoding(t *testing.T) {
 	held := *x
 	held.body = raw
 	newHolder(t, reg, "h1", &held)
-	st, err := newStore(dir, reg) // restart: only the sidecar and the holder remain
+	st, err := newStore(dir, reg, 30*time.Second) // restart: only the sidecar and the holder remain
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -500,7 +589,7 @@ func TestOffsetsCacheFollowsReplacedEncoding(t *testing.T) {
 	held := *x
 	held.body = raw
 	h := newHolder(t, reg, "h1", &held)
-	st, err := newStore(dir, reg) // restart: only the holder knows the offsets
+	st, err := newStore(dir, reg, 30*time.Second) // restart: only the holder knows the offsets
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -849,6 +938,259 @@ func TestRelayRespectsContextCancel(t *testing.T) {
 		t.Fatalf("open with canceled context = %v, want context.Canceled", err)
 	}
 	close(release)
+}
+
+// A holder that accepts connections but never answers is cut off after the relay timeout, then tried last until one PeerTTL of the registry clock has passed.
+func TestRelayFailsOverFromSilentHolder(t *testing.T) {
+	const attempt = 200 * time.Millisecond
+	x := makeXorb(t, 18, 2, 4<<10)
+	// Ranks depend only on the hash and the IDs, so a throwaway registry tells which ID is tried first.
+	order := newRegistry(time.Minute)
+	for _, id := range []string{"h1", "h2"} {
+		order.announce(fullReq(apis.Peer{ID: id, URL: "http://" + id}, "e", x.hash.String()))
+	}
+	first := order.holders(x.hash.String())
+	darkID, liveID := first[0].ID, first[1].ID
+	for _, scheme := range []string{"http", "https"} {
+		t.Run(scheme, func(t *testing.T) {
+			reg, now := clockedRegistry(time.Minute)
+			st, err := newStore(t.TempDir(), reg, attempt)
+			if err != nil {
+				t.Fatal(err)
+			}
+			dark := newDarkHolder(t)
+			silent := apis.Peer{ID: darkID, URL: scheme + "://" + dark.addr}
+			reg.announce(fullReq(silent, "e", x.hash.String()))
+			live := newHolder(t, reg, liveID, x)
+			ctx, cancel := context.WithTimeout(context.Background(), clustertest.WaitTimeout)
+			defer cancel()
+			dialed := func(want int64, when string) {
+				t.Helper()
+				clustertest.WaitFor(t, clustertest.WaitTimeout, fmt.Sprintf("connection %d to the silent holder %s", want, when), func() bool { return dark.conns.Load() >= want })
+				if n := dark.conns.Load(); n != want {
+					t.Fatalf("silent holder dialed %d times %s, want %d", n, when, want)
+				}
+			}
+			readHead := func(when string) {
+				t.Helper()
+				rc, err := st.GetXorbRangeReadCloser(ctx, x.hash, 0, 15)
+				if err != nil {
+					t.Fatalf("range relay %s = %v, want the live holder", when, err)
+				}
+				head, err := io.ReadAll(rc)
+				_ = rc.Close()
+				if err != nil || !bytes.Equal(head, x.body[:16]) {
+					t.Fatalf("range relay %s differs: %v", when, err)
+				}
+			}
+
+			start := time.Now()
+			rs, err := st.GetXorbReadSeekCloser(ctx, x.hash)
+			if err != nil {
+				t.Fatalf("relay past the silent holder = %v after %v, want the live holder once the %v relay timeout ends the silent attempt", err, time.Since(start).Round(time.Millisecond), attempt)
+			}
+			got, err := io.ReadAll(rs)
+			_ = rs.Close()
+			if err != nil || !bytes.Equal(got, x.body) {
+				t.Fatalf("relay past the silent holder differs: %v", err)
+			}
+			live.assertRelayed(t, 1)
+			dialed(1, "by the first relay")
+
+			*now = now.Add(30 * time.Second) // half the silent holder's cooldown of one PeerTTL
+			readHead("during the silent holder's cooldown")
+			dialed(1, "during its cooldown")
+
+			reg.announce(fullReq(silent, "e", x.hash.String())) // both stay alive past the cooldown
+			reg.announce(fullReq(live.peer, "e", x.hash.String()))
+			*now = now.Add(45 * time.Second)
+			readHead("after the silent holder's cooldown")
+			dialed(2, "after its cooldown, back in rank order")
+		})
+	}
+}
+
+// A relay failing on every holder names each one it tried, and the cooldowns it leaves hide no holder from availability.
+func TestRelayReportsEveryHolderTried(t *testing.T) {
+	const attempt = 200 * time.Millisecond
+	x := makeXorb(t, 19, 2, 4<<10)
+	reg := newRegistry(time.Minute)
+	st, err := newStore(t.TempDir(), reg, attempt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stale := newHolder(t, reg, "h1", x)
+	stale.drop(x.hash)
+	ids := []string{stale.peer.ID}
+	for _, id := range []string{"h2", "h3"} {
+		dark := newDarkHolder(t)
+		reg.announce(fullReq(apis.Peer{ID: id, URL: "http://" + dark.addr}, "e", x.hash.String()))
+		ids = append(ids, id)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), clustertest.WaitTimeout)
+	defer cancel()
+	start := time.Now()
+	rs, err := st.GetXorbReadSeekCloser(ctx, x.hash)
+	elapsed := time.Since(start)
+	if err == nil {
+		_ = rs.Close()
+		t.Fatal("relay with every holder failing must fail")
+	}
+	for _, id := range ids {
+		if want := "holder " + id + ": "; !strings.Contains(err.Error(), want) {
+			t.Errorf("relay error %q lacks %q, want every holder tried reported", err, want)
+		}
+	}
+	if want := "xorb " + x.hash.String() + ": "; !strings.HasPrefix(err.Error(), want) {
+		t.Errorf("relay error %q, want prefix %q", err, want)
+	}
+	if errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("relay error %v is fs.ErrNotExist, which only a xorb without holders reports", err)
+	}
+	if elapsed >= 2*time.Second {
+		t.Errorf("relay through %d failing holders took %v, want each silent one cut off after the %v relay timeout", len(ids), elapsed, attempt)
+	}
+	if n := reg.aliveHolders(x.hash.String()); n != len(ids) {
+		t.Errorf("aliveHolders after the failed relay = %d, want %d: cooldowns must not hide holders", n, len(ids))
+	}
+	if ok, err := st.HasXorb(context.Background(), x.hash); err != nil || !ok {
+		t.Errorf("HasXorb after the failed relay = %v, %v, want true: cooldowns must not hide holders", ok, err)
+	}
+}
+
+// A relay whose context has already ended returns its error and cools nobody, so the next relay still tries the first holder in rank order.
+func TestRelayCancelCoolsNoHolder(t *testing.T) {
+	x := makeXorb(t, 20, 2, 4<<10)
+	ranked := rankOrder(x.hash, "h1", "h2")
+	reg := newRegistry(time.Minute)
+	st, err := newStore(t.TempDir(), reg, 200*time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dark := newDarkHolder(t)
+	reg.announce(fullReq(apis.Peer{ID: ranked[0], URL: "http://" + dark.addr}, "e", x.hash.String()))
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := st.remote(ctx, x.hash, 0, -1); !errors.Is(err, context.Canceled) {
+		t.Fatalf("relay with a canceled context = %v, want context.Canceled", err)
+	}
+	newHolder(t, reg, ranked[1], x)
+	sk, err := st.remote(context.Background(), x.hash, 0, -1)
+	if err != nil {
+		t.Fatalf("relay past the silent holder = %v, want the live holder ranked after it", err)
+	}
+	_ = sk.Close()
+	clustertest.WaitFor(t, clustertest.WaitTimeout, "the silent holder, first in rank order and not cooled by the canceled relay, to be dialed", func() bool { return dark.conns.Load() > 0 })
+}
+
+// Holders still cooling are tried again when no other holder is left, so the error names each of them.
+func TestRelayRetriesCooledHolders(t *testing.T) {
+	x := makeXorb(t, 32, 2, 4<<10)
+	reg := newRegistry(time.Minute)
+	st, err := newStore(t.TempDir(), reg, 50*time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids := []string{"h1", "h2", "h3"}
+	for _, id := range ids {
+		dark := newDarkHolder(t)
+		reg.announce(fullReq(apis.Peer{ID: id, URL: "http://" + dark.addr}, "e", x.hash.String()))
+	}
+	for _, when := range []string{"that cools every holder", "while every holder cools"} {
+		_, err := st.remote(context.Background(), x.hash, 0, -1)
+		for _, id := range ids {
+			if want := "holder " + id + ": "; err == nil || !strings.Contains(err.Error(), want) {
+				t.Fatalf("relay %s = %v, want an error naming %q", when, err, want)
+			}
+		}
+	}
+}
+
+// Only the cooling holder moves back; the others keep their rank order, which here runs against ID order.
+func TestRelayKeepsRankOrderBesideCooledHolder(t *testing.T) {
+	x := makeXorb(t, 33, 2, 4<<10)
+	ranked := rankOrder(x.hash, "h1", "h2", "h3", "h4", "h5", "h6", "h7", "h8")
+	var first, second string
+	for i := 1; i < len(ranked) && first == ""; i++ {
+		if ranked[i-1] > ranked[i] {
+			first, second = ranked[i-1], ranked[i]
+		}
+	}
+	if first == "" {
+		t.Fatalf("holders of xorb %s rank in ID order %v, want a pair ranked against it", x.hash, ranked)
+	}
+	st, reg := newTestStore(t, t.TempDir())
+	stale := newHolder(t, reg, "h0", x)
+	stale.drop(x.hash)
+	if _, err := st.remote(context.Background(), x.hash, 0, -1); err == nil {
+		t.Fatal("relay through a holder that lost the xorb succeeded, want it to fail and cool")
+	}
+	newHolder(t, reg, first, x)
+	late := newHolder(t, reg, second, x)
+	sk, err := st.remote(context.Background(), x.hash, 0, -1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = sk.Close()
+	if n := len(late.requests()); n != 0 {
+		t.Fatalf("holder %s ranked after %s saw %d requests, want 0: holders beside a cooling one keep their rank order", second, first, n)
+	}
+}
+
+// A cooling holder that relays again stops cooling at once, so it is tried first in rank order again.
+func TestRelaySuccessEndsCooldown(t *testing.T) {
+	x := makeXorb(t, 34, 2, 4<<10)
+	ranked := rankOrder(x.hash, "h1", "h2")
+	st, reg := newTestStore(t, t.TempDir())
+	h := newHolder(t, reg, ranked[0], x)
+	h.drop(x.hash)
+	if _, err := st.remote(context.Background(), x.hash, 0, -1); err == nil {
+		t.Fatal("relay through a holder that lost the xorb succeeded, want it to fail and cool")
+	}
+	h.mu.Lock()
+	h.objs[x.hash] = x.body
+	h.mu.Unlock()
+	relay := func(when string) {
+		t.Helper()
+		sk, err := st.remote(context.Background(), x.hash, 0, -1)
+		if err != nil {
+			t.Fatalf("relay %s = %v, want success", when, err)
+		}
+		_ = sk.Close()
+	}
+	relay("through the cooling holder alone")
+	late := newHolder(t, reg, ranked[1], x)
+	relay("once the cooling holder relayed again")
+	if n := len(late.requests()); n != 0 {
+		t.Fatalf("holder %s ranked after %s saw %d requests, want 0: a successful relay ends the cooldown", ranked[1], ranked[0], n)
+	}
+}
+
+// Only a holder that starts cooling is warned about: failing again while it cools stays quiet, failing once the cooldown expired starts a new one.
+func TestRelayWarnsOncePerCooldown(t *testing.T) {
+	x := makeXorb(t, 35, 2, 4<<10)
+	reg, now := clockedRegistry(time.Minute)
+	st, err := newStore(t.TempDir(), reg, 30*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stale := newHolder(t, reg, "h1", x)
+	stale.drop(x.hash)
+	warned := cooledWarnings(t, x.hash)
+	fail := func(when string, want int64) {
+		t.Helper()
+		if _, err := st.remote(context.Background(), x.hash, 0, -1); err == nil {
+			t.Fatalf("relay %s succeeded, want the stale holder to fail", when)
+		}
+		if n := warned.Load(); n != want {
+			t.Fatalf("cooled warnings after the relay %s = %d, want %d", when, n, want)
+		}
+	}
+	fail("that starts the cooldown", 1)
+	fail("during the cooldown", 1)
+	*now = now.Add(time.Minute) // one PeerTTL: both the cooldown and the holder's announce have expired
+	reg.announce(fullReq(stale.peer, "e", x.hash.String()))
+	fail("after the cooldown", 2)
 }
 
 func TestReconstructedFileFromRemoteOnlyXorb(t *testing.T) {

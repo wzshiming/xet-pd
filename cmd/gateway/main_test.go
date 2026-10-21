@@ -18,7 +18,7 @@ import (
 
 func TestParseGatewayDefaults(t *testing.T) {
 	listen, cfg, err := parse(nil, clitest.Getenv(), io.Discard)
-	want := gateway.Config{StorageDir: "./xet-pd-gateway", Upstream: "https://huggingface.co", PeerTTL: 30 * time.Second, Replicas: 2, MinSeeds: 1, XorbCacheSize: 8 << 30}
+	want := gateway.Config{StorageDir: "./xet-pd-gateway", Upstream: "https://huggingface.co", PeerTTL: 30 * time.Second, RelayTimeout: 5 * time.Second, Replicas: 2, MinSeeds: 1, XorbCacheSize: 8 << 30}
 	if err != nil || listen != ":8080" || cfg != want {
 		t.Fatalf("parse() = %q, %+v, %v; want %q, %+v", listen, cfg, err, ":8080", want)
 	}
@@ -28,10 +28,10 @@ func TestParseGatewayEnv(t *testing.T) {
 	getenv := clitest.Getenv(
 		"XET_PD_LISTEN", ":9000", "XET_PD_STORAGE_DIR", "/data", "HF_ENDPOINT", "http://hub:8000",
 		"HF_TOKEN", "tok", "XET_PD_SIGNING_KEY", "sign", "XET_PD_EXTERNAL_URL", "http://gw",
-		"XET_PD_SECRET", "sec", "XET_PD_PEER_TTL", "45s", "XET_PD_REPLICAS", "3", "XET_PD_MIN_SEEDS", "2",
+		"XET_PD_SECRET", "sec", "XET_PD_PEER_TTL", "45s", "XET_PD_RELAY_TIMEOUT", "7s", "XET_PD_REPLICAS", "3", "XET_PD_MIN_SEEDS", "2",
 		"XET_PD_XORB_CACHE_SIZE", "64MiB")
 	listen, cfg, err := parse(nil, getenv, io.Discard)
-	want := gateway.Config{StorageDir: "/data", Upstream: "http://hub:8000", UpstreamToken: "tok", SigningKey: "sign", ExternalURL: "http://gw", Secret: "sec", PeerTTL: 45 * time.Second, Replicas: 3, MinSeeds: 2, XorbCacheSize: 64 << 20}
+	want := gateway.Config{StorageDir: "/data", Upstream: "http://hub:8000", UpstreamToken: "tok", SigningKey: "sign", ExternalURL: "http://gw", Secret: "sec", PeerTTL: 45 * time.Second, RelayTimeout: 7 * time.Second, Replicas: 3, MinSeeds: 2, XorbCacheSize: 64 << 20}
 	if err != nil || listen != ":9000" || cfg != want {
 		t.Fatalf("parse() = %q, %+v, %v; want %q, %+v", listen, cfg, err, ":9000", want)
 	}
@@ -42,13 +42,13 @@ func TestParseGatewayFlagsOverrideEnv(t *testing.T) {
 	getenv := clitest.Getenv(
 		"XET_PD_LISTEN", ":9000", "XET_PD_STORAGE_DIR", "/data", "HF_ENDPOINT", "http://hub:8000",
 		"HF_TOKEN", "tok", "XET_PD_SIGNING_KEY", "sign", "XET_PD_EXTERNAL_URL", "http://gw",
-		"XET_PD_SECRET", "sec", "XET_PD_PEER_TTL", "bogus", "XET_PD_REPLICAS", "x", "XET_PD_MIN_SEEDS", "1.5",
+		"XET_PD_SECRET", "sec", "XET_PD_PEER_TTL", "bogus", "XET_PD_RELAY_TIMEOUT", "bogus", "XET_PD_REPLICAS", "x", "XET_PD_MIN_SEEDS", "1.5",
 		"XET_PD_XORB_CACHE_SIZE", "-1")
 	args := []string{"-listen", ":7000", "-storage-dir", "/flag", "-upstream", "http://flag", "-upstream-token", "ftok",
-		"-signing-key", "fsign", "-external-url", "http://fgw", "-secret", "fsec", "-peer-ttl", "5s", "-replicas", "4",
+		"-signing-key", "fsign", "-external-url", "http://fgw", "-secret", "fsec", "-peer-ttl", "5s", "-relay-timeout", "3s", "-replicas", "4",
 		"-min-seeds", "3", "-xorb-cache-size", "1GiB"}
 	listen, cfg, err := parse(args, getenv, io.Discard)
-	want := gateway.Config{StorageDir: "/flag", Upstream: "http://flag", UpstreamToken: "ftok", SigningKey: "fsign", ExternalURL: "http://fgw", Secret: "fsec", PeerTTL: 5 * time.Second, Replicas: 4, MinSeeds: 3, XorbCacheSize: 1 << 30}
+	want := gateway.Config{StorageDir: "/flag", Upstream: "http://flag", UpstreamToken: "ftok", SigningKey: "fsign", ExternalURL: "http://fgw", Secret: "fsec", PeerTTL: 5 * time.Second, RelayTimeout: 3 * time.Second, Replicas: 4, MinSeeds: 3, XorbCacheSize: 1 << 30}
 	if err != nil || listen != ":7000" || cfg != want {
 		t.Fatalf("parse() = %q, %+v, %v; want %q, %+v", listen, cfg, err, ":7000", want)
 	}
@@ -111,7 +111,7 @@ func TestParseGatewayHelp(t *testing.T) {
 	if !errors.Is(err, flag.ErrHelp) {
 		t.Fatalf("err = %v, want flag.ErrHelp", err)
 	}
-	for _, want := range []string{"Usage: gateway [flags]", "-xorb-cache-size", "(default 8GiB)", "[env XET_PD_XORB_CACHE_SIZE]", "[env HF_TOKEN]", "[env XET_PD_SECRET_FILE]", "(default \":8080\")"} {
+	for _, want := range []string{"Usage: gateway [flags]", "-xorb-cache-size", "(default 8GiB)", "[env XET_PD_XORB_CACHE_SIZE]", "[env HF_TOKEN]", "[env XET_PD_SECRET_FILE]", "(default \":8080\")", "-relay-timeout", "[env XET_PD_RELAY_TIMEOUT]", "(default 5s)"} {
 		if !strings.Contains(help.String(), want) {
 			t.Errorf("help lacks %q:\n%s", want, help.String())
 		}

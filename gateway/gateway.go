@@ -31,6 +31,7 @@ type Config struct {
 	ExternalURL   string        // origin advertised in hub links; empty derives it from each request
 	Secret        string        // bearer token of announces and pull requests
 	PeerTTL       time.Duration // announce validity, default 30s, at least 1s
+	RelayTimeout  time.Duration // dial, TLS handshake and response headers of one relay attempt, default 5s
 	Replicas      int           // seeds asked to hold each xorb, default 2
 	MinSeeds      int           // live holders before the local copy may go, default 1
 	XorbCacheSize int64         // bytes of local xorbs kept, 0 unlimited
@@ -67,20 +68,21 @@ func New(cfg Config) (*Gateway, error) {
 			return nil, fmt.Errorf("gateway: external url: %w", err)
 		}
 	}
-	if cfg.PeerTTL < 0 || cfg.Replicas < 0 || cfg.MinSeeds < 0 || cfg.XorbCacheSize < 0 {
+	if cfg.PeerTTL < 0 || cfg.RelayTimeout < 0 || cfg.Replicas < 0 || cfg.MinSeeds < 0 || cfg.XorbCacheSize < 0 {
 		return nil, errors.New("gateway: negative config value")
 	}
 	cfg.PeerTTL = cmp.Or(cfg.PeerTTL, 30*time.Second)
 	if cfg.PeerTTL < time.Second {
 		return nil, errors.New("gateway: peer ttl below 1s")
 	}
+	cfg.RelayTimeout = cmp.Or(cfg.RelayTimeout, 5*time.Second)
 	cfg.Replicas = cmp.Or(cfg.Replicas, 2)
 	cfg.MinSeeds = cmp.Or(cfg.MinSeeds, 1)
 	if cfg.MinSeeds > cfg.Replicas {
 		return nil, errors.New("gateway: min seeds exceed replicas")
 	}
 	reg := newRegistry(cfg.PeerTTL)
-	st, err := newStore(filepath.Join(cfg.StorageDir, "data"), reg)
+	st, err := newStore(filepath.Join(cfg.StorageDir, "data"), reg, cfg.RelayTimeout)
 	if err != nil {
 		return nil, fmt.Errorf("gateway: %w", err)
 	}

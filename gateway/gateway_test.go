@@ -121,12 +121,14 @@ func TestConfigValidation(t *testing.T) {
 		{"negative replicas", func(c *Config) { c.Replicas = -1 }, "negative"},
 		{"negative min seeds", func(c *Config) { c.MinSeeds = -1 }, "negative"},
 		{"negative cache", func(c *Config) { c.XorbCacheSize = -1 }, "negative"},
+		{"negative relay timeout", func(c *Config) { c.RelayTimeout = -time.Second }, "negative"},
 		{"min seeds over replicas", func(c *Config) { c.MinSeeds = 3 }, "replicas"},
 		{"defaults", nil, ""},
 		{"explicit", func(c *Config) {
 			c.Upstream += "/"
 			c.ExternalURL = "http://gw.test/"
 			c.PeerTTL, c.Replicas, c.MinSeeds, c.XorbCacheSize = 2*time.Second, 2, 2, 1
+			c.RelayTimeout = 3 * time.Second
 		}, ""},
 	}
 	for _, tt := range tests {
@@ -149,12 +151,15 @@ func TestConfigValidation(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer func() { _ = g.Close() }()
-			wantTTL, wantReplicas, wantSeeds := 30*time.Second, 2, 1
+			wantTTL, wantReplicas, wantSeeds, wantRelay := 30*time.Second, 2, 1, 5*time.Second
 			if tt.mod != nil {
-				wantTTL, wantSeeds = 2*time.Second, 2
+				wantTTL, wantSeeds, wantRelay = 2*time.Second, 2, 3*time.Second
 			}
 			if g.reg.ttl != wantTTL || g.staging.cfg.replicas != wantReplicas || g.staging.cfg.minSeeds != wantSeeds || g.staging.cfg.cacheSize != cfg.XorbCacheSize {
 				t.Fatalf("effective ttl %v replicas %d minSeeds %d cache %d", g.reg.ttl, g.staging.cfg.replicas, g.staging.cfg.minSeeds, g.staging.cfg.cacheSize)
+			}
+			if tr := g.st.transport; tr.ResponseHeaderTimeout != wantRelay || tr.TLSHandshakeTimeout != wantRelay {
+				t.Fatalf("effective relay timeout: response headers %v, TLS handshake %v, want %v", tr.ResponseHeaderTimeout, tr.TLSHandshakeTimeout, wantRelay)
 			}
 			for _, dir := range []string{"data/offsets", "mirror/index"} {
 				if _, err := os.Stat(filepath.Join(cfg.StorageDir, dir)); err != nil {

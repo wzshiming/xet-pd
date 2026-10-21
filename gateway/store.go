@@ -7,11 +7,15 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"log/slog"
+	"maps"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"slices"
 	"sync"
+	"time"
 
 	"github.com/wzshiming/httpseek"
 	"github.com/wzshiming/xet"
@@ -38,6 +42,9 @@ type store struct {
 	offsets   *storage.Cache[xet.XorbHash, []uint64]
 	transport *http.Transport // relay fetches; carries no upstream credentials
 
+	coolMu  sync.Mutex           // guards cooling
+	cooling map[string]time.Time // holder ID → until when remote tries it last
+
 	mu      sync.Mutex // guards pins, writers and local xorb deletion; never held across network I/O
 	pins    map[xet.XorbHash]int
 	writers map[xet.XorbHash]*writerLock
@@ -54,7 +61,7 @@ type writerLock struct {
 	users int // guarded by store.mu
 }
 
-func newStore(dir string, reg *registry) (*store, error) {
+func newStore(dir string, reg *registry, relayTimeout time.Duration) (*store, error) {
 	st, err := local.NewStorage(local.WithBasePath(dir))
 	if err != nil {
 		return nil, err
@@ -63,7 +70,11 @@ func newStore(dir string, reg *registry) (*store, error) {
 	if err := os.MkdirAll(offsetDir, 0o755); err != nil {
 		return nil, err
 	}
-	return &store{Storage: st, reg: reg, offsetDir: offsetDir, offsets: storage.NewCache[xet.XorbHash, []uint64](storage.DefaultCacheSize), transport: apis.NewTransport(relayIdleConns), pins: map[xet.XorbHash]int{}, writers: map[xet.XorbHash]*writerLock{}}, nil
+	t := apis.NewTransport(relayIdleConns)
+	t.DialContext = (&net.Dialer{Timeout: relayTimeout, KeepAlive: 30 * time.Second}).DialContext
+	t.TLSHandshakeTimeout = relayTimeout
+	t.ResponseHeaderTimeout = relayTimeout
+	return &store{Storage: st, reg: reg, offsetDir: offsetDir, offsets: storage.NewCache[xet.XorbHash, []uint64](storage.DefaultCacheSize), transport: t, cooling: map[string]time.Time{}, pins: map[xet.XorbHash]int{}, writers: map[xet.XorbHash]*writerLock{}}, nil
 }
 
 // lockWriter blocks until this caller is the only writer of hash; the result releases it.
@@ -304,16 +315,29 @@ func (s *store) GetXorbChunkOffsets(ctx context.Context, hash xet.XorbHash) ([]u
 	return offsets, err
 }
 
-// remote opens [start, end] of the xorb on a live holder, end -1 meaning EOF; failed holders are skipped before any handle is handed out.
+// remote opens [start, end] of the xorb on a live holder, end -1 meaning EOF; failed holders are skipped before any handle is handed out and tried last for one PeerTTL.
 func (s *store) remote(ctx context.Context, hash xet.XorbHash, start, end int64) (*httpseek.Seeker, error) {
 	holders := s.reg.holders(hash.String())
 	if len(holders) == 0 {
 		return nil, fmt.Errorf("xorb %s has no live holder: %w", hash, fs.ErrNotExist)
 	}
-	var err error
+	var cooled []apis.Peer
+	ready := holders[:0]
+	now := s.reg.now()
+	s.coolMu.Lock()
+	for _, p := range holders {
+		if now.Before(s.cooling[p.ID]) {
+			cooled = append(cooled, p)
+		} else {
+			ready = append(ready, p)
+		}
+	}
+	s.coolMu.Unlock()
+	holders = append(ready, cooled...)
+	var errs []error
 	for _, p := range holders[:min(len(holders), relayAttempts)] {
-		var req *http.Request
-		if req, err = http.NewRequestWithContext(ctx, http.MethodGet, apis.XorbURL(p.URL, hash.String()), nil); err == nil {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, apis.XorbURL(p.URL, hash.String()), nil)
+		if err == nil {
 			req.Header.Set(apis.PeerHeader, "gateway")
 			sk := httpseek.NewRangeSeeker(ctx, s.transport, req, start, end)
 			if end < 0 {
@@ -326,16 +350,29 @@ func (s *store) remote(ctx context.Context, hash xet.XorbHash, start, end int64)
 				err = errors.New(resp.Status)
 			}
 			if err == nil {
+				s.coolMu.Lock()
+				delete(s.cooling, p.ID)
+				s.coolMu.Unlock()
 				return sk, nil
 			}
 			_ = sk.Close()
-			err = fmt.Errorf("holder %s: %w", p.ID, err)
 		}
 		if cerr := ctx.Err(); cerr != nil {
 			return nil, cerr
 		}
+		err = fmt.Errorf("holder %s: %w", p.ID, err)
+		errs = append(errs, err)
+		now = s.reg.now()
+		s.coolMu.Lock()
+		maps.DeleteFunc(s.cooling, func(_ string, until time.Time) bool { return !now.Before(until) })
+		_, already := s.cooling[p.ID]
+		s.cooling[p.ID] = now.Add(s.reg.ttl)
+		s.coolMu.Unlock()
+		if !already {
+			slog.Warn("gateway: relay holder cooled", "peer", p.ID, "url", p.URL, "hash", hash, "err", err)
+		}
 	}
-	return nil, fmt.Errorf("xorb %s: %w", hash, err)
+	return nil, fmt.Errorf("xorb %s: %w", hash, errors.Join(errs...))
 }
 
 func (s *store) GetXorbReadSeekCloser(ctx context.Context, hash xet.XorbHash) (io.ReadSeekCloser, error) {

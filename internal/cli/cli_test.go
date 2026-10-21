@@ -19,6 +19,7 @@ import (
 )
 
 func TestParseSize(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		in      string
 		want    int64
@@ -45,6 +46,7 @@ func TestParseSize(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.in, func(t *testing.T) {
+			t.Parallel()
 			got, err := parseSize(tt.in)
 			if tt.wantErr != "" {
 				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
@@ -60,6 +62,7 @@ func TestParseSize(t *testing.T) {
 }
 
 func TestSizeValueString(t *testing.T) {
+	t.Parallel()
 	for _, tt := range []struct {
 		n    int64
 		want string
@@ -91,6 +94,7 @@ func parseTestFlags(args []string, getenv func(string) string, help io.Writer) (
 }
 
 func TestFlagSetSources(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name string
 		args []string
@@ -107,6 +111,7 @@ func TestFlagSetSources(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			got, err := parseTestFlags(tt.args, tt.env, io.Discard)
 			if err != nil || got != tt.want {
 				t.Fatalf("Parse = %+v, %v; want %+v", got, err, tt.want)
@@ -116,6 +121,7 @@ func TestFlagSetSources(t *testing.T) {
 }
 
 func TestFlagSetErrors(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name string
 		args []string
@@ -130,6 +136,7 @@ func TestFlagSetErrors(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			var help bytes.Buffer
 			_, err := parseTestFlags(tt.args, tt.env, &help)
 			if err == nil || !strings.Contains(err.Error(), tt.want) {
@@ -143,6 +150,7 @@ func TestFlagSetErrors(t *testing.T) {
 }
 
 func TestFlagSetHelp(t *testing.T) {
+	t.Parallel()
 	var help bytes.Buffer
 	_, err := parseTestFlags([]string{"-h"}, clitest.Getenv(), &help)
 	if !errors.Is(err, flag.ErrHelp) {
@@ -170,6 +178,7 @@ func secretOf(args []string, getenv func(string) string) (string, error) {
 }
 
 func TestSecretPolicy(t *testing.T) {
+	t.Parallel()
 	file := filepath.Join(t.TempDir(), "secret")
 	if err := os.WriteFile(file, []byte(" s3cr3t \n"), 0o600); err != nil {
 		t.Fatal(err)
@@ -200,6 +209,7 @@ func TestSecretPolicy(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			secret, err := secretOf(tt.args, tt.env)
 			if tt.wantErr != "" {
 				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
@@ -218,9 +228,11 @@ func TestSecretPolicy(t *testing.T) {
 }
 
 func TestEmptySecretFlagOverridesEnvironment(t *testing.T) {
+	t.Parallel()
 	getenv := clitest.Getenv("XET_PD_SECRET", "environment-secret", "XET_PD_SECRET_FILE", "/missing-secret-file")
 	for _, option := range []string{"-secret", "-secret-file"} {
 		t.Run(option, func(t *testing.T) {
+			t.Parallel()
 			secret, err := secretOf([]string{option, ""}, getenv)
 			if err != nil || secret != "" {
 				t.Fatalf("secret = %q, error = %v, want empty secret", secret, err)
@@ -260,6 +272,7 @@ func fakeCommand(listen string, parseErr error, svc *fakeService, newErr error) 
 }
 
 func TestRunExitsBeforeServing(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name             string
 		parseErr, newErr error
@@ -272,6 +285,7 @@ func TestRunExitsBeforeServing(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			var stdout, stderr bytes.Buffer
 			code := fakeCommand("127.0.0.1:0", tt.parseErr, nil, tt.newErr).Run(context.Background(), nil, clitest.Getenv(), &stdout, &stderr)
 			if code != tt.code || stdout.String() != tt.stdout || stderr.String() != tt.stderr {
@@ -282,6 +296,7 @@ func TestRunExitsBeforeServing(t *testing.T) {
 }
 
 func TestRunListenFailureClosesService(t *testing.T) {
+	t.Parallel()
 	taken, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -301,6 +316,7 @@ func TestRunListenFailureClosesService(t *testing.T) {
 }
 
 func TestRunServesUntilCancelled(t *testing.T) {
+	t.Parallel()
 	svc := &fakeService{Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusTeapot) })}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -331,6 +347,7 @@ func TestRunServesUntilCancelled(t *testing.T) {
 }
 
 func TestRunCancelledBeforeServing(t *testing.T) {
+	t.Parallel()
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	svc := &fakeService{Handler: http.NotFoundHandler()}
@@ -344,6 +361,7 @@ func TestRunCancelledBeforeServing(t *testing.T) {
 }
 
 func TestServeHTTPCancelledContextClosesListener(t *testing.T) {
+	t.Parallel()
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	var stdout bytes.Buffer
@@ -361,6 +379,7 @@ func TestServeHTTPCancelledContextClosesListener(t *testing.T) {
 }
 
 func TestServeHTTPForceClosesStalledResponses(t *testing.T) {
+	// Not parallel: it overrides the package-level shutdown timeout that ServeHTTP reads in the other tests.
 	defer func(d time.Duration) { shutdownTimeout = d }(shutdownTimeout)
 	shutdownTimeout = 100 * time.Millisecond
 	ctx, cancel := context.WithCancel(context.Background())

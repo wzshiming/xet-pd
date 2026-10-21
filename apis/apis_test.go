@@ -8,6 +8,7 @@ import (
 )
 
 func TestWireConstants(t *testing.T) {
+	t.Parallel()
 	if AnnouncePath != "/xet-pd/v1/announce" {
 		t.Fatalf("AnnouncePath = %q", AnnouncePath)
 	}
@@ -29,6 +30,7 @@ func TestWireConstants(t *testing.T) {
 }
 
 func TestPullRequestWire(t *testing.T) {
+	t.Parallel()
 	in := PullRequest{Hash: "xorb-hash"}
 	want := `{"hash":"xorb-hash"}`
 	encoded, err := json.Marshal(in)
@@ -48,6 +50,7 @@ func TestPullRequestWire(t *testing.T) {
 }
 
 func TestAnnounceRequestWire(t *testing.T) {
+	t.Parallel()
 	in := AnnounceRequest{
 		Peer:   Peer{ID: "peer-1", URL: "http://peer-1:8080"},
 		Epoch:  "epoch-1",
@@ -73,6 +76,7 @@ func TestAnnounceRequestWire(t *testing.T) {
 }
 
 func TestAnnounceRequestOmitsEmptyDelta(t *testing.T) {
+	t.Parallel()
 	in := AnnounceRequest{Peer: Peer{ID: "peer-1", URL: "http://peer-1:8080"}, Epoch: "epoch-1"}
 	want := `{"peer":{"id":"peer-1","url":"http://peer-1:8080"},"epoch":"epoch-1"}`
 	got, err := json.Marshal(in)
@@ -85,6 +89,7 @@ func TestAnnounceRequestOmitsEmptyDelta(t *testing.T) {
 }
 
 func TestAnnounceResponseWire(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		in   AnnounceResponse
 		want string
@@ -111,6 +116,7 @@ func TestAnnounceResponseWire(t *testing.T) {
 }
 
 func TestPeersResponseWire(t *testing.T) {
+	t.Parallel()
 	in := PeersResponse{
 		Peers:     []PeerStatus{{ID: "peer-1", URL: "http://peer-1:8080", Epoch: "epoch-1", Expiry: time.Date(2026, 9, 23, 14, 0, 0, 0, time.UTC), Holdings: 3}},
 		XorbBytes: 1024,
@@ -134,6 +140,7 @@ func TestPeersResponseWire(t *testing.T) {
 }
 
 func TestPeersResponseEmptyPeers(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		in   PeersResponse
 		want string

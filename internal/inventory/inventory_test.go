@@ -48,12 +48,14 @@ func testParse(t *testing.T, s string) xet.XorbHash {
 }
 
 func TestScan(t *testing.T) {
+	t.Parallel()
 	at := func(sec int64) time.Time { return time.Unix(1_700_000_000+sec, 0) }
 	n1, n3, n4 := strings.Repeat("c", 64), strings.Repeat("b", 64), strings.Repeat("a", 64)
 	// lo sorts first as a hash string but last as bytes: xet stores each 16-digit group little-endian.
 	lo, hi := strings.Repeat("0", 15)+"1"+strings.Repeat("0", 48), "01"+strings.Repeat("0", 62)
 
 	t.Run("sorted", func(t *testing.T) {
+		t.Parallel()
 		w := &fakeWalker{rows: []fakeRow{
 			{n3, 30, at(3)},
 			{hi, 21, at(2)},
@@ -76,6 +78,7 @@ func TestScan(t *testing.T) {
 		}
 	})
 	t.Run("walk_error", func(t *testing.T) {
+		t.Parallel()
 		walkErr := errors.New("walk failed")
 		w := &fakeWalker{rows: []fakeRow{{n1, 10, at(1)}}, err: walkErr}
 		if got, err := inventory.Scan(t.Context(), w); !errors.Is(err, walkErr) || len(got) != 0 {
@@ -83,6 +86,7 @@ func TestScan(t *testing.T) {
 		}
 	})
 	t.Run("ctx", func(t *testing.T) {
+		t.Parallel()
 		w := &fakeWalker{}
 		ctx := context.WithValue(t.Context(), fakeCtxKey{}, "scan")
 		if _, err := inventory.Scan(ctx, w); err != nil || w.ctxValue != "scan" {

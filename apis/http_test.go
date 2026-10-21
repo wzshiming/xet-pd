@@ -8,6 +8,7 @@ import (
 )
 
 func TestOrigin(t *testing.T) {
+	t.Parallel()
 	good := map[string]string{
 		"http://h":             "http://h",
 		"https://h:65535/":     "https://h:65535",
@@ -33,6 +34,7 @@ func TestOrigin(t *testing.T) {
 }
 
 func TestReadJSON(t *testing.T) {
+	t.Parallel()
 	const limit = 16
 	tests := []struct {
 		name, body string
@@ -58,6 +60,7 @@ func TestReadJSON(t *testing.T) {
 }
 
 func TestAuthorize(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		secret, header string
 		want           bool
@@ -88,6 +91,7 @@ func TestAuthorize(t *testing.T) {
 }
 
 func TestXorbURL(t *testing.T) {
+	t.Parallel()
 	got := XorbURL("http://g:1", "abc")
 	if want := "http://g:1/v1/xorbs/default/abc"; got != want || got != "http://g:1"+XorbPathPrefix+"abc" {
 		t.Errorf("XorbURL(%q, %q) = %q, want %q", "http://g:1", "abc", got, want)

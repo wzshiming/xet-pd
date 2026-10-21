@@ -1341,3 +1341,42 @@ func TestDeleteXorbRefusedWhilePinned(t *testing.T) {
 		t.Fatalf("pins leaked: %v", st.pins)
 	}
 }
+
+// Each holder a relay tries is one attempt and each failed attempt one failure; a xorb without holders tries none.
+func TestRelayCounters(t *testing.T) {
+	x, y := makeXorb(t, 68, 2, 4<<10), makeXorb(t, 69, 2, 4<<10)
+	st, reg := newTestStore(t, t.TempDir())
+	stale, live := newHolder(t, reg, "h1", x), newHolder(t, reg, "h2", x)
+	if reg.holders(x.hash.String())[0].ID != stale.peer.ID {
+		stale, live = live, stale
+	}
+	stale.drop(x.hash)
+	relays := func() apis.RelayCounters {
+		return apis.RelayCounters{Attempts: st.relayTries.Load(), Failures: st.relayErrs.Load()}
+	}
+	ctx := context.Background()
+	rs, err := st.GetXorbReadSeekCloser(ctx, x.hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = rs.Close()
+	if got := relays(); got != (apis.RelayCounters{Attempts: 2, Failures: 1}) {
+		t.Fatalf("relay counters past the stale holder = %+v, want 2 attempts and 1 failure", got)
+	}
+	live.drop(x.hash)
+	before := relays()
+	if _, err := st.GetXorbReadSeekCloser(ctx, x.hash); err == nil {
+		t.Fatal("GetXorbReadSeekCloser with every holder stale must fail")
+	}
+	// The stale holder now cools and is tried last, so only the increments are order-free.
+	if got := relays(); got.Attempts-before.Attempts != 2 || got.Failures-before.Failures != 2 {
+		t.Fatalf("relay counters %+v -> %+v with every holder stale, want 2 more attempts and 2 more failures", before, got)
+	}
+	before = relays()
+	if _, err := st.GetXorbReadSeekCloser(ctx, y.hash); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("GetXorbReadSeekCloser of a xorb without holders = %v, want fs.ErrNotExist", err)
+	}
+	if got := relays(); got != before {
+		t.Fatalf("relay counters %+v -> %+v for a xorb without holders, want no attempt", before, got)
+	}
+}

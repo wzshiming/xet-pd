@@ -115,6 +115,9 @@ func TestAnnounceResponseWire(t *testing.T) {
 	}
 }
 
+// zeroCounters ends a PeersResponse encoding whose counters past xorb_gets are all zero.
+const zeroCounters = `"xorb_bytes_served":{"peer":0,"direct":0},"pulls":{"sent":0,"accepted":0,"failed":0},"evictions":{"count":0,"bytes":0},"relays":{"attempts":0,"failures":0},"announces":{"total":0,"full":0,"resync":0}}`
+
 func TestPeersResponseWire(t *testing.T) {
 	t.Parallel()
 	in := PeersResponse{
@@ -122,7 +125,7 @@ func TestPeersResponseWire(t *testing.T) {
 		XorbBytes: 1024,
 		XorbGets:  XorbGets{Peer: 2, Direct: 1},
 	}
-	want := `{"peers":[{"id":"peer-1","url":"http://peer-1:8080","epoch":"epoch-1","expiry":"2026-09-23T14:00:00Z","holdings":3}],"xorb_bytes":1024,"xorb_gets":{"peer":2,"direct":1}}`
+	want := `{"peers":[{"id":"peer-1","url":"http://peer-1:8080","epoch":"epoch-1","expiry":"2026-09-23T14:00:00Z","holdings":3}],"xorb_bytes":1024,"xorb_gets":{"peer":2,"direct":1},` + zeroCounters
 	got, err := json.Marshal(in)
 	if err != nil {
 		t.Fatal(err)
@@ -145,8 +148,8 @@ func TestPeersResponseEmptyPeers(t *testing.T) {
 		in   PeersResponse
 		want string
 	}{
-		{PeersResponse{Peers: []PeerStatus{}}, `{"peers":[],"xorb_bytes":0,"xorb_gets":{"peer":0,"direct":0}}`},
-		{PeersResponse{}, `{"peers":null,"xorb_bytes":0,"xorb_gets":{"peer":0,"direct":0}}`},
+		{PeersResponse{Peers: []PeerStatus{}}, `{"peers":[],"xorb_bytes":0,"xorb_gets":{"peer":0,"direct":0},` + zeroCounters},
+		{PeersResponse{}, `{"peers":null,"xorb_bytes":0,"xorb_gets":{"peer":0,"direct":0},` + zeroCounters},
 	}
 	for _, c := range cases {
 		got, err := json.Marshal(c.in)

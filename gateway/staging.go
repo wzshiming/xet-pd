@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/wzshiming/xet"
@@ -49,6 +50,9 @@ type staging struct {
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 	once   sync.Once
+
+	pullsSent, pullsAccepted, pullsFailed atomic.Uint64
+	evictions, evictedBytes               atomic.Uint64 // added under mu with the removal, so a zero snapshot implies them
 
 	mu     sync.Mutex                      // guards the fields below; never held across registry, store or network calls
 	xorbs  lru.Index[xet.XorbHash, staged] // local copies
@@ -119,6 +123,8 @@ func newStaging(st *store, cfg stagingConfig) (*staging, error) {
 							skipErr = err
 						} else {
 							m.xorbs.Remove(e) // a copy re-inserted meanwhile is a new entry and stays
+							m.evictions.Add(1)
+							m.evictedBytes.Add(uint64(e.Size))
 							if over = m.xorbs.Usage() > m.cfg.cacheSize; !over {
 								m.warned = false
 							}
@@ -179,6 +185,7 @@ func newStaging(st *store, cfg stagingConfig) (*staging, error) {
 					defer m.kick()
 					defer func() { <-m.sem }()
 					ctx, cancel := context.WithTimeout(m.ctx, pullTimeout)
+					m.pullsSent.Add(1)
 					resp, err := apis.PostJSON(ctx, m.client, p.URL+apis.PullPath, m.cfg.secret, apis.PullRequest{Hash: hash.String()})
 					if err == nil {
 						_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
@@ -188,7 +195,12 @@ func newStaging(st *store, cfg stagingConfig) (*staging, error) {
 						}
 					}
 					cancel()
-					if err != nil && m.ctx.Err() == nil {
+					if err == nil {
+						m.pullsAccepted.Add(1)
+						return
+					}
+					m.pullsFailed.Add(1)
+					if m.ctx.Err() == nil {
 						slog.Warn("gateway: pull request", "peer", p.ID, "hash", hash, "err", err)
 					}
 				}(a.p, a.hash)

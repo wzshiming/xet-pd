@@ -588,3 +588,71 @@ func TestRegistryStallLeavesIndexFree(t *testing.T) {
 		})
 	}
 }
+
+// pullCounters reads the staging counters the peers route reports as pulls.
+func pullCounters(m *staging) apis.PullCounters {
+	return apis.PullCounters{Sent: m.pullsSent.Load(), Accepted: m.pullsAccepted.Load(), Failed: m.pullsFailed.Load()}
+}
+
+// A pull request sent counts as accepted on a 202 and as failed on any other answer or a cancellation.
+func TestPullCounters(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status int
+		want   apis.PullCounters
+	}{
+		{"accepted", http.StatusAccepted, apis.PullCounters{Sent: 1, Accepted: 1}},
+		{"refused", http.StatusInternalServerError, apis.PullCounters{Sent: 1, Failed: 1}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			x := makeXorb(t, 66, 2, 4<<10)
+			st, _ := newTestStore(t, t.TempDir())
+			newSeed(t, st, "s1").answer(tc.status, "")
+			m := newTestStaging(t, st, stagingConfig{})
+			if _, err := st.PutXorb(context.Background(), x.hash, bytes.NewReader(x.body)); err != nil {
+				t.Fatal(err)
+			}
+			clustertest.WaitFor(t, clustertest.WaitTimeout, "the pull to be counted as "+tc.name, func() bool {
+				c := pullCounters(m)
+				return c.Accepted+c.Failed > 0
+			})
+			if got := pullCounters(m); got != tc.want {
+				t.Fatalf("pull counters = %+v, want %+v", got, tc.want)
+			}
+		})
+	}
+	t.Run("canceled by Close", func(t *testing.T) {
+		x := makeXorb(t, 66, 2, 4<<10)
+		st, _ := newTestStore(t, t.TempDir())
+		s := newSeed(t, st, "s1")
+		s.hang()
+		m := newTestStaging(t, st, stagingConfig{})
+		if _, err := st.PutXorb(context.Background(), x.hash, bytes.NewReader(x.body)); err != nil {
+			t.Fatal(err)
+		}
+		clustertest.WaitFor(t, clustertest.WaitTimeout, "hung pull", func() bool { return len(s.requests()) == 1 })
+		_ = m.Close()
+		// Close reaped every pull goroutine, so each pull sent has its outcome.
+		if got := pullCounters(m); got.Sent != 1 || got.Sent != got.Accepted+got.Failed {
+			t.Fatalf("pull counters after Close = %+v, want the 1 pull sent counted as accepted or failed", got)
+		}
+	})
+}
+
+// An evicted copy is counted with its bytes by the time the staged usage drops.
+func TestEvictionCounters(t *testing.T) {
+	x := makeXorb(t, 67, 2, 4<<10)
+	st, _ := newTestStore(t, t.TempDir())
+	s := newSeed(t, st, "s1")
+	m := newTestStaging(t, st, stagingConfig{cacheSize: 1})
+	if _, err := st.PutXorb(context.Background(), x.hash, bytes.NewReader(x.body)); err != nil {
+		t.Fatal(err)
+	}
+	s.holds(x.hash)
+	m.kick()
+	clustertest.WaitFor(t, clustertest.WaitTimeout, "eviction", func() bool { return !clustertest.HasXorb(t, st.Storage, x.hash) && m.snapshot() == 0 })
+	want := apis.EvictionCounters{Count: 1, Bytes: uint64(len(x.body))}
+	if got := (apis.EvictionCounters{Count: m.evictions.Load(), Bytes: m.evictedBytes.Load()}); got != want {
+		t.Fatalf("eviction counters once the usage dropped = %+v, want %+v", got, want)
+	}
+}

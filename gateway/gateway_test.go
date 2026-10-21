@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
@@ -202,7 +203,9 @@ func TestControlRoutes(t *testing.T) {
 		t.Fatalf("control paths reached the upstream %d times", n)
 	}
 	resp, body := request(t, http.MethodGet, srv.URL+apis.PeersPath, "")
-	want := `{"peers":[],"xorb_bytes":0,"xorb_gets":{"peer":0,"direct":0}}` + "\n"
+	want := `{"peers":[],"xorb_bytes":0,"xorb_gets":{"peer":0,"direct":0},"xorb_bytes_served":{"peer":0,"direct":0},` +
+		`"pulls":{"sent":0,"accepted":0,"failed":0},"evictions":{"count":0,"bytes":0},"relays":{"attempts":0,"failures":0},` +
+		`"announces":{"total":0,"full":0,"resync":0}}` + "\n"
 	if resp.StatusCode != http.StatusOK || resp.Header.Get("Content-Type") != "application/json" || body != want {
 		t.Fatalf("GET %s = %d %q %q, want %q", apis.PeersPath, resp.StatusCode, resp.Header.Get("Content-Type"), body, want)
 	}
@@ -512,5 +515,67 @@ func TestGatewayIntegration(t *testing.T) {
 	}
 	if err := g.Close(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// Served xorb bytes count what each GET wrote, error bodies included, by whether apis.PeerHeader marked it; HEAD probes write none.
+func TestPeersReportsServedXorbBytes(t *testing.T) {
+	g, srv := newTestGateway(t, clustertest.NewHub(t), nil)
+	x := makeXorb(t, 64, 2, 4<<10)
+	if _, err := g.st.PutXorb(context.Background(), x.hash, bytes.NewReader(x.body)); err != nil {
+		t.Fatal(err)
+	}
+	n, peer := uint64(len(x.body)), []string{apis.PeerHeader, "p1"}
+	steps := []struct {
+		name, method string
+		hdr          []string
+		status       int
+		body         []byte
+		want         apis.ServedBytes
+	}{
+		{"direct GET", http.MethodGet, nil, http.StatusOK, x.body, apis.ServedBytes{Direct: n}},
+		{"peer GET", http.MethodGet, peer, http.StatusOK, x.body, apis.ServedBytes{Peer: n, Direct: n}},
+		{"direct range GET", http.MethodGet, []string{"Range", "bytes=0-15"}, http.StatusPartialContent, x.body[:16], apis.ServedBytes{Peer: n, Direct: n + 16}},
+		{"peer range GET", http.MethodGet, []string{"Range", "bytes=0-15", apis.PeerHeader, "p1"}, http.StatusPartialContent, x.body[:16], apis.ServedBytes{Peer: n + 16, Direct: n + 16}},
+		{"direct HEAD", http.MethodHead, nil, http.StatusOK, nil, apis.ServedBytes{Peer: n + 16, Direct: n + 16}},
+		{"peer HEAD", http.MethodHead, peer, http.StatusOK, nil, apis.ServedBytes{Peer: n + 16, Direct: n + 16}},
+	}
+	for _, s := range steps {
+		resp, body := request(t, s.method, apis.XorbURL(srv.URL, x.hash.String()), "", s.hdr...)
+		if resp.StatusCode != s.status || body != string(s.body) {
+			t.Fatalf("%s = %d with %d bytes, want %d with %d", s.name, resp.StatusCode, len(body), s.status, len(s.body))
+		}
+		if got := clustertest.Diag(t, srv.URL).XorbBytesServed; got != s.want {
+			t.Fatalf("served bytes after the %s = %+v, want %+v", s.name, got, s.want)
+		}
+	}
+	resp, body := request(t, http.MethodGet, apis.XorbURL(srv.URL, strings.Repeat("11", 32)), "")
+	if resp.StatusCode != http.StatusNotFound || body == "" {
+		t.Fatalf("GET of a missing xorb = %d %q, want 404 with an error body", resp.StatusCode, body)
+	}
+	if got, want := clustertest.Diag(t, srv.URL).XorbBytesServed, (apis.ServedBytes{Peer: n + 16, Direct: n + 16 + uint64(len(body))}); got != want {
+		t.Fatalf("served bytes after a 404 = %+v, want %+v counting its error body", got, want)
+	}
+}
+
+// The peers route reports the pulls, evictions and relays of the gateway's own staging and store.
+func TestPeersReportsStagingAndRelayCounters(t *testing.T) {
+	g, srv := newTestGateway(t, clustertest.NewHub(t), func(cfg *Config, _ string) { cfg.XorbCacheSize = 1 })
+	x := makeXorb(t, 65, 2, 4<<10)
+	s := newSeed(t, g.st, "s1")
+	if _, err := g.st.PutXorb(context.Background(), x.hash, bytes.NewReader(x.body)); err != nil {
+		t.Fatal(err)
+	}
+	clustertest.WaitFor(t, clustertest.WaitTimeout, "the seed to accept its pull", func() bool { return clustertest.Diag(t, srv.URL).Pulls.Accepted == 1 })
+	s.holds(x.hash)
+	g.staging.kick()
+	clustertest.WaitFor(t, clustertest.WaitTimeout, "the local copy to be evicted", func() bool { return clustertest.Diag(t, srv.URL).XorbBytes == 0 })
+	// The fake seed serves no xorb bytes, so the read fails over its only holder.
+	if resp, _ := request(t, http.MethodGet, apis.XorbURL(srv.URL, x.hash.String()), ""); resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("GET of the evicted xorb = %d, want 404 from the failed relay", resp.StatusCode)
+	}
+	d := clustertest.Diag(t, srv.URL)
+	if d.Pulls != (apis.PullCounters{Sent: 1, Accepted: 1}) || d.Evictions != (apis.EvictionCounters{Count: 1, Bytes: uint64(len(x.body))}) || d.Relays != (apis.RelayCounters{Attempts: 1, Failures: 1}) {
+		t.Fatalf("pulls %+v, evictions %+v, relays %+v, want 1 pull sent and accepted, 1 eviction of %d bytes, 1 failed relay attempt", d.Pulls, d.Evictions, d.Relays, len(x.body))
 	}
 }

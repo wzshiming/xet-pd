@@ -232,6 +232,7 @@ func New(cfg Config) (*Peer, error) {
 	p.mux.HandleFunc("GET /v1/xorbs/{prefix}/{hash}", p.serveXorb)
 	p.mux.HandleFunc("POST "+apis.PullPath, p.servePull)
 	p.mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
+	p.mux.HandleFunc("GET /readyz", p.serveReady)
 	return p, nil
 }
 
@@ -249,6 +250,17 @@ func (p *Peer) Validated() bool {
 // Announced reports whether the latest completed announce was acknowledged by the gateway.
 func (p *Peer) Announced() bool {
 	return p.announced.Load()
+}
+
+func (p *Peer) serveReady(w http.ResponseWriter, _ *http.Request) {
+	switch {
+	case !p.Validated():
+		http.Error(w, "validating cached xorbs", http.StatusServiceUnavailable)
+	case !p.Announced():
+		http.Error(w, "gateway has not acknowledged an announce", http.StatusServiceUnavailable)
+	default:
+		w.WriteHeader(http.StatusOK)
+	}
 }
 
 // Close stops the announcer and the startup validation, cancels in-flight pulls, waits for them and drops idle upstream connections.

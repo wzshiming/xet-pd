@@ -6,7 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
+	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -47,6 +49,7 @@ type Gateway struct {
 	st        *store
 	staging   *staging
 	secret    string
+	dataDir   string
 	transport *http.Transport // upstream xet downloads
 
 	peerGets, directGets                    atomic.Uint64
@@ -87,7 +90,8 @@ func New(cfg Config) (*Gateway, error) {
 		return nil, errors.New("gateway: min seeds exceed replicas")
 	}
 	reg := newRegistry(cfg.PeerTTL)
-	st, err := newStore(filepath.Join(cfg.StorageDir, "data"), reg, cfg.RelayTimeout)
+	dataDir := filepath.Join(cfg.StorageDir, "data")
+	st, err := newStore(dataDir, reg, cfg.RelayTimeout)
 	if err != nil {
 		return nil, fmt.Errorf("gateway: %w", err)
 	}
@@ -127,8 +131,9 @@ func New(cfg Config) (*Gateway, error) {
 	if err != nil {
 		return nil, fmt.Errorf("gateway: %w", err)
 	}
-	g := &Gateway{mux: http.NewServeMux(), cas: cas, reg: reg, st: st, staging: staging, secret: cfg.Secret, transport: transport}
+	g := &Gateway{mux: http.NewServeMux(), cas: cas, reg: reg, st: st, staging: staging, secret: cfg.Secret, dataDir: dataDir, transport: transport}
 	g.mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
+	g.mux.HandleFunc("GET /readyz", g.serveReady)
 	g.mux.HandleFunc(apis.AnnouncePath, route(http.MethodPost, g.serveAnnounce))
 	g.mux.HandleFunc(apis.PeersPath, route(http.MethodGet, g.servePeers))
 	g.mux.Handle("/xet-pd/", http.NotFoundHandler()) // unknown control paths never reach the upstream
@@ -160,6 +165,20 @@ func route(method string, h http.HandlerFunc) http.HandlerFunc {
 		}
 		h(w, r)
 	}
+}
+
+// serveReady creates and removes a probe file in the data directory's root, which the xorb walks never enter.
+func (g *Gateway) serveReady(w http.ResponseWriter, _ *http.Request) {
+	f, err := os.CreateTemp(g.dataDir, ".readyz-*")
+	if err == nil {
+		err = errors.Join(f.Close(), os.Remove(f.Name()))
+	}
+	if err != nil {
+		slog.Warn("gateway: readyz probe", "err", err)
+		http.Error(w, "storage: probe failed", http.StatusServiceUnavailable)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
 }
 
 // pathsInfoRe admits the one hub POST that only reads: /api/{type}s/{repo}/paths-info/{rev}.

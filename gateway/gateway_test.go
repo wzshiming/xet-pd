@@ -187,6 +187,9 @@ func TestControlRoutes(t *testing.T) {
 		{http.MethodGet, "/healthz", http.StatusOK, ""},
 		{http.MethodHead, "/healthz", http.StatusOK, ""},
 		{http.MethodPost, "/healthz", http.StatusForbidden, ""},
+		{http.MethodGet, "/readyz", http.StatusOK, ""},
+		{http.MethodHead, "/readyz", http.StatusOK, ""},
+		{http.MethodPost, "/readyz", http.StatusForbidden, ""},
 		{http.MethodGet, apis.AnnouncePath, http.StatusMethodNotAllowed, http.MethodPost},
 		{http.MethodPost, apis.PeersPath, http.StatusMethodNotAllowed, http.MethodGet},
 		{http.MethodGet, apis.PullPath, http.StatusNotFound, ""},
@@ -195,7 +198,7 @@ func TestControlRoutes(t *testing.T) {
 	}
 	for _, tt := range tests {
 		resp, body := request(t, tt.method, srv.URL+tt.path, "")
-		if resp.StatusCode != tt.status || resp.Header.Get("Allow") != tt.allow {
+		if resp.StatusCode != tt.status || resp.Header.Get("Allow") != tt.allow || (tt.method == http.MethodHead && body != "") {
 			t.Fatalf("%s %s = %d Allow %q %q, want %d Allow %q", tt.method, tt.path, resp.StatusCode, resp.Header.Get("Allow"), body, tt.status, tt.allow)
 		}
 	}
@@ -208,6 +211,31 @@ func TestControlRoutes(t *testing.T) {
 		`"announces":{"total":0,"full":0,"resync":0}}` + "\n"
 	if resp.StatusCode != http.StatusOK || resp.Header.Get("Content-Type") != "application/json" || body != want {
 		t.Fatalf("GET %s = %d %q %q, want %q", apis.PeersPath, resp.StatusCode, resp.Header.Get("Content-Type"), body, want)
+	}
+}
+
+// Readiness creates a probe file in the data directory, so a data directory that refuses new files is not ready.
+func TestReadyzStorage(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores file modes")
+	}
+	var root, dir string
+	_, srv := newTestGateway(t, clustertest.NewHub(t), func(cfg *Config, _ string) { root, dir = cfg.StorageDir, filepath.Join(cfg.StorageDir, "data") })
+	if err := os.Chmod(dir, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o755) })
+	if resp, body := request(t, http.MethodGet, srv.URL+"/readyz", ""); resp.StatusCode != http.StatusServiceUnavailable || !strings.Contains(body, "storage") || strings.Contains(body, root) {
+		t.Fatalf("GET /readyz on a read-only data dir = %d %q, want 503 naming the storage but not its path %s", resp.StatusCode, body, root)
+	}
+	if err := os.Chmod(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if resp, body := request(t, http.MethodGet, srv.URL+"/readyz", ""); resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /readyz on a writable data dir = %d %q, want 200", resp.StatusCode, body)
+	}
+	if left, err := filepath.Glob(filepath.Join(dir, ".readyz-*")); err != nil || len(left) != 0 {
+		t.Fatalf("probe files left in the data dir: %v %v", left, err)
 	}
 }
 

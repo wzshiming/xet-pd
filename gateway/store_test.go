@@ -9,7 +9,6 @@ import (
 	"io"
 	"io/fs"
 	"math"
-	"math/rand/v2"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -27,6 +26,7 @@ import (
 	"github.com/wzshiming/xet/xorb"
 
 	"github.com/wzshiming/xet-pd/apis"
+	"github.com/wzshiming/xet-pd/internal/clustertest"
 )
 
 // fixture is one footered xorb built by the real encoder, with the raw chunks it packs.
@@ -39,33 +39,18 @@ type fixture struct {
 }
 
 func makeXorb(t *testing.T, seed byte, n, size int) *fixture {
-	t.Helper()
-	rng := rand.NewChaCha8([32]byte{seed})
-	chunks := make([][]byte, n)
-	for i := range chunks {
-		chunks[i] = make([]byte, size)
-		_, _ = rng.Read(chunks[i])
-	}
-	return buildXorb(t, chunks)
+	return buildXorb(t, clustertest.RandomChunks(seed, n, size))
 }
 
 // buildXorb packs chunks with the real encoder, which picks the smallest encoding per chunk.
 func buildXorb(t *testing.T, chunks [][]byte) *fixture {
 	t.Helper()
 	x := &fixture{chunks: chunks}
-	var buf bytes.Buffer
-	enc := xorb.NewEncoder(&buf, true)
 	for _, chunk := range chunks {
-		if _, err := enc.Write(chunk); err != nil {
-			t.Fatal(err)
-		}
 		x.hashes = append(x.hashes, xet.ComputeChunkHash(chunk))
 		x.sizes = append(x.sizes, uint64(len(chunk)))
 	}
-	if err := enc.Close(); err != nil {
-		t.Fatal(err)
-	}
-	x.hash, x.body = enc.SummoryHash(), buf.Bytes()
+	x.hash, x.body = clustertest.PackXorb(t, chunks)
 	return x
 }
 

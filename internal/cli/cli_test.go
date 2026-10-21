@@ -14,17 +14,9 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/wzshiming/xet-pd/internal/cli/clitest"
 )
-
-func noEnv(string) string { return "" }
-
-func env(kv ...string) func(string) string {
-	m := map[string]string{}
-	for i := 0; i+1 < len(kv); i += 2 {
-		m[kv[i]] = kv[i+1]
-	}
-	return func(k string) string { return m[k] }
-}
 
 func TestParseSize(t *testing.T) {
 	tests := []struct {
@@ -105,13 +97,13 @@ func TestFlagSetSources(t *testing.T) {
 		env  func(string) string
 		want testFlags
 	}{
-		{"defaults", nil, noEnv, testFlags{"anon", 1, time.Second, 1 << 20}},
-		{"environment", nil, env("TEST_NAME", "env", "TEST_COUNT", "2", "TEST_TIMEOUT", "2s", "TEST_SIZE", "2MiB"), testFlags{"env", 2, 2 * time.Second, 2 << 20}},
-		{"later key fills in", nil, env("TEST_ALIAS", "alias"), testFlags{"alias", 1, time.Second, 1 << 20}},
-		{"earlier key wins", nil, env("TEST_NAME", "env", "TEST_ALIAS", "alias"), testFlags{"env", 1, time.Second, 1 << 20}},
+		{"defaults", nil, clitest.Getenv(), testFlags{"anon", 1, time.Second, 1 << 20}},
+		{"environment", nil, clitest.Getenv("TEST_NAME", "env", "TEST_COUNT", "2", "TEST_TIMEOUT", "2s", "TEST_SIZE", "2MiB"), testFlags{"env", 2, 2 * time.Second, 2 << 20}},
+		{"later key fills in", nil, clitest.Getenv("TEST_ALIAS", "alias"), testFlags{"alias", 1, time.Second, 1 << 20}},
+		{"earlier key wins", nil, clitest.Getenv("TEST_NAME", "env", "TEST_ALIAS", "alias"), testFlags{"env", 1, time.Second, 1 << 20}},
 		// An unparsable environment value is ignored once its flag is given.
-		{"flags win", []string{"-name", "flag", "-count", "3", "-timeout", "3s", "-size", "3KiB"}, env("TEST_NAME", "env", "TEST_COUNT", "x", "TEST_TIMEOUT", "y", "TEST_SIZE", "z"), testFlags{"flag", 3, 3 * time.Second, 3 << 10}},
-		{"empty flag wins", []string{"-name", ""}, env("TEST_NAME", "env"), testFlags{"", 1, time.Second, 1 << 20}},
+		{"flags win", []string{"-name", "flag", "-count", "3", "-timeout", "3s", "-size", "3KiB"}, clitest.Getenv("TEST_NAME", "env", "TEST_COUNT", "x", "TEST_TIMEOUT", "y", "TEST_SIZE", "z"), testFlags{"flag", 3, 3 * time.Second, 3 << 10}},
+		{"empty flag wins", []string{"-name", ""}, clitest.Getenv("TEST_NAME", "env"), testFlags{"", 1, time.Second, 1 << 20}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -130,11 +122,11 @@ func TestFlagSetErrors(t *testing.T) {
 		env  func(string) string
 		want string
 	}{
-		{"positional argument", []string{"-count", "2", "extra"}, noEnv, `unexpected argument "extra"`},
-		{"unknown flag", []string{"-bogus"}, noEnv, "flag provided but not defined: -bogus"},
-		{"bad env int", nil, env("TEST_COUNT", "x"), `TEST_COUNT="x": parse error`},
-		{"bad env duration", nil, env("TEST_TIMEOUT", "soon"), `TEST_TIMEOUT="soon": parse error`},
-		{"bad env size", nil, env("TEST_SIZE", "-1"), `TEST_SIZE="-1": expected bytes`},
+		{"positional argument", []string{"-count", "2", "extra"}, clitest.Getenv(), `unexpected argument "extra"`},
+		{"unknown flag", []string{"-bogus"}, clitest.Getenv(), "flag provided but not defined: -bogus"},
+		{"bad env int", nil, clitest.Getenv("TEST_COUNT", "x"), `TEST_COUNT="x": parse error`},
+		{"bad env duration", nil, clitest.Getenv("TEST_TIMEOUT", "soon"), `TEST_TIMEOUT="soon": parse error`},
+		{"bad env size", nil, clitest.Getenv("TEST_SIZE", "-1"), `TEST_SIZE="-1": expected bytes`},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -152,7 +144,7 @@ func TestFlagSetErrors(t *testing.T) {
 
 func TestFlagSetHelp(t *testing.T) {
 	var help bytes.Buffer
-	_, err := parseTestFlags([]string{"-h"}, noEnv, &help)
+	_, err := parseTestFlags([]string{"-h"}, clitest.Getenv(), &help)
 	if !errors.Is(err, flag.ErrHelp) {
 		t.Fatalf("err = %v, want flag.ErrHelp", err)
 	}
@@ -194,17 +186,17 @@ func TestSecretPolicy(t *testing.T) {
 		want    string
 		wantErr string
 	}{
-		{name: "flag", args: []string{"-secret", "a"}, env: noEnv, want: "a"},
-		{name: "env", env: env("XET_PD_SECRET", "e"), want: "e"},
-		{name: "flag file trimmed", args: []string{"-secret-file", file}, env: noEnv, want: "s3cr3t"},
-		{name: "env file", env: env("XET_PD_SECRET_FILE", file), want: "s3cr3t"},
-		{name: "flag secret beats env file", args: []string{"-secret", "a"}, env: env("XET_PD_SECRET_FILE", file), want: "a"},
-		{name: "flag file beats env secret", args: []string{"-secret-file", file}, env: env("XET_PD_SECRET", "e"), want: "s3cr3t"},
-		{name: "both flags", args: []string{"-secret", "hunter2", "-secret-file", file}, env: noEnv, wantErr: "mutually exclusive"},
-		{name: "both env", env: env("XET_PD_SECRET", "hunter2", "XET_PD_SECRET_FILE", file), wantErr: "mutually exclusive"},
-		{name: "missing file", args: []string{"-secret-file", missing}, env: noEnv, wantErr: missing},
-		{name: "blank flag file", args: []string{"-secret-file", blank}, env: noEnv, wantErr: "secret file is empty"},
-		{name: "blank env file", env: env("XET_PD_SECRET_FILE", blank), wantErr: "secret file is empty"},
+		{name: "flag", args: []string{"-secret", "a"}, env: clitest.Getenv(), want: "a"},
+		{name: "env", env: clitest.Getenv("XET_PD_SECRET", "e"), want: "e"},
+		{name: "flag file trimmed", args: []string{"-secret-file", file}, env: clitest.Getenv(), want: "s3cr3t"},
+		{name: "env file", env: clitest.Getenv("XET_PD_SECRET_FILE", file), want: "s3cr3t"},
+		{name: "flag secret beats env file", args: []string{"-secret", "a"}, env: clitest.Getenv("XET_PD_SECRET_FILE", file), want: "a"},
+		{name: "flag file beats env secret", args: []string{"-secret-file", file}, env: clitest.Getenv("XET_PD_SECRET", "e"), want: "s3cr3t"},
+		{name: "both flags", args: []string{"-secret", "hunter2", "-secret-file", file}, env: clitest.Getenv(), wantErr: "mutually exclusive"},
+		{name: "both env", env: clitest.Getenv("XET_PD_SECRET", "hunter2", "XET_PD_SECRET_FILE", file), wantErr: "mutually exclusive"},
+		{name: "missing file", args: []string{"-secret-file", missing}, env: clitest.Getenv(), wantErr: missing},
+		{name: "blank flag file", args: []string{"-secret-file", blank}, env: clitest.Getenv(), wantErr: "secret file is empty"},
+		{name: "blank env file", env: clitest.Getenv("XET_PD_SECRET_FILE", blank), wantErr: "secret file is empty"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -226,7 +218,7 @@ func TestSecretPolicy(t *testing.T) {
 }
 
 func TestEmptySecretFlagOverridesEnvironment(t *testing.T) {
-	getenv := env("XET_PD_SECRET", "environment-secret", "XET_PD_SECRET_FILE", "/missing-secret-file")
+	getenv := clitest.Getenv("XET_PD_SECRET", "environment-secret", "XET_PD_SECRET_FILE", "/missing-secret-file")
 	for _, option := range []string{"-secret", "-secret-file"} {
 		t.Run(option, func(t *testing.T) {
 			secret, err := secretOf([]string{option, ""}, getenv)
@@ -234,25 +226,6 @@ func TestEmptySecretFlagOverridesEnvironment(t *testing.T) {
 				t.Fatalf("secret = %q, error = %v, want empty secret", secret, err)
 			}
 		})
-	}
-}
-
-// chanWriter hands every write to the test as it happens.
-type chanWriter chan string
-
-func (c chanWriter) Write(p []byte) (int, error) {
-	c <- string(p)
-	return len(p), nil
-}
-
-func await[T any](t *testing.T, what string, ch <-chan T) T {
-	t.Helper()
-	select {
-	case v := <-ch:
-		return v
-	case <-time.After(10 * time.Second):
-		t.Fatalf("timed out waiting for %s", what)
-		panic("unreachable")
 	}
 }
 
@@ -300,7 +273,7 @@ func TestRunExitsBeforeServing(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			var stdout, stderr bytes.Buffer
-			code := fakeCommand("127.0.0.1:0", tt.parseErr, nil, tt.newErr).Run(context.Background(), nil, noEnv, &stdout, &stderr)
+			code := fakeCommand("127.0.0.1:0", tt.parseErr, nil, tt.newErr).Run(context.Background(), nil, clitest.Getenv(), &stdout, &stderr)
 			if code != tt.code || stdout.String() != tt.stdout || stderr.String() != tt.stderr {
 				t.Fatalf("Run = %d, stdout %q, stderr %q; want %d, %q, %q", code, stdout.String(), stderr.String(), tt.code, tt.stdout, tt.stderr)
 			}
@@ -316,7 +289,7 @@ func TestRunListenFailureClosesService(t *testing.T) {
 	defer func() { _ = taken.Close() }()
 	svc := &fakeService{Handler: http.NotFoundHandler()}
 	var stdout, stderr bytes.Buffer
-	if code := fakeCommand(taken.Addr().String(), nil, svc, nil).Run(context.Background(), nil, noEnv, &stdout, &stderr); code != 1 {
+	if code := fakeCommand(taken.Addr().String(), nil, svc, nil).Run(context.Background(), nil, clitest.Getenv(), &stdout, &stderr); code != 1 {
 		t.Fatalf("Run = %d, want 1; stderr %q", code, stderr.String())
 	}
 	if stdout.Len() != 0 || !strings.HasPrefix(stderr.String(), "fake: ") || !strings.Contains(stderr.String(), "address already in use") {
@@ -331,9 +304,11 @@ func TestRunServesUntilCancelled(t *testing.T) {
 	svc := &fakeService{Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusTeapot) })}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	stdout, stderr, code := make(chanWriter, 8), &bytes.Buffer{}, make(chan int, 1)
-	go func() { code <- fakeCommand("127.0.0.1:0", nil, svc, nil).Run(ctx, nil, noEnv, stdout, stderr) }()
-	banner := await(t, "banner", stdout)
+	stdout, stderr, code := make(clitest.ChanWriter, 8), &bytes.Buffer{}, make(chan int, 1)
+	go func() {
+		code <- fakeCommand("127.0.0.1:0", nil, svc, nil).Run(ctx, nil, clitest.Getenv(), stdout, stderr)
+	}()
+	banner := clitest.Await(t, "banner", stdout)
 	addr, ok := strings.CutPrefix(strings.TrimSpace(banner), "fake listening on ")
 	if !ok {
 		t.Fatalf("banner %q", banner)
@@ -347,7 +322,7 @@ func TestRunServesUntilCancelled(t *testing.T) {
 		t.Fatalf("status %d, %d closes while serving", resp.StatusCode, svc.closes.Load())
 	}
 	cancel()
-	if got := await(t, "exit", code); got != 0 {
+	if got := clitest.Await(t, "exit", code); got != 0 {
 		t.Fatalf("Run = %d, want 0; stderr %q", got, stderr.String())
 	}
 	if n := svc.closes.Load(); n != 1 {
@@ -360,7 +335,7 @@ func TestRunCancelledBeforeServing(t *testing.T) {
 	cancel()
 	svc := &fakeService{Handler: http.NotFoundHandler()}
 	var stdout, stderr bytes.Buffer
-	if code := fakeCommand("127.0.0.1:0", nil, svc, nil).Run(ctx, nil, noEnv, &stdout, &stderr); code != 0 {
+	if code := fakeCommand("127.0.0.1:0", nil, svc, nil).Run(ctx, nil, clitest.Getenv(), &stdout, &stderr); code != 0 {
 		t.Fatalf("Run = %d, want 0; stderr %q", code, stderr.String())
 	}
 	if !strings.HasPrefix(stdout.String(), "fake listening on 127.0.0.1:") || stderr.Len() != 0 || svc.closes.Load() != 1 {
@@ -395,9 +370,9 @@ func TestServeHTTPForceClosesStalledResponses(t *testing.T) {
 		w.(http.Flusher).Flush()
 		<-r.Context().Done()
 	})
-	stdout, done := make(chanWriter, 8), make(chan error, 1)
+	stdout, done := make(clitest.ChanWriter, 8), make(chan error, 1)
 	go func() { done <- ServeHTTP(ctx, "127.0.0.1:0", stalled, stdout, "xet-pd test") }()
-	addr, _ := strings.CutPrefix(strings.TrimSpace(await(t, "banner", stdout)), "xet-pd test listening on ")
+	addr, _ := strings.CutPrefix(strings.TrimSpace(clitest.Await(t, "banner", stdout)), "xet-pd test listening on ")
 	resp, err := http.Get("http://" + addr + "/stream")
 	if err != nil {
 		t.Fatal(err)
@@ -405,7 +380,7 @@ func TestServeHTTPForceClosesStalledResponses(t *testing.T) {
 	defer func() { _ = resp.Body.Close() }()
 	start := time.Now()
 	cancel()
-	if err := await(t, "return", done); err != nil {
+	if err := clitest.Await(t, "return", done); err != nil {
 		t.Fatal(err)
 	}
 	if elapsed := time.Since(start); elapsed > 5*time.Second {

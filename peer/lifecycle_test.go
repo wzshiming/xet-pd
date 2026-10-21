@@ -11,7 +11,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"path"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -26,24 +25,11 @@ import (
 	"github.com/wzshiming/xet-pd/internal/clustertest"
 )
 
-// serveByHash serves the body registered for the requested xorb hash.
-func serveByHash(bodies map[xet.XorbHash][]byte) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		hash, _ := xet.ParseXorbHash(path.Base(r.URL.Path))
-		body, ok := bodies[hash]
-		if !ok {
-			http.NotFound(w, r)
-			return
-		}
-		serveBody(body)(w, r)
-	}
-}
-
 // settled waits until no pull, spool or pinned reader is left.
 func settled(t *testing.T, p *Peer) {
 	t.Helper()
-	clustertest.WaitFor(t, waitTimeout, "spool cleanup", spoolEmpty(p))
-	clustertest.WaitFor(t, waitTimeout, "readers released", func() bool {
+	clustertest.WaitFor(t, clustertest.WaitTimeout, "spool cleanup", spoolEmpty(p))
+	clustertest.WaitFor(t, clustertest.WaitTimeout, "readers released", func() bool {
 		p.mu.Lock()
 		defer p.mu.Unlock()
 		for e := range p.xorbs.Oldest() {
@@ -132,9 +118,9 @@ func TestStartupDropsCorruptObject(t *testing.T) {
 	if err := os.WriteFile(xorbPath(dir, b), corrupt, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	g := newGateway(t, serveByHash(nil))
+	g := clustertest.NewFakeGateway(t, clustertest.ServeByHash(nil))
 	p, _ := newTestPeer(t, g.URL, func(c *Config) { c.CacheDir, c.Heartbeat = dir, time.Hour })
-	if got := g.announce(t, 0).req; !got.Full || !slices.Equal(got.Add, hashes(a)) {
+	if got := g.Announce(t, 0).Req; !got.Full || !slices.Equal(got.Add, hashes(a)) {
 		t.Fatalf("startup announce = %+v, want only %s", got, a)
 	}
 	if _, err := os.Stat(xorbPath(dir, b)); !os.IsNotExist(err) {
@@ -148,68 +134,64 @@ func TestStartupDropsCorruptObject(t *testing.T) {
 func TestPullEntersInventoryOnlyAfterValidation(t *testing.T) {
 	hash, body := clustertest.MakeXorb(t, 24, 4, 16<<10)
 	release := make(chan struct{})
-	g := newGateway(t, gatedBody(body, 4<<10, release))
+	g := clustertest.NewFakeGateway(t, clustertest.GatedBody(body, 4<<10, release))
 	p, srv := newTestPeer(t, g.URL, func(c *Config) { c.Heartbeat = 20 * time.Millisecond })
 	late := doAsync(t, xorbURL(srv, hash))
-	clustertest.WaitFor(t, waitTimeout, "pull start", func() bool { return g.gets.Load() == 1 })
+	clustertest.WaitFor(t, clustertest.WaitTimeout, "pull start", func() bool { return len(g.Requests()) == 1 })
 	// Heartbeats keep flowing while the pull is gated; none may carry the object.
-	before := g.announceCount()
-	clustertest.WaitFor(t, waitTimeout, "heartbeats", func() bool { return g.announceCount() >= before+3 })
-	g.mu.Lock()
-	for i, a := range g.announces {
-		if hasAdd(a, hash) || (i > 0 && (a.req.Full || len(a.req.Add)+len(a.req.Remove) != 0)) {
-			t.Fatalf("announce %d while gated = %+v", i, a.req)
+	before := len(g.Announces())
+	clustertest.WaitFor(t, clustertest.WaitTimeout, "heartbeats", func() bool { return len(g.Announces()) >= before+3 })
+	for i, a := range g.Announces() {
+		if hasAdd(a, hash) || (i > 0 && (a.Req.Full || len(a.Req.Add)+len(a.Req.Remove) != 0)) {
+			t.Fatalf("announce %d while gated = %+v", i, a.Req)
 		}
 	}
-	g.mu.Unlock()
 	close(release)
 	if r := <-late; r.err != nil || r.resp.StatusCode != http.StatusOK || !bytes.Equal(r.body, body) {
 		t.Fatalf("GET = %d, %v", r.resp.StatusCode, r.err)
 	}
-	added, _ := g.findAnnounce(t, before, func(a announced) bool { return hasAdd(a, hash) })
-	if added.req.Full || !slices.Equal(added.req.Add, hashes(hash)) || len(added.req.Remove) != 0 {
-		t.Fatalf("delta after commit = %+v", added.req)
+	added, _ := g.FindAnnounce(t, before, func(a clustertest.Announce) bool { return hasAdd(a, hash) })
+	if added.Req.Full || !slices.Equal(added.Req.Add, hashes(hash)) || len(added.Req.Remove) != 0 {
+		t.Fatalf("delta after commit = %+v", added.Req)
 	}
 	settled(t, p)
 }
 
 func TestAnnounceFailureRetriesAsFull(t *testing.T) {
 	hash, body := clustertest.MakeXorb(t, 25, 2, 8<<10)
-	g := newGateway(t, serveBody(body))
+	g := clustertest.NewFakeGateway(t, clustertest.ServeBody(body))
 	var fails atomic.Int32
 	fails.Store(2)
-	g.setReply(func(_ http.ResponseWriter, _ *http.Request, req apis.AnnounceRequest) (int, apis.AnnounceResponse) {
+	g.SetReply(func(_ http.ResponseWriter, _ *http.Request, req apis.AnnounceRequest) (int, apis.AnnounceResponse) {
 		if slices.Contains(req.Add, hash.String()) && fails.Add(-1) >= 0 {
 			return http.StatusInternalServerError, apis.AnnounceResponse{}
 		}
 		return http.StatusOK, apis.AnnounceResponse{TTL: 30}
 	})
 	p, srv := newTestPeer(t, g.URL, func(c *Config) { c.Heartbeat = 20 * time.Millisecond })
-	g.announce(t, 0)
+	g.Announce(t, 0)
 	pullAndSettle(t, p, srv, hash, body)
-	acked, i := g.findAnnounce(t, 1, func(a announced) bool { return hasAdd(a, hash) && a.code == http.StatusOK })
+	acked, i := g.FindAnnounce(t, 1, func(a clustertest.Announce) bool { return hasAdd(a, hash) && a.Code == http.StatusOK })
 	// A failed delta may have been applied, so every retry carries the exact inventory.
-	if !acked.req.Full || !slices.Equal(acked.req.Add, hashes(hash)) {
-		t.Fatalf("acked retry = %+v, want Full", acked.req)
+	if !acked.Req.Full || !slices.Equal(acked.Req.Add, hashes(hash)) {
+		t.Fatalf("acked retry = %+v, want Full", acked.Req)
 	}
 	var rejected []apis.AnnounceRequest
-	g.mu.Lock()
-	for _, a := range g.announces[:i] {
+	for _, a := range g.Announces()[:i] {
 		if hasAdd(a, hash) {
-			if a.code != http.StatusInternalServerError {
-				t.Fatalf("announce before the ack = %d", a.code)
+			if a.Code != http.StatusInternalServerError {
+				t.Fatalf("announce before the ack = %d", a.Code)
 			}
-			rejected = append(rejected, a.req)
+			rejected = append(rejected, a.Req)
 		}
 	}
-	g.mu.Unlock()
 	if len(rejected) != 2 || rejected[0].Full || !rejected[1].Full {
 		t.Fatalf("rejected announces = %+v, want one delta then one Full", rejected)
 	}
 	// The acked object is not resent on later heartbeats.
-	next := g.announce(t, i+1)
-	if next.req.Full || len(next.req.Add)+len(next.req.Remove) != 0 {
-		t.Fatalf("heartbeat after the ack = %+v", next.req)
+	next := g.Announce(t, i+1)
+	if next.Req.Full || len(next.Req.Add)+len(next.Req.Remove) != 0 {
+		t.Fatalf("heartbeat after the ack = %+v", next.Req)
 	}
 }
 
@@ -237,7 +219,7 @@ func TestAmbiguousAnnounceReplyForcesFullReconciliation(t *testing.T) {
 			var loseNext atomic.Bool
 			gw := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				if r.URL.Path != apis.AnnouncePath {
-					serveByHash(map[xet.XorbHash][]byte{a: bodyA, b: bodyB})(w, r)
+					clustertest.ServeByHash(map[xet.XorbHash][]byte{a: bodyA, b: bodyB})(w, r)
 					return
 				}
 				var req apis.AnnounceRequest
@@ -274,24 +256,24 @@ func TestAmbiguousAnnounceReplyForcesFullReconciliation(t *testing.T) {
 			}
 			check := func(i int, want xet.XorbHash) {
 				t.Helper()
-				clustertest.WaitFor(t, waitTimeout, "announce", func() bool { return count() > i })
+				clustertest.WaitFor(t, clustertest.WaitTimeout, "announce", func() bool { return count() > i })
 				mu.Lock()
 				defer mu.Unlock()
 				if got := slices.Sorted(maps.Keys(holdings)); !reqs[i].Full || !slices.Equal(got, hashes(want)) {
 					t.Fatalf("retry = %+v, gateway holdings = %v, want Full with %v", reqs[i], got, hashes(want))
 				}
 			}
-			clustertest.WaitFor(t, waitTimeout, "startup ack", func() bool { return count() == 1 })
+			clustertest.WaitFor(t, clustertest.WaitTimeout, "startup ack", func() bool { return count() == 1 })
 			// Add a is applied but its reply is lost; a is evicted before the retry.
 			loseNext.Store(true)
 			pullAndSettle(t, p, srv, a, bodyA)
-			clustertest.WaitFor(t, waitTimeout, "lost delta", func() bool { return count() == 2 })
+			clustertest.WaitFor(t, clustertest.WaitTimeout, "lost delta", func() bool { return count() == 2 })
 			pullAndSettle(t, p, srv, b, bodyB)
 			check(2, b)
 			// Remove b is applied but its reply is lost; b is pulled again before the retry.
 			loseNext.Store(true)
 			pullAndSettle(t, p, srv, a, bodyA)
-			clustertest.WaitFor(t, waitTimeout, "lost delta", func() bool { return count() == 4 })
+			clustertest.WaitFor(t, clustertest.WaitTimeout, "lost delta", func() bool { return count() == 4 })
 			pullAndSettle(t, p, srv, b, bodyB)
 			check(4, b)
 		})
@@ -300,9 +282,9 @@ func TestAmbiguousAnnounceReplyForcesFullReconciliation(t *testing.T) {
 
 func TestInFlightAnnounceKeepsConcurrentCommitForNextDelta(t *testing.T) {
 	hash, body := clustertest.MakeXorb(t, 26, 2, 8<<10)
-	g := newGateway(t, serveBody(body))
+	g := clustertest.NewFakeGateway(t, clustertest.ServeBody(body))
 	hold := make(chan struct{})
-	g.setReply(func(_ http.ResponseWriter, r *http.Request, _ apis.AnnounceRequest) (int, apis.AnnounceResponse) {
+	g.SetReply(func(_ http.ResponseWriter, r *http.Request, _ apis.AnnounceRequest) (int, apis.AnnounceResponse) {
 		select {
 		case <-hold:
 		case <-r.Context().Done():
@@ -310,14 +292,14 @@ func TestInFlightAnnounceKeepsConcurrentCommitForNextDelta(t *testing.T) {
 		return http.StatusOK, apis.AnnounceResponse{TTL: 30}
 	})
 	p, srv := newTestPeer(t, g.URL, func(c *Config) { c.Heartbeat = time.Hour })
-	if first := g.announce(t, 0); !first.req.Full || len(first.req.Add) != 0 {
-		t.Fatalf("startup announce = %+v", first.req)
+	if first := g.Announce(t, 0); !first.Req.Full || len(first.Req.Add) != 0 {
+		t.Fatalf("startup announce = %+v", first.Req)
 	}
 	pullAndSettle(t, p, srv, hash, body)
-	g.setReply(nil)
+	g.SetReply(nil)
 	close(hold)
-	if second := g.announce(t, 1); second.req.Full || !slices.Equal(second.req.Add, hashes(hash)) {
-		t.Fatalf("delta after the held Full = %+v", second.req)
+	if second := g.Announce(t, 1); second.Req.Full || !slices.Equal(second.Req.Add, hashes(hash)) {
+		t.Fatalf("delta after the held Full = %+v", second.Req)
 	}
 }
 
@@ -325,9 +307,9 @@ func TestResyncSendsFullWithCurrentInventory(t *testing.T) {
 	a, bodyA := clustertest.MakeXorb(t, 27, 2, 8<<10)
 	b, bodyB := clustertest.MakeXorb(t, 28, 2, 8<<10)
 	c, bodyC := clustertest.MakeXorb(t, 29, 2, 8<<10)
-	g := newGateway(t, serveByHash(map[xet.XorbHash][]byte{a: bodyA, b: bodyB, c: bodyC}))
+	g := clustertest.NewFakeGateway(t, clustertest.ServeByHash(map[xet.XorbHash][]byte{a: bodyA, b: bodyB, c: bodyC}))
 	var mode atomic.Int32 // 0 ok, 1 fail once, 2 resync once
-	g.setReply(func(_ http.ResponseWriter, _ *http.Request, req apis.AnnounceRequest) (int, apis.AnnounceResponse) {
+	g.SetReply(func(_ http.ResponseWriter, _ *http.Request, req apis.AnnounceRequest) (int, apis.AnnounceResponse) {
 		switch mode.Swap(0) {
 		case 1:
 			return http.StatusInternalServerError, apis.AnnounceResponse{}
@@ -339,48 +321,48 @@ func TestResyncSendsFullWithCurrentInventory(t *testing.T) {
 	p, srv := newTestPeer(t, g.URL, func(c *Config) {
 		c.Heartbeat, c.XorbCacheSize = time.Hour, int64(len(bodyA)+len(bodyB))
 	})
-	g.announce(t, 0)
+	g.Announce(t, 0)
 	pullAndSettle(t, p, srv, a, bodyA)
 	pullAndSettle(t, p, srv, b, bodyB)
-	g.findAnnounce(t, 1, func(x announced) bool { return hasAdd(x, b) && x.code == http.StatusOK })
-	n := g.announceCount()
+	g.FindAnnounce(t, 1, func(x clustertest.Announce) bool { return hasAdd(x, b) && x.Code == http.StatusOK })
+	n := len(g.Announces())
 	// The eviction of a is lost with this delta; the retry is a Full with the exact inventory.
 	mode.Store(1)
 	pullAndSettle(t, p, srv, c, bodyC)
-	lost := g.announce(t, n)
-	if lost.code != http.StatusInternalServerError || !hasAdd(lost, c) || !hasRemove(lost, a) {
-		t.Fatalf("lost delta = %d %+v", lost.code, lost.req)
+	lost := g.Announce(t, n)
+	if lost.Code != http.StatusInternalServerError || !hasAdd(lost, c) || !hasRemove(lost, a) {
+		t.Fatalf("lost delta = %d %+v", lost.Code, lost.Req)
 	}
 	p.mu.Lock()
 	p.kick()
 	p.mu.Unlock()
-	retry := g.announce(t, n+1)
-	if !retry.req.Full || !slices.Equal(retry.req.Add, hashes(b, c)) || len(retry.req.Remove) != 0 {
-		t.Fatalf("retry after the lost delta = %+v, want Full %v", retry.req, hashes(b, c))
+	retry := g.Announce(t, n+1)
+	if !retry.Req.Full || !slices.Equal(retry.Req.Add, hashes(b, c)) || len(retry.Req.Remove) != 0 {
+		t.Fatalf("retry after the lost delta = %+v, want Full %v", retry.Req, hashes(b, c))
 	}
 	// A resync demanded on a delta is answered with a Full at once.
 	mode.Store(2)
 	p.mu.Lock()
 	p.kick()
 	p.mu.Unlock()
-	demanded := g.announce(t, n+2)
-	if demanded.req.Full || len(demanded.req.Add)+len(demanded.req.Remove) != 0 {
-		t.Fatalf("heartbeat before the resync = %+v", demanded.req)
+	demanded := g.Announce(t, n+2)
+	if demanded.Req.Full || len(demanded.Req.Add)+len(demanded.Req.Remove) != 0 {
+		t.Fatalf("heartbeat before the resync = %+v", demanded.Req)
 	}
-	full := g.announce(t, n+3)
-	if !full.req.Full || !slices.Equal(full.req.Add, hashes(b, c)) || len(full.req.Remove) != 0 {
-		t.Fatalf("resync Full = %+v, want %v", full.req, hashes(b, c))
+	full := g.Announce(t, n+3)
+	if !full.Req.Full || !slices.Equal(full.Req.Add, hashes(b, c)) || len(full.Req.Remove) != 0 {
+		t.Fatalf("resync Full = %+v, want %v", full.Req, hashes(b, c))
 	}
-	if hasXorb(t, p, a) || !hasXorb(t, p, b) || !hasXorb(t, p, c) {
+	if clustertest.HasXorb(t, p.store, a) || !clustertest.HasXorb(t, p.store, b) || !clustertest.HasXorb(t, p.store, c) {
 		t.Fatal("store does not match the announced inventory")
 	}
 }
 
 func TestAnnounceNeverFollowsRedirects(t *testing.T) {
-	leak := newGateway(t, func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
-	g := newGateway(t, serveByHash(nil))
+	leak := clustertest.NewFakeGateway(t, func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
+	g := clustertest.NewFakeGateway(t, clustertest.ServeByHash(nil))
 	var redirects atomic.Int32
-	g.setReply(func(w http.ResponseWriter, _ *http.Request, _ apis.AnnounceRequest) (int, apis.AnnounceResponse) {
+	g.SetReply(func(w http.ResponseWriter, _ *http.Request, _ apis.AnnounceRequest) (int, apis.AnnounceResponse) {
 		if redirects.Add(1) == 1 {
 			w.Header().Set("Location", leak.URL+apis.AnnouncePath)
 			return http.StatusTemporaryRedirect, apis.AnnounceResponse{}
@@ -388,12 +370,12 @@ func TestAnnounceNeverFollowsRedirects(t *testing.T) {
 		return http.StatusOK, apis.AnnounceResponse{TTL: 30}
 	})
 	newTestPeer(t, g.URL, func(c *Config) { c.Heartbeat, c.Secret = 20*time.Millisecond, "s3cret" })
-	first := g.announce(t, 0)
-	second := g.announce(t, 1)
-	if first.code != http.StatusTemporaryRedirect || !second.req.Full || second.code != http.StatusOK {
-		t.Fatalf("announces = %d %+v, %d %+v", first.code, first.req, second.code, second.req)
+	first := g.Announce(t, 0)
+	second := g.Announce(t, 1)
+	if first.Code != http.StatusTemporaryRedirect || !second.Req.Full || second.Code != http.StatusOK {
+		t.Fatalf("announces = %d %+v, %d %+v", first.Code, first.Req, second.Code, second.Req)
 	}
-	if leak.gets.Load() != 0 || leak.announceCount() != 0 {
+	if len(leak.Requests()) != 0 || len(leak.Announces()) != 0 {
 		t.Fatal("redirect target received the secret-bearing announce")
 	}
 }
@@ -421,7 +403,7 @@ func TestAnnounceRejectsMalformedReply(t *testing.T) {
 	t.Cleanup(srv.Close)
 	newTestPeer(t, srv.URL, func(c *Config) { c.Heartbeat = 20 * time.Millisecond })
 	// Every malformed reply is a failure: the Full is resent until a clean ack.
-	clustertest.WaitFor(t, waitTimeout, "heartbeat after the ack", func() bool { return reqs.Load() >= int32(len(replies))+1 })
+	clustertest.WaitFor(t, clustertest.WaitTimeout, "heartbeat after the ack", func() bool { return reqs.Load() >= int32(len(replies))+1 })
 	if n := fulls.Load(); n != int32(len(replies)) {
 		t.Fatalf("Full announces = %d, want %d", n, len(replies))
 	}
@@ -429,11 +411,11 @@ func TestAnnounceRejectsMalformedReply(t *testing.T) {
 
 func TestMissingStoredObjectLeavesInventoryAndPullsAgain(t *testing.T) {
 	hash, body := clustertest.MakeXorb(t, 46, 2, 8<<10)
-	g := newGateway(t, serveBody(body))
+	g := clustertest.NewFakeGateway(t, clustertest.ServeBody(body))
 	p, srv := newTestPeer(t, g.URL, func(c *Config) { c.Heartbeat = time.Hour })
-	g.announce(t, 0)
+	g.Announce(t, 0)
 	pullAndSettle(t, p, srv, hash, body)
-	_, n := g.findAnnounce(t, 1, func(a announced) bool { return hasAdd(a, hash) })
+	_, n := g.FindAnnounce(t, 1, func(a clustertest.Announce) bool { return hasAdd(a, hash) })
 	// The stored file is lost underneath a live inventory entry.
 	if err := p.store.DeleteXorb(context.Background(), hash); err != nil {
 		t.Fatal(err)
@@ -444,24 +426,24 @@ func TestMissingStoredObjectLeavesInventoryAndPullsAgain(t *testing.T) {
 	if u := usage(p); u != 0 {
 		t.Fatalf("usage after the confirmed miss = %d, want 0", u)
 	}
-	if removed := g.announce(t, n+1); removed.req.Full || !slices.Equal(removed.req.Remove, hashes(hash)) || len(removed.req.Add) != 0 {
-		t.Fatalf("announce after the confirmed miss = %+v, want Remove %s", removed.req, hash)
+	if removed := g.Announce(t, n+1); removed.Req.Full || !slices.Equal(removed.Req.Remove, hashes(hash)) || len(removed.Req.Add) != 0 {
+		t.Fatalf("announce after the confirmed miss = %+v, want Remove %s", removed.Req, hash)
 	}
 	pullAndSettle(t, p, srv, hash, body)
-	if n := g.gets.Load(); n != 2 {
+	if n := len(g.Requests()); n != 2 {
 		t.Fatalf("gateway GETs = %d, want 2 (second pull)", n)
 	}
-	if u := usage(p); u != int64(len(body)) || !hasXorb(t, p, hash) {
-		t.Fatalf("usage after the second pull = %d, present %v", u, hasXorb(t, p, hash))
+	if u := usage(p); u != int64(len(body)) || !clustertest.HasXorb(t, p.store, hash) {
+		t.Fatalf("usage after the second pull = %d, present %v", u, clustertest.HasXorb(t, p.store, hash))
 	}
-	if added := g.announce(t, n+2); added.req.Full || !slices.Equal(added.req.Add, hashes(hash)) || len(added.req.Remove) != 0 {
-		t.Fatalf("announce after the second pull = %+v, want Add %s", added.req, hash)
+	if added := g.Announce(t, n+2); added.Req.Full || !slices.Equal(added.Req.Add, hashes(hash)) || len(added.Req.Remove) != 0 {
+		t.Fatalf("announce after the second pull = %+v, want Add %s", added.Req, hash)
 	}
 }
 
 func TestPullRestoresMissingStoredObject(t *testing.T) {
 	hash, body := clustertest.MakeXorb(t, 49, 2, 8<<10)
-	gateway := newGateway(t, serveBody(body))
+	gateway := clustertest.NewFakeGateway(t, clustertest.ServeBody(body))
 	seed, _ := newTestPeer(t, gateway.URL, nil)
 	commitDirect(t, seed, hash, body)
 	if err := seed.store.DeleteXorb(context.Background(), hash); err != nil {
@@ -474,16 +456,16 @@ func TestPullRestoresMissingStoredObject(t *testing.T) {
 	if response.Code != http.StatusAccepted {
 		t.Fatalf("pull status = %d, want %d", response.Code, http.StatusAccepted)
 	}
-	clustertest.WaitFor(t, waitTimeout, "pull of the missing object", func() bool { return gateway.gets.Load() == 1 })
+	clustertest.WaitFor(t, clustertest.WaitTimeout, "pull of the missing object", func() bool { return len(gateway.Requests()) == 1 })
 	settled(t, seed)
-	if !hasXorb(t, seed, hash) {
+	if !clustertest.HasXorb(t, seed.store, hash) {
 		t.Fatal("accepted pull did not restore the missing object")
 	}
 }
 
 func TestStaleReaderDoesNotTouchNewerGeneration(t *testing.T) {
 	hash, body := clustertest.MakeXorb(t, 47, 2, 8<<10)
-	g := newGateway(t, serveByHash(nil))
+	g := clustertest.NewFakeGateway(t, clustertest.ServeByHash(nil))
 	p, _ := newTestPeer(t, g.URL, func(c *Config) { c.Heartbeat = time.Hour })
 	commitDirect(t, p, hash, body)
 	req := httptest.NewRequest(http.MethodGet, "/v1/xorbs/default/"+hash.String(), nil)
@@ -528,10 +510,10 @@ func TestStaleReaderDoesNotTouchNewerGeneration(t *testing.T) {
 // A stale reader confirming a miss on a replaced generation neither drops the replacement nor wakes the announcer (pins drop's identity check).
 func TestStaleDropDoesNotAnnounce(t *testing.T) {
 	hash, body := clustertest.MakeXorb(t, 72, 2, 8<<10)
-	g := newGateway(t, serveByHash(nil))
+	g := clustertest.NewFakeGateway(t, clustertest.ServeByHash(nil))
 	p, _ := newTestPeer(t, g.URL, func(c *Config) { c.Heartbeat = time.Hour })
 	commitDirect(t, p, hash, body)
-	_, i := g.findAnnounce(t, 0, func(x announced) bool { return hasAdd(x, hash) })
+	_, i := g.FindAnnounce(t, 0, func(x clustertest.Announce) bool { return hasAdd(x, hash) })
 	req := httptest.NewRequest(http.MethodGet, "/v1/xorbs/default/"+hash.String(), nil)
 	first, second := p.pin(hash), p.pin(hash)
 	if first == nil || second == nil {
@@ -541,14 +523,14 @@ func TestStaleDropDoesNotAnnounce(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = p.serveStored(httptest.NewRecorder(), req, first) // confirms the miss: drops the first generation and announces it
-	_, j := g.findAnnounce(t, i+1, func(x announced) bool { return hasRemove(x, hash) })
+	_, j := g.FindAnnounce(t, i+1, func(x clustertest.Announce) bool { return hasRemove(x, hash) })
 	commitDirect(t, p, hash, body)
-	g.findAnnounce(t, j+1, func(x announced) bool { return hasAdd(x, hash) })
-	n := g.announceCount()
+	g.FindAnnounce(t, j+1, func(x clustertest.Announce) bool { return hasAdd(x, hash) })
+	n := len(g.Announces())
 	p.drop(second)
 	p.unpin(second)
 	time.Sleep(150 * time.Millisecond)
-	if got := g.announceCount(); got != n {
+	if got := len(g.Announces()); got != n {
 		t.Fatalf("stale drop woke the announcer: %d announces, want %d", got, n)
 	}
 	rd := p.pin(hash)
@@ -563,7 +545,7 @@ func TestUnreadableStoredObjectIsNotDropped(t *testing.T) {
 		t.Skip("root ignores file modes")
 	}
 	hash, body := clustertest.MakeXorb(t, 48, 2, 8<<10)
-	g := newGateway(t, serveByHash(nil))
+	g := clustertest.NewFakeGateway(t, clustertest.ServeByHash(nil))
 	p, srv := newTestPeer(t, g.URL, func(c *Config) { c.Heartbeat = time.Hour })
 	commitDirect(t, p, hash, body)
 	path := xorbPath(p.cfg.CacheDir, hash)
@@ -575,8 +557,8 @@ func TestUnreadableStoredObjectIsNotDropped(t *testing.T) {
 	if resp, _, _ := do(t, http.MethodGet, xorbURL(srv, hash)); resp.StatusCode != http.StatusInternalServerError {
 		t.Fatalf("GET of an unreadable object = %d", resp.StatusCode)
 	}
-	if usage(p) != int64(len(body)) || g.gets.Load() != 0 {
-		t.Fatalf("usage = %d, gateway GETs = %d", usage(p), g.gets.Load())
+	if usage(p) != int64(len(body)) || len(g.Requests()) != 0 {
+		t.Fatalf("usage = %d, gateway GETs = %d", usage(p), len(g.Requests()))
 	}
 	if err := os.Chmod(path, 0o644); err != nil {
 		t.Fatal(err)
@@ -590,7 +572,7 @@ func TestUnreadableStoredObjectIsNotDropped(t *testing.T) {
 func TestReadyDecisionSurvivesEviction(t *testing.T) {
 	a, bodyA := clustertest.MakeXorb(t, 49, 2, 8<<10)
 	b, bodyB := clustertest.MakeXorb(t, 50, 2, 8<<10)
-	g := newGateway(t, serveByHash(nil))
+	g := clustertest.NewFakeGateway(t, clustertest.ServeByHash(nil))
 	p, _ := newTestPeer(t, g.URL, func(c *Config) {
 		c.Heartbeat, c.XorbCacheSize = time.Hour, int64(len(bodyA)+len(bodyB)/2)
 	})
@@ -601,7 +583,7 @@ func TestReadyDecisionSurvivesEviction(t *testing.T) {
 		t.Fatalf("acquire = %v, %v, %v, want a reserved ready", f, rd, err)
 	}
 	commitDirect(t, p, b, bodyB)
-	if !hasXorb(t, p, a) {
+	if !clustertest.HasXorb(t, p.store, a) {
 		t.Fatal("ready object evicted between the decision and the read")
 	}
 	req := httptest.NewRequest(http.MethodGet, "/v1/xorbs/default/"+a.String(), nil)
@@ -613,8 +595,8 @@ func TestReadyDecisionSurvivesEviction(t *testing.T) {
 	p.mu.Lock()
 	u, pins := p.xorbs.Usage(), rd.V.pins
 	p.mu.Unlock()
-	if u > p.cfg.XorbCacheSize || pins != 0 || g.gets.Load() != 0 {
-		t.Fatalf("after release: usage %d, pins %d, gateway GETs %d", u, pins, g.gets.Load())
+	if u > p.cfg.XorbCacheSize || pins != 0 || len(g.Requests()) != 0 {
+		t.Fatalf("after release: usage %d, pins %d, gateway GETs %d", u, pins, len(g.Requests()))
 	}
 }
 
@@ -622,7 +604,7 @@ func TestLRUEvictsLeastRecentlyUsed(t *testing.T) {
 	a, bodyA := clustertest.MakeXorb(t, 30, 2, 8<<10)
 	b, bodyB := clustertest.MakeXorb(t, 31, 2, 8<<10)
 	c, bodyC := clustertest.MakeXorb(t, 32, 2, 8<<10)
-	g := newGateway(t, serveByHash(map[xet.XorbHash][]byte{a: bodyA, b: bodyB, c: bodyC}))
+	g := clustertest.NewFakeGateway(t, clustertest.ServeByHash(map[xet.XorbHash][]byte{a: bodyA, b: bodyB, c: bodyC}))
 	p, srv := newTestPeer(t, g.URL, func(cfg *Config) {
 		cfg.Heartbeat, cfg.XorbCacheSize = time.Hour, int64(len(bodyA)+len(bodyB))
 	})
@@ -631,22 +613,22 @@ func TestLRUEvictsLeastRecentlyUsed(t *testing.T) {
 	// Reading a makes b the eviction candidate.
 	pullAndSettle(t, p, srv, a, bodyA)
 	pullAndSettle(t, p, srv, c, bodyC)
-	if hasXorb(t, p, b) || !hasXorb(t, p, a) || !hasXorb(t, p, c) {
+	if clustertest.HasXorb(t, p.store, b) || !clustertest.HasXorb(t, p.store, a) || !clustertest.HasXorb(t, p.store, c) {
 		t.Fatal("expected b evicted, a and c kept")
 	}
 	if u := usage(p); u != int64(len(bodyA)+len(bodyC)) {
 		t.Fatalf("usage = %d", u)
 	}
-	removed, _ := g.findAnnounce(t, 1, func(x announced) bool { return hasRemove(x, b) })
-	if removed.req.Full || !slices.Equal(removed.req.Add, hashes(c)) || !slices.Equal(removed.req.Remove, hashes(b)) {
-		t.Fatalf("eviction delta = %+v", removed.req)
+	removed, _ := g.FindAnnounce(t, 1, func(x clustertest.Announce) bool { return hasRemove(x, b) })
+	if removed.Req.Full || !slices.Equal(removed.Req.Add, hashes(c)) || !slices.Equal(removed.Req.Remove, hashes(b)) {
+		t.Fatalf("eviction delta = %+v", removed.Req)
 	}
-	if n := g.gets.Load(); n != 3 {
+	if n := len(g.Requests()); n != 3 {
 		t.Fatalf("gateway GETs = %d, want 3", n)
 	}
 	// A GET for the evicted object pulls again instead of trusting stale state.
 	pullAndSettle(t, p, srv, b, bodyB)
-	if hasXorb(t, p, a) || !hasXorb(t, p, b) || !hasXorb(t, p, c) {
+	if clustertest.HasXorb(t, p.store, a) || !clustertest.HasXorb(t, p.store, b) || !clustertest.HasXorb(t, p.store, c) {
 		t.Fatal("expected a evicted after pulling b again")
 	}
 }
@@ -654,7 +636,7 @@ func TestLRUEvictsLeastRecentlyUsed(t *testing.T) {
 func TestLRUProtectsActiveReadersAndConvergesOnRelease(t *testing.T) {
 	a, bodyA := clustertest.MakeXorb(t, 33, 2, 8<<10)
 	b, bodyB := clustertest.MakeXorb(t, 34, 2, 8<<10)
-	g := newGateway(t, serveByHash(map[xet.XorbHash][]byte{a: bodyA, b: bodyB}))
+	g := clustertest.NewFakeGateway(t, clustertest.ServeByHash(map[xet.XorbHash][]byte{a: bodyA, b: bodyB}))
 	p, srv := newTestPeer(t, g.URL, func(cfg *Config) {
 		cfg.Heartbeat, cfg.XorbCacheSize = time.Hour, int64(len(bodyA)+len(bodyB)/2)
 	})
@@ -663,52 +645,52 @@ func TestLRUProtectsActiveReadersAndConvergesOnRelease(t *testing.T) {
 	wa, doneA := serveHeld(t, p, a)
 	wb, doneB := serveHeld(t, p, b)
 	// The pull leaves p.pulls under the lock that admits b; the store file lands earlier.
-	clustertest.WaitFor(t, waitTimeout, "b commit", func() bool {
+	clustertest.WaitFor(t, clustertest.WaitTimeout, "b commit", func() bool {
 		p.mu.Lock()
 		defer p.mu.Unlock()
 		return p.pulls[b] == nil
 	})
-	if !hasXorb(t, p, a) || usage(p) != int64(len(bodyA)+len(bodyB)) {
+	if !clustertest.HasXorb(t, p.store, a) || usage(p) != int64(len(bodyA)+len(bodyB)) {
 		t.Fatal("object with an active reader was evicted")
 	}
 	finishHeld(t, wa, doneA, bodyA)
-	clustertest.WaitFor(t, waitTimeout, "a evicted on release", func() bool { return !hasXorb(t, p, a) })
-	if !hasXorb(t, p, b) {
+	clustertest.WaitFor(t, clustertest.WaitTimeout, "a evicted on release", func() bool { return !clustertest.HasXorb(t, p.store, a) })
+	if !clustertest.HasXorb(t, p.store, b) {
 		t.Fatal("streamed object evicted while its reader was attached")
 	}
 	finishHeld(t, wb, doneB, bodyB)
 	settled(t, p)
-	if !hasXorb(t, p, b) || usage(p) != int64(len(bodyB)) {
-		t.Fatalf("final usage = %d, b present %v", usage(p), hasXorb(t, p, b))
+	if !clustertest.HasXorb(t, p.store, b) || usage(p) != int64(len(bodyB)) {
+		t.Fatalf("final usage = %d, b present %v", usage(p), clustertest.HasXorb(t, p.store, b))
 	}
-	if n := g.gets.Load(); n != 2 {
+	if n := len(g.Requests()); n != 2 {
 		t.Fatalf("gateway GETs = %d, want 2", n)
 	}
 }
 
 func TestOversizedObjectServedThenEvicted(t *testing.T) {
 	hash, body := clustertest.MakeXorb(t, 35, 2, 8<<10)
-	g := newGateway(t, serveBody(body))
+	g := clustertest.NewFakeGateway(t, clustertest.ServeBody(body))
 	var resync atomic.Bool
-	g.setReply(func(_ http.ResponseWriter, _ *http.Request, _ apis.AnnounceRequest) (int, apis.AnnounceResponse) {
+	g.SetReply(func(_ http.ResponseWriter, _ *http.Request, _ apis.AnnounceRequest) (int, apis.AnnounceResponse) {
 		return http.StatusOK, apis.AnnounceResponse{Resync: resync.Swap(false), TTL: 30}
 	})
 	p, srv := newTestPeer(t, g.URL, func(c *Config) {
 		c.Heartbeat, c.XorbCacheSize = 20*time.Millisecond, int64(len(body)/2)
 	})
 	pullAndSettle(t, p, srv, hash, body)
-	if hasXorb(t, p, hash) || usage(p) != 0 {
+	if clustertest.HasXorb(t, p.store, hash) || usage(p) != 0 {
 		t.Fatalf("oversized object kept, usage %d", usage(p))
 	}
-	n := g.announceCount()
+	n := len(g.Announces())
 	resync.Store(true)
-	full, _ := g.findAnnounce(t, n+1, func(x announced) bool { return x.req.Full })
-	if len(full.req.Add) != 0 {
-		t.Fatalf("Full after eviction = %+v", full.req)
+	full, _ := g.FindAnnounce(t, n+1, func(x clustertest.Announce) bool { return x.Req.Full })
+	if len(full.Req.Add) != 0 {
+		t.Fatalf("Full after eviction = %+v", full.Req)
 	}
 	// Repeated demand pulls again each time; no pull is left behind.
 	pullAndSettle(t, p, srv, hash, body)
-	if n := g.gets.Load(); n != 2 {
+	if n := len(g.Requests()); n != 2 {
 		t.Fatalf("gateway GETs = %d, want 2", n)
 	}
 }
@@ -730,36 +712,36 @@ func TestRestartRebuildsUsageAndOrder(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	g := newGateway(t, serveByHash(map[xet.XorbHash][]byte{d: bodyD}))
+	g := clustertest.NewFakeGateway(t, clustertest.ServeByHash(map[xet.XorbHash][]byte{d: bodyD}))
 	p, srv := newTestPeer(t, g.URL, func(cfg *Config) {
 		cfg.CacheDir, cfg.Heartbeat, cfg.XorbCacheSize = dir, time.Hour, int64(len(bodyA)+len(bodyC))
 	})
 	// Oldest by mtime goes first at startup, and the Full matches what survived.
-	if got := g.announce(t, 0).req; !got.Full || !slices.Equal(got.Add, hashes(a, c)) {
+	if got := g.Announce(t, 0).Req; !got.Full || !slices.Equal(got.Add, hashes(a, c)) {
 		t.Fatalf("startup Full = %+v, want %v", got, hashes(a, c))
 	}
-	if hasXorb(t, p, b) || usage(p) != int64(len(bodyA)+len(bodyC)) {
-		t.Fatalf("startup eviction: b present %v, usage %d", hasXorb(t, p, b), usage(p))
+	if clustertest.HasXorb(t, p.store, b) || usage(p) != int64(len(bodyA)+len(bodyC)) {
+		t.Fatalf("startup eviction: b present %v, usage %d", clustertest.HasXorb(t, p.store, b), usage(p))
 	}
 	pullAndSettle(t, p, srv, d, bodyD)
-	if hasXorb(t, p, c) || !hasXorb(t, p, a) || !hasXorb(t, p, d) {
+	if clustertest.HasXorb(t, p.store, c) || !clustertest.HasXorb(t, p.store, a) || !clustertest.HasXorb(t, p.store, d) {
 		t.Fatal("expected c evicted next, a and d kept")
 	}
 }
 
 func TestCloseCancelsHungAnnounceAndPull(t *testing.T) {
 	hash, body := clustertest.MakeXorb(t, 40, 4, 16<<10)
-	g := newGateway(t, gatedBody(body, 4<<10, make(chan struct{})))
+	g := clustertest.NewFakeGateway(t, clustertest.GatedBody(body, 4<<10, make(chan struct{})))
 	unblocked := make(chan struct{})
-	g.setReply(func(_ http.ResponseWriter, r *http.Request, _ apis.AnnounceRequest) (int, apis.AnnounceResponse) {
+	g.SetReply(func(_ http.ResponseWriter, r *http.Request, _ apis.AnnounceRequest) (int, apis.AnnounceResponse) {
 		<-r.Context().Done()
 		close(unblocked)
 		return http.StatusOK, apis.AnnounceResponse{TTL: 30}
 	})
 	p, srv := newTestPeer(t, g.URL, func(c *Config) { c.Heartbeat = time.Hour })
-	g.announce(t, 0)
+	g.Announce(t, 0)
 	late := doAsync(t, xorbURL(srv, hash))
-	clustertest.WaitFor(t, waitTimeout, "pull start", func() bool { return g.gets.Load() == 1 })
+	clustertest.WaitFor(t, clustertest.WaitTimeout, "pull start", func() bool { return len(g.Requests()) == 1 })
 	closed := make(chan error, 1)
 	go func() { closed <- p.Close() }()
 	select {
@@ -779,10 +761,10 @@ func TestCloseCancelsHungAnnounceAndPull(t *testing.T) {
 	if r := <-late; r.err == nil && r.resp.StatusCode == http.StatusOK {
 		t.Fatal("reader completed after Close")
 	}
-	if hasXorb(t, p, hash) {
+	if clustertest.HasXorb(t, p.store, hash) {
 		t.Fatal("canceled pull published the xorb")
 	}
-	if n := g.announceCount(); n != 1 {
+	if n := len(g.Announces()); n != 1 {
 		t.Fatalf("announces after Close = %d, want 1", n)
 	}
 	// Reader release after shutdown must neither block nor panic.

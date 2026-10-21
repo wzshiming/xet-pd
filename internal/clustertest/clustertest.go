@@ -3,6 +3,7 @@ package clustertest
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -30,6 +31,19 @@ func RandomData(seed byte, n int) []byte {
 	_, _ = rand.NewChaCha8([32]byte{seed}).Read(b)
 	return b
 }
+
+// RandomChunks splits RandomData(seed, n*size) into n chunks of size bytes.
+func RandomChunks(seed byte, n, size int) [][]byte {
+	data := RandomData(seed, n*size)
+	chunks := make([][]byte, n)
+	for i := range chunks {
+		chunks[i] = data[i*size : (i+1)*size : (i+1)*size]
+	}
+	return chunks
+}
+
+// WaitTimeout bounds the waits of in-process tests.
+const WaitTimeout = 5 * time.Second
 
 // WaitFor polls cond until it holds and fails the test once timeout has passed.
 func WaitFor(t testing.TB, timeout time.Duration, what string, cond func() bool) {
@@ -66,17 +80,24 @@ func Diag(t testing.TB, origin string) apis.PeersResponse {
 	return d
 }
 
-// MakeXorb packs deterministic incompressible chunks with the real encoder.
-func MakeXorb(t testing.TB, seed byte, chunks, chunkSize int) (xet.XorbHash, []byte) {
+// HasXorb reports whether s stores h and fails the test when the lookup fails.
+func HasXorb(t testing.TB, s interface {
+	HasXorb(context.Context, xet.XorbHash) (bool, error)
+}, h xet.XorbHash) bool {
+	t.Helper()
+	ok, err := s.HasXorb(context.Background(), h)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ok
+}
+
+// PackXorb packs chunks with the real encoder, which picks the smallest encoding per chunk.
+func PackXorb(t testing.TB, chunks [][]byte) (xet.XorbHash, []byte) {
 	t.Helper()
 	var buf bytes.Buffer
 	enc := xorb.NewEncoder(&buf, true)
-	rng := rand.NewChaCha8([32]byte{seed})
-	chunk := make([]byte, chunkSize)
-	for range chunks {
-		if _, err := rng.Read(chunk); err != nil {
-			t.Fatal(err)
-		}
+	for _, chunk := range chunks {
 		if _, err := enc.Write(chunk); err != nil {
 			t.Fatal(err)
 		}
@@ -85,4 +106,10 @@ func MakeXorb(t testing.TB, seed byte, chunks, chunkSize int) (xet.XorbHash, []b
 		t.Fatal(err)
 	}
 	return enc.SummoryHash(), buf.Bytes()
+}
+
+// MakeXorb packs deterministic incompressible chunks with the real encoder.
+func MakeXorb(t testing.TB, seed byte, chunks, chunkSize int) (xet.XorbHash, []byte) {
+	t.Helper()
+	return PackXorb(t, RandomChunks(seed, chunks, chunkSize))
 }

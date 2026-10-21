@@ -90,7 +90,7 @@ func request(t *testing.T, method, url, body string, hdr ...string) (*http.Respo
 func waitReady(t *testing.T, resolveURL string) *http.Response {
 	t.Helper()
 	var resp *http.Response
-	clustertest.WaitFor(t, waitTimeout, "ingest ready", func() bool {
+	clustertest.WaitFor(t, clustertest.WaitTimeout, "ingest ready", func() bool {
 		resp, _ = request(t, http.MethodHead, resolveURL, "")
 		return resp.Header.Get("X-Xet-Hash") != ""
 	})
@@ -338,7 +338,7 @@ func TestGatewayIntegration(t *testing.T) {
 		}
 		return out
 	}
-	clustertest.WaitFor(t, waitTimeout, "peers registered", func() bool { return len(clustertest.Diag(t, srv.URL).Peers) == 2 })
+	clustertest.WaitFor(t, clustertest.WaitTimeout, "peers registered", func() bool { return len(clustertest.Diag(t, srv.URL).Peers) == 2 })
 	for _, addr := range addrs {
 		if !strings.Contains(strings.Join(peerURLs(clustertest.Diag(t, srv.URL)), " "), "http://"+addr) {
 			t.Fatalf("peer %s missing from %v", addr, peerURLs(clustertest.Diag(t, srv.URL)))
@@ -376,7 +376,7 @@ func TestGatewayIntegration(t *testing.T) {
 		}
 		return true
 	}
-	clustertest.WaitFor(t, waitTimeout, "seeds hold the xorb", func() bool { return seeded(clustertest.Diag(t, srv.URL)) })
+	clustertest.WaitFor(t, clustertest.WaitTimeout, "seeds hold the xorb", func() bool { return seeded(clustertest.Diag(t, srv.URL)) })
 	if d := clustertest.Diag(t, srv.URL); d.XorbGets != (apis.XorbGets{Peer: 2}) {
 		t.Fatalf("xorb gets after seeding = %+v", d.XorbGets)
 	}
@@ -460,7 +460,7 @@ func TestGatewayIntegration(t *testing.T) {
 		stop()
 		startPeer(t, srv.URL, secret, addrs[i])
 	}
-	clustertest.WaitFor(t, waitTimeout, "seeds re-registered empty", func() bool {
+	clustertest.WaitFor(t, clustertest.WaitTimeout, "seeds re-registered empty", func() bool {
 		d := clustertest.Diag(t, srv.URL)
 		if len(d.Peers) != 2 {
 			return false
@@ -487,7 +487,7 @@ func TestGatewayIntegration(t *testing.T) {
 	if gets, n := hub.CDN(); gets != 2 || n != 2*int64(len(data)) {
 		t.Fatalf("hub CDN after re-ingest = %d gets, %d bytes", gets, n)
 	}
-	clustertest.WaitFor(t, waitTimeout, "seeds hold the xorb again", func() bool { return seeded(clustertest.Diag(t, srv.URL)) })
+	clustertest.WaitFor(t, clustertest.WaitTimeout, "seeds hold the xorb again", func() bool { return seeded(clustertest.Diag(t, srv.URL)) })
 	download()
 	if gets, _ := hub.CDN(); gets != 2 {
 		t.Fatalf("hub CDN gets after second xet download = %d, want 2", gets)

@@ -178,6 +178,7 @@ func TestConfigValidation(t *testing.T) {
 		"advertise credentials": func(c *Config) { c.Advertise = "http://bob:hunter2@seed/%zz" },
 		"negative max pulls":    func(c *Config) { c.MaxPulls = -1 },
 		"negative timeout":      func(c *Config) { c.PullTimeout = -time.Second },
+		"negative cooldown":     func(c *Config) { c.FailureCooldown = -time.Second },
 		"negative heartbeat":    func(c *Config) { c.Heartbeat = -time.Second },
 		"negative cache size":   func(c *Config) { c.XorbCacheSize = -1 },
 	}
@@ -200,7 +201,7 @@ func TestConfigValidation(t *testing.T) {
 	if p.cfg.Advertise != "http://seed:8080" || p.cfg.Gateway != "https://gw.example" {
 		t.Fatalf("normalized URLs = %q %q", p.cfg.Advertise, p.cfg.Gateway)
 	}
-	if p.cfg.MaxPulls != 8 || p.cfg.PullTimeout != 10*time.Minute || p.cfg.Heartbeat != 10*time.Second {
+	if p.cfg.MaxPulls != 8 || p.cfg.PullTimeout != 10*time.Minute || p.cfg.Heartbeat != 10*time.Second || p.cfg.FailureCooldown != 15*time.Second {
 		t.Fatalf("defaults = %+v", p.cfg)
 	}
 	if tr := p.client.Transport.(*http.Transport); tr.MaxIdleConnsPerHost != p.cfg.MaxPulls+1 || p.control.Transport != p.client.Transport {

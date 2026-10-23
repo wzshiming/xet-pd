@@ -18,6 +18,7 @@ import (
 	"path/filepath"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/wzshiming/xet"
@@ -29,14 +30,15 @@ import (
 )
 
 type Config struct {
-	Advertise     string        // public origin of this peer, scheme://host[:port]
-	Gateway       string        // upstream gateway origin
-	CacheDir      string        // data directory: xorbs/ committed objects, spool/ in-flight pulls
-	XorbCacheSize int64         // bytes of committed xorbs to keep, 0 unlimited; spools are extra
-	MaxPulls      int           // parallel pulls from the gateway, default 8
-	PullTimeout   time.Duration // per pull including queueing, default 10m
-	Heartbeat     time.Duration // announce interval, default 10s
-	Secret        string        // optional bearer token shared with the gateway for pull and announce
+	Advertise       string        // public origin of this peer, scheme://host[:port]
+	Gateway         string        // upstream gateway origin
+	CacheDir        string        // data directory: xorbs/ committed objects, spool/ in-flight pulls
+	XorbCacheSize   int64         // bytes of committed xorbs to keep, 0 unlimited; spools are extra
+	MaxPulls        int           // parallel pulls from the gateway, default 8
+	PullTimeout     time.Duration // per pull including queueing, default 10m
+	FailureCooldown time.Duration // pause before a failed pull may be retried, default 15s
+	Heartbeat       time.Duration // announce interval, default 10s
+	Secret          string        // optional bearer token shared with the gateway for pull and announce
 }
 
 const (
@@ -61,6 +63,8 @@ type Peer struct {
 	sem    chan struct{} // bounds parallel upstream pulls
 	once   sync.Once
 
+	announced atomic.Bool
+
 	mu        sync.Mutex // guards pulls, cooldown, the inventory, unchecked and cancel-vs-acquire
 	pulls     map[xet.XorbHash]*pull
 	cooldown  map[xet.XorbHash]cooled
@@ -79,11 +83,12 @@ func New(cfg Config) (*Peer, error) {
 	if cfg.CacheDir == "" {
 		return nil, errors.New("cache dir is required")
 	}
-	if cfg.XorbCacheSize < 0 || cfg.MaxPulls < 0 || cfg.PullTimeout < 0 || cfg.Heartbeat < 0 {
+	if cfg.XorbCacheSize < 0 || cfg.MaxPulls < 0 || cfg.PullTimeout < 0 || cfg.FailureCooldown < 0 || cfg.Heartbeat < 0 {
 		return nil, errors.New("negative config value")
 	}
 	cfg.MaxPulls = cmp.Or(cfg.MaxPulls, 8)
 	cfg.PullTimeout = cmp.Or(cfg.PullTimeout, 10*time.Minute)
+	cfg.FailureCooldown = cmp.Or(cfg.FailureCooldown, 15*time.Second)
 	cfg.Heartbeat = cmp.Or(cfg.Heartbeat, 10*time.Second)
 	store, err := local.NewStorage(local.WithBasePath(cfg.CacheDir))
 	if err != nil {
@@ -142,8 +147,10 @@ func New(cfg Config) (*Peer, error) {
 		var acked map[string]struct{} // inventory the gateway confirmed
 		full := true                  // next request carries the whole inventory
 		var failed, warned bool
-		tick := time.NewTicker(p.cfg.Heartbeat)
-		defer tick.Stop()
+		delay := p.cfg.Heartbeat
+		var lastTTL int64
+		timer := time.NewTimer(delay)
+		defer timer.Stop()
 		for {
 			wasFull := full
 			p.mu.Lock()
@@ -181,14 +188,28 @@ func New(cfg Config) (*Peer, error) {
 				_ = resp.Body.Close()
 			}
 			cancel()
+			p.announced.Store(err == nil)
 			if err != nil {
 				if !failed {
 					slog.Warn("peer: announce", "err", err)
+				} else {
+					ceiling := 4 * p.cfg.Heartbeat
+					if lastTTL > 0 {
+						// A recovered gateway hears from the peer within half its TTL.
+						ceiling = max(p.cfg.Heartbeat, time.Duration(lastTTL)*time.Second/2)
+					}
+					delay = min(2*delay, ceiling)
 				}
 				// The gateway may have applied this request, so only a Full can resync it.
 				failed, full = true, true
 			} else {
-				failed = false
+				if failed {
+					slog.Info("peer: announce recovered")
+				}
+				failed, delay = false, p.cfg.Heartbeat
+				if out.TTL > 0 {
+					lastTTL = out.TTL
+				}
 				acked, full = snap, out.Resync
 				if !warned && out.TTL > 0 && p.cfg.Heartbeat >= time.Duration(out.TTL)*time.Second {
 					slog.Warn("peer: heartbeat not shorter than gateway TTL", "heartbeat", p.cfg.Heartbeat, "ttl", out.TTL)
@@ -199,10 +220,11 @@ func New(cfg Config) (*Peer, error) {
 					continue
 				}
 			}
+			timer.Reset(delay)
 			select {
 			case <-p.ctx.Done():
 				return
-			case <-tick.C:
+			case <-timer.C:
 			case <-p.wake:
 			}
 		}
@@ -210,6 +232,7 @@ func New(cfg Config) (*Peer, error) {
 	p.mux.HandleFunc("GET /v1/xorbs/{prefix}/{hash}", p.serveXorb)
 	p.mux.HandleFunc("POST "+apis.PullPath, p.servePull)
 	p.mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
+	p.mux.HandleFunc("GET /readyz", p.serveReady)
 	return p, nil
 }
 
@@ -222,6 +245,22 @@ func (p *Peer) Validated() bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return len(p.unchecked) == 0
+}
+
+// Announced reports whether the latest completed announce was acknowledged by the gateway.
+func (p *Peer) Announced() bool {
+	return p.announced.Load()
+}
+
+func (p *Peer) serveReady(w http.ResponseWriter, _ *http.Request) {
+	switch {
+	case !p.Validated():
+		http.Error(w, "validating cached xorbs", http.StatusServiceUnavailable)
+	case !p.Announced():
+		http.Error(w, "gateway has not acknowledged an announce", http.StatusServiceUnavailable)
+	default:
+		w.WriteHeader(http.StatusOK)
+	}
 }
 
 // Close stops the announcer and the startup validation, cancels in-flight pulls, waits for them and drops idle upstream connections.

@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/wzshiming/xet"
@@ -25,14 +26,12 @@ const pullTimeout = 2 * time.Second
 type stagingConfig struct {
 	replicas  int           // seeds asked to pull each local xorb
 	minSeeds  int           // live holders required before a local copy may be evicted
+	maxPulls  int           // parallel pull requests to seeds, default 8
 	cacheSize int64         // soft cap on local xorb bytes, 0 unlimited
 	secret    string        // bearer token of control requests; never sent on data requests
 	retry     time.Duration // pause per (xorb, seed) after a pull request, default 1m
 	tick      time.Duration // maintenance period besides wakes, default 1s
 }
-
-// maxPulls bounds parallel pull requests.
-const maxPulls = 8
 
 // staged is the seeding state of one durable local xorb.
 type staged struct {
@@ -52,6 +51,9 @@ type staging struct {
 	wg     sync.WaitGroup
 	once   sync.Once
 
+	pullsSent, pullsAccepted, pullsFailed atomic.Uint64
+	evictions, evictedBytes               atomic.Uint64 // added under mu with the removal, so a zero snapshot implies them
+
 	mu     sync.Mutex                      // guards the fields below; never held across registry, store or network calls
 	xorbs  lru.Index[xet.XorbHash, staged] // local copies
 	warned bool                            // over the cap with nothing evictable, logged once until it clears
@@ -59,6 +61,7 @@ type staging struct {
 
 // newStaging indexes the store's local xorbs and hooks the store; call before the store is shared.
 func newStaging(st *store, cfg stagingConfig) (*staging, error) {
+	cfg.maxPulls = cmp.Or(cfg.maxPulls, 8)
 	cfg.retry = cmp.Or(cfg.retry, time.Minute)
 	cfg.tick = cmp.Or(cfg.tick, time.Second)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -66,9 +69,9 @@ func newStaging(st *store, cfg stagingConfig) (*staging, error) {
 		cfg:    cfg,
 		st:     st,
 		reg:    st.reg,
-		client: apis.NewClient(apis.NewTransport(maxPulls)),
+		client: apis.NewClient(apis.NewTransport(cfg.maxPulls)),
 		wake:   make(chan struct{}, 1),
-		sem:    make(chan struct{}, maxPulls),
+		sem:    make(chan struct{}, cfg.maxPulls),
 		ctx:    ctx,
 		cancel: cancel,
 	}
@@ -120,6 +123,8 @@ func newStaging(st *store, cfg stagingConfig) (*staging, error) {
 							skipErr = err
 						} else {
 							m.xorbs.Remove(e) // a copy re-inserted meanwhile is a new entry and stays
+							m.evictions.Add(1)
+							m.evictedBytes.Add(uint64(e.Size))
 							if over = m.xorbs.Usage() > m.cfg.cacheSize; !over {
 								m.warned = false
 							}
@@ -180,6 +185,7 @@ func newStaging(st *store, cfg stagingConfig) (*staging, error) {
 					defer m.kick()
 					defer func() { <-m.sem }()
 					ctx, cancel := context.WithTimeout(m.ctx, pullTimeout)
+					m.pullsSent.Add(1)
 					resp, err := apis.PostJSON(ctx, m.client, p.URL+apis.PullPath, m.cfg.secret, apis.PullRequest{Hash: hash.String()})
 					if err == nil {
 						_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
@@ -189,7 +195,12 @@ func newStaging(st *store, cfg stagingConfig) (*staging, error) {
 						}
 					}
 					cancel()
-					if err != nil && m.ctx.Err() == nil {
+					if err == nil {
+						m.pullsAccepted.Add(1)
+						return
+					}
+					m.pullsFailed.Add(1)
+					if m.ctx.Err() == nil {
 						slog.Warn("gateway: pull request", "peer", p.ID, "hash", hash, "err", err)
 					}
 				}(a.p, a.hash)

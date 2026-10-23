@@ -101,11 +101,21 @@ func (s *seed) answer(status int, redirect string) {
 	s.status, s.redirect = status, redirect
 }
 
-// hang makes every following request wait until its client gives up.
+// hang holds every following pull request until release or its client gives up.
 func (s *seed) hang() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.block = make(chan struct{})
+}
+
+// release answers the requests hang holds and lets later ones through.
+func (s *seed) release() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.block != nil {
+		close(s.block)
+		s.block = nil
+	}
 }
 
 func (s *seed) cancellations() int {
@@ -162,8 +172,8 @@ func TestPutSeedsReplicasOnce(t *testing.T) {
 		seeds[id] = newSeed(t, st, id)
 	}
 	m := newTestStaging(t, st, stagingConfig{secret: "tok"})
-	if got := m.client.Transport.(*http.Transport).MaxIdleConnsPerHost; got != maxPulls {
-		t.Fatalf("pull client keeps %d idle conns per seed, want maxPulls = %d", got, maxPulls)
+	if got := m.client.Transport.(*http.Transport).MaxIdleConnsPerHost; got != cap(m.sem) {
+		t.Fatalf("pull client keeps %d idle conns per seed, want maxPulls = %d", got, cap(m.sem))
 	}
 	ctx := context.Background()
 	if _, err := st.PutXorb(ctx, x.hash, bytes.NewReader(x.body)); err != nil {
@@ -503,6 +513,32 @@ func TestCloseCancelsHungPull(t *testing.T) {
 	_ = m.Close()
 }
 
+// One pull slot holds the other seed's request back until the first one is answered.
+func TestMaxPullsBoundsInFlightRequests(t *testing.T) {
+	x := makeXorb(t, 63, 2, 4<<10)
+	st, _ := newTestStore(t, t.TempDir())
+	s1, s2 := newSeed(t, st, "s1"), newSeed(t, st, "s2")
+	s1.hang()
+	s2.hang()
+	m := newTestStaging(t, st, stagingConfig{maxPulls: 1})
+	t.Cleanup(func() { s1.release(); s2.release() })
+	if _, err := st.PutXorb(context.Background(), x.hash, bytes.NewReader(x.body)); err != nil {
+		t.Fatal(err)
+	}
+	arrived := func() int { return len(s1.requests()) + len(s2.requests()) }
+	// A held request keeps its slot, so once the arrivals match the slots taken none is still on its way.
+	clustertest.WaitFor(t, clustertest.WaitTimeout, "the requests holding pull slots to arrive", func() bool {
+		n := arrived()
+		return n > 0 && n == len(m.sem)
+	})
+	if n := arrived(); n != 1 {
+		t.Fatalf("%d pull requests in flight with maxPulls 1, want 1", n)
+	}
+	s1.release()
+	s2.release()
+	clustertest.WaitFor(t, clustertest.WaitTimeout, "the other seed's request once the first is answered", func() bool { return arrived() == 2 })
+}
+
 // The staging index stays free to uploads and reads while a large Full announce holds the registry write lock.
 func TestRegistryStallLeavesIndexFree(t *testing.T) {
 	// A zero cache size skips eviction, so the pass first reaches the registry while seeding.
@@ -550,5 +586,73 @@ func TestRegistryStallLeavesIndexFree(t *testing.T) {
 			m.reg.mu.Lock() // live() completes under the handoff; the pass now waits in rank or holderCount
 			free("the pass ranks or counts holders")
 		})
+	}
+}
+
+// pullCounters reads the staging counters the peers route reports as pulls.
+func pullCounters(m *staging) apis.PullCounters {
+	return apis.PullCounters{Sent: m.pullsSent.Load(), Accepted: m.pullsAccepted.Load(), Failed: m.pullsFailed.Load()}
+}
+
+// A pull request sent counts as accepted on a 202 and as failed on any other answer or a cancellation.
+func TestPullCounters(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status int
+		want   apis.PullCounters
+	}{
+		{"accepted", http.StatusAccepted, apis.PullCounters{Sent: 1, Accepted: 1}},
+		{"refused", http.StatusInternalServerError, apis.PullCounters{Sent: 1, Failed: 1}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			x := makeXorb(t, 66, 2, 4<<10)
+			st, _ := newTestStore(t, t.TempDir())
+			newSeed(t, st, "s1").answer(tc.status, "")
+			m := newTestStaging(t, st, stagingConfig{})
+			if _, err := st.PutXorb(context.Background(), x.hash, bytes.NewReader(x.body)); err != nil {
+				t.Fatal(err)
+			}
+			clustertest.WaitFor(t, clustertest.WaitTimeout, "the pull to be counted as "+tc.name, func() bool {
+				c := pullCounters(m)
+				return c.Accepted+c.Failed > 0
+			})
+			if got := pullCounters(m); got != tc.want {
+				t.Fatalf("pull counters = %+v, want %+v", got, tc.want)
+			}
+		})
+	}
+	t.Run("canceled by Close", func(t *testing.T) {
+		x := makeXorb(t, 66, 2, 4<<10)
+		st, _ := newTestStore(t, t.TempDir())
+		s := newSeed(t, st, "s1")
+		s.hang()
+		m := newTestStaging(t, st, stagingConfig{})
+		if _, err := st.PutXorb(context.Background(), x.hash, bytes.NewReader(x.body)); err != nil {
+			t.Fatal(err)
+		}
+		clustertest.WaitFor(t, clustertest.WaitTimeout, "hung pull", func() bool { return len(s.requests()) == 1 })
+		_ = m.Close()
+		// Close reaped every pull goroutine, so each pull sent has its outcome.
+		if got := pullCounters(m); got.Sent != 1 || got.Sent != got.Accepted+got.Failed {
+			t.Fatalf("pull counters after Close = %+v, want the 1 pull sent counted as accepted or failed", got)
+		}
+	})
+}
+
+// An evicted copy is counted with its bytes by the time the staged usage drops.
+func TestEvictionCounters(t *testing.T) {
+	x := makeXorb(t, 67, 2, 4<<10)
+	st, _ := newTestStore(t, t.TempDir())
+	s := newSeed(t, st, "s1")
+	m := newTestStaging(t, st, stagingConfig{cacheSize: 1})
+	if _, err := st.PutXorb(context.Background(), x.hash, bytes.NewReader(x.body)); err != nil {
+		t.Fatal(err)
+	}
+	s.holds(x.hash)
+	m.kick()
+	clustertest.WaitFor(t, clustertest.WaitTimeout, "eviction", func() bool { return !clustertest.HasXorb(t, st.Storage, x.hash) && m.snapshot() == 0 })
+	want := apis.EvictionCounters{Count: 1, Bytes: uint64(len(x.body))}
+	if got := (apis.EvictionCounters{Count: m.evictions.Load(), Bytes: m.evictedBytes.Load()}); got != want {
+		t.Fatalf("eviction counters once the usage dropped = %+v, want %+v", got, want)
 	}
 }

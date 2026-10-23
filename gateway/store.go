@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/wzshiming/httpseek"
@@ -44,6 +45,8 @@ type store struct {
 
 	coolMu  sync.Mutex           // guards cooling
 	cooling map[string]time.Time // holder ID → until when remote tries it last
+
+	relayTries, relayErrs atomic.Uint64 // holders remote tried and the attempts that failed
 
 	mu      sync.Mutex // guards pins, writers and local xorb deletion; never held across network I/O
 	pins    map[xet.XorbHash]int
@@ -213,6 +216,10 @@ func (s *store) readSidecar(hash xet.XorbHash) ([]uint64, error) {
 }
 
 func (s *store) writeSidecar(hash xet.XorbHash, offsets []uint64) error {
+	data, err := json.Marshal(offsets)
+	if err != nil {
+		return fmt.Errorf("offsets sidecar of xorb %s: %w", hash, err)
+	}
 	path := s.sidecar(hash)
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
@@ -221,7 +228,6 @@ func (s *store) writeSidecar(hash xet.XorbHash, offsets []uint64) error {
 	if err != nil {
 		return err
 	}
-	data, _ := json.Marshal(offsets)
 	_, err = f.Write(data)
 	if cerr := f.Close(); err == nil {
 		err = cerr
@@ -336,6 +342,7 @@ func (s *store) remote(ctx context.Context, hash xet.XorbHash, start, end int64)
 	holders = append(ready, cooled...)
 	var errs []error
 	for _, p := range holders[:min(len(holders), relayAttempts)] {
+		s.relayTries.Add(1)
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, apis.XorbURL(p.URL, hash.String()), nil)
 		if err == nil {
 			req.Header.Set(apis.PeerHeader, "gateway")
@@ -357,6 +364,7 @@ func (s *store) remote(ctx context.Context, hash xet.XorbHash, start, end int64)
 			}
 			_ = sk.Close()
 		}
+		s.relayErrs.Add(1)
 		if cerr := ctx.Err(); cerr != nil {
 			return nil, cerr
 		}

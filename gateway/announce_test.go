@@ -155,3 +155,31 @@ func TestAnnounceRequiresSecret(t *testing.T) {
 		t.Fatalf("diagnostics leak the secret: %q", text)
 	}
 }
+
+// Announces are counted once authorized, decoded and validated: in total, the Full ones and those answered with a resync.
+func TestAnnounceCounters(t *testing.T) {
+	const secret = "s3cret"
+	_, srv := newTestGateway(t, clustertest.NewHub(t), func(cfg *Config, _ string) { cfg.Secret = secret })
+	auth := []string{"Authorization", "Bearer " + secret}
+	full := announceJSON(t, apis.AnnounceRequest{Peer: apis.Peer{ID: "p1", URL: "http://127.0.0.1:1"}, Epoch: "e", Full: true, Add: []string{testHash}})
+	steps := []struct {
+		name   string
+		body   string
+		hdr    []string
+		status int
+		want   apis.AnnounceCounters
+	}{
+		{"full", full, auth, http.StatusOK, apis.AnnounceCounters{Total: 1, Full: 1}},
+		{"delta from an unknown peer", announceJSON(t, apis.AnnounceRequest{Peer: apis.Peer{ID: "p2", URL: "http://127.0.0.1:2"}, Epoch: "e"}), auth, http.StatusOK, apis.AnnounceCounters{Total: 2, Full: 1, Resync: 1}},
+		{"unauthorized full", full, nil, http.StatusUnauthorized, apis.AnnounceCounters{Total: 2, Full: 1, Resync: 1}},
+		{"invalid full", announceJSON(t, apis.AnnounceRequest{Peer: apis.Peer{URL: "http://127.0.0.1:1"}, Epoch: "e", Full: true}), auth, http.StatusBadRequest, apis.AnnounceCounters{Total: 2, Full: 1, Resync: 1}},
+	}
+	for _, s := range steps {
+		if status, body, _ := post(t, srv, s.body, s.hdr...); status != s.status {
+			t.Fatalf("%s announce = %d %q, want %d", s.name, status, body, s.status)
+		}
+		if got := clustertest.Diag(t, srv.URL).Announces; got != s.want {
+			t.Fatalf("announce counters after the %s = %+v, want %+v", s.name, got, s.want)
+		}
+	}
+}

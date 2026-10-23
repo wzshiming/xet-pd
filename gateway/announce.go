@@ -48,6 +48,13 @@ func (g *Gateway) serveAnnounce(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	resp := g.reg.announce(req)
+	g.announces.Add(1)
+	if req.Full {
+		g.announceFull.Add(1)
+	}
+	if resp.Resync {
+		g.announceResync.Add(1)
+	}
 	g.staging.kick()
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(resp)

@@ -43,6 +43,7 @@ func parse(args []string, getenv func(string) string, help io.Writer) (string, p
 	fs.SizeVar(&cfg.XorbCacheSize, "xorb-cache-size", 0, "bytes of xorbs kept, 0 unlimited", "XET_PD_XORB_CACHE_SIZE")
 	fs.IntVar(&cfg.MaxPulls, "max-pulls", 8, "parallel pulls from the gateway", "XET_PD_MAX_PULLS")
 	fs.DurationVar(&cfg.PullTimeout, "pull-timeout", 10*time.Minute, "time limit of one pull, queueing included", "XET_PD_PULL_TIMEOUT")
+	fs.DurationVar(&cfg.FailureCooldown, "failure-cooldown", 15*time.Second, "pause before a failed pull is retried", "XET_PD_FAILURE_COOLDOWN")
 	fs.DurationVar(&cfg.Heartbeat, "heartbeat", 10*time.Second, "announce interval, keep it below the gateway peer ttl", "XET_PD_HEARTBEAT")
 	secret, secretFile := fs.SecretFlags()
 	if err := fs.Parse(args, getenv, help); err != nil {

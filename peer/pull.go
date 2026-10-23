@@ -18,8 +18,6 @@ import (
 	"github.com/wzshiming/xet-pd/internal/lru"
 )
 
-const failedCooldown = 15 * time.Second
-
 var (
 	errNotFound = errors.New("xorb not found at gateway")
 	errClosed   = errors.New("peer closed")
@@ -109,14 +107,18 @@ func (p *Peer) acquire(hash xet.XorbHash, force bool) (*pull, *lru.Entry[xet.Xor
 					case resp.ContentLength > apis.MaxXorbBytes:
 						err = fmt.Errorf("xorb of %d bytes exceeds cap", resp.ContentLength)
 					default:
-						f.stream = ioswmr.NewSWMR(ioswmr.NewTemporaryFileBuffer(func() (*os.File, error) {
+						stream := ioswmr.NewSWMR(ioswmr.NewTemporaryFileBuffer(func() (*os.File, error) {
 							return os.CreateTemp(p.spoolDir, f.hash.String()+"-*.part")
 						}), ioswmr.WithAutoClose())
-						f.hold, _ = f.stream.NewReader(0)
-						f.length = resp.ContentLength
-						close(f.started)
+						var hold io.Closer
 						var n int64
-						n, err = io.Copy(f.stream.Writer(), io.LimitReader(resp.Body, apis.MaxXorbBytes+1))
+						if hold, err = stream.NewReader(0); err != nil {
+							err = fmt.Errorf("spool reader: %w", err)
+						} else {
+							f.stream, f.hold, f.length = stream, hold, resp.ContentLength
+							close(f.started)
+							n, err = io.Copy(f.stream.Writer(), io.LimitReader(resp.Body, apis.MaxXorbBytes+1))
+						}
 						switch {
 						case err != nil:
 						case n > apis.MaxXorbBytes:
@@ -135,9 +137,13 @@ func (p *Peer) acquire(hash xet.XorbHash, force bool) (*pull, *lru.Entry[xet.Xor
 							p.mu.Unlock()
 							var stored bool
 							if err == nil {
-								rs, _ := f.stream.NewReadSeeker(0, int(n))
-								stored, err = p.store.PutXorb(ctx, f.hash, rs)
-								_ = rs.Close()
+								var rs io.ReadSeekCloser
+								if rs, err = f.stream.NewReadSeeker(0, int(n)); err != nil {
+									err = fmt.Errorf("spool reader: %w", err)
+								} else {
+									stored, err = p.store.PutXorb(ctx, f.hash, rs)
+									_ = rs.Close()
+								}
 							}
 							switch {
 							case err != nil || stored:
@@ -145,9 +151,13 @@ func (p *Peer) acquire(hash xet.XorbHash, force bool) (*pull, *lru.Entry[xet.Xor
 								err = errors.New("replaced xorb reappeared")
 							default:
 								// The store deduplicated against an existing object without reading this spool.
-								rs, _ := f.stream.NewReadSeeker(0, int(n))
-								err = xorb.Validate(rs, f.hash)
-								_ = rs.Close()
+								var rs io.ReadSeekCloser
+								if rs, err = f.stream.NewReadSeeker(0, int(n)); err != nil {
+									err = fmt.Errorf("spool reader: %w", err)
+								} else {
+									err = xorb.Validate(rs, f.hash)
+									_ = rs.Close()
+								}
 							}
 						}
 					}
@@ -171,7 +181,7 @@ func (p *Peer) acquire(hash xet.XorbHash, force bool) (*pull, *lru.Entry[xet.Xor
 		if err == nil {
 			p.admit(f.hash, f.size, f)
 		} else if !errors.Is(err, context.Canceled) { // abandoned or closed is no fault of the xorb
-			p.cooldown[f.hash] = cooled{until: time.Now().Add(failedCooldown), err: err}
+			p.cooldown[f.hash] = cooled{until: time.Now().Add(p.cfg.FailureCooldown), err: err}
 		}
 		if err != nil && p.unchecked[f.hash] { // the validator left its invalid file to this pull
 			if err := p.discard(f.hash); err != nil {

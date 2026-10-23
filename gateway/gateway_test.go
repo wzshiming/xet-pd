@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
@@ -122,6 +123,7 @@ func TestConfigValidation(t *testing.T) {
 		{"negative min seeds", func(c *Config) { c.MinSeeds = -1 }, "negative"},
 		{"negative cache", func(c *Config) { c.XorbCacheSize = -1 }, "negative"},
 		{"negative relay timeout", func(c *Config) { c.RelayTimeout = -time.Second }, "negative"},
+		{"negative max pulls", func(c *Config) { c.MaxPulls = -1 }, "negative"},
 		{"min seeds over replicas", func(c *Config) { c.MinSeeds = 3 }, "replicas"},
 		{"defaults", nil, ""},
 		{"explicit", func(c *Config) {
@@ -129,6 +131,7 @@ func TestConfigValidation(t *testing.T) {
 			c.ExternalURL = "http://gw.test/"
 			c.PeerTTL, c.Replicas, c.MinSeeds, c.XorbCacheSize = 2*time.Second, 2, 2, 1
 			c.RelayTimeout = 3 * time.Second
+			c.MaxPulls = 3
 		}, ""},
 	}
 	for _, tt := range tests {
@@ -151,15 +154,18 @@ func TestConfigValidation(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer func() { _ = g.Close() }()
-			wantTTL, wantReplicas, wantSeeds, wantRelay := 30*time.Second, 2, 1, 5*time.Second
+			wantTTL, wantReplicas, wantSeeds, wantRelay, wantPulls := 30*time.Second, 2, 1, 5*time.Second, 8
 			if tt.mod != nil {
-				wantTTL, wantSeeds, wantRelay = 2*time.Second, 2, 3*time.Second
+				wantTTL, wantSeeds, wantRelay, wantPulls = 2*time.Second, 2, 3*time.Second, 3
 			}
 			if g.reg.ttl != wantTTL || g.staging.cfg.replicas != wantReplicas || g.staging.cfg.minSeeds != wantSeeds || g.staging.cfg.cacheSize != cfg.XorbCacheSize {
 				t.Fatalf("effective ttl %v replicas %d minSeeds %d cache %d", g.reg.ttl, g.staging.cfg.replicas, g.staging.cfg.minSeeds, g.staging.cfg.cacheSize)
 			}
 			if tr := g.st.transport; tr.ResponseHeaderTimeout != wantRelay || tr.TLSHandshakeTimeout != wantRelay {
 				t.Fatalf("effective relay timeout: response headers %v, TLS handshake %v, want %v", tr.ResponseHeaderTimeout, tr.TLSHandshakeTimeout, wantRelay)
+			}
+			if m := g.staging; m.cfg.maxPulls != wantPulls || cap(m.sem) != wantPulls || m.client.Transport.(*http.Transport).MaxIdleConnsPerHost != wantPulls {
+				t.Fatalf("effective max pulls %d: %d pull slots, %d idle conns per seed, want %d", m.cfg.maxPulls, cap(m.sem), m.client.Transport.(*http.Transport).MaxIdleConnsPerHost, wantPulls)
 			}
 			for _, dir := range []string{"data/offsets", "mirror/index"} {
 				if _, err := os.Stat(filepath.Join(cfg.StorageDir, dir)); err != nil {
@@ -181,6 +187,9 @@ func TestControlRoutes(t *testing.T) {
 		{http.MethodGet, "/healthz", http.StatusOK, ""},
 		{http.MethodHead, "/healthz", http.StatusOK, ""},
 		{http.MethodPost, "/healthz", http.StatusForbidden, ""},
+		{http.MethodGet, "/readyz", http.StatusOK, ""},
+		{http.MethodHead, "/readyz", http.StatusOK, ""},
+		{http.MethodPost, "/readyz", http.StatusForbidden, ""},
 		{http.MethodGet, apis.AnnouncePath, http.StatusMethodNotAllowed, http.MethodPost},
 		{http.MethodPost, apis.PeersPath, http.StatusMethodNotAllowed, http.MethodGet},
 		{http.MethodGet, apis.PullPath, http.StatusNotFound, ""},
@@ -189,7 +198,7 @@ func TestControlRoutes(t *testing.T) {
 	}
 	for _, tt := range tests {
 		resp, body := request(t, tt.method, srv.URL+tt.path, "")
-		if resp.StatusCode != tt.status || resp.Header.Get("Allow") != tt.allow {
+		if resp.StatusCode != tt.status || resp.Header.Get("Allow") != tt.allow || (tt.method == http.MethodHead && body != "") {
 			t.Fatalf("%s %s = %d Allow %q %q, want %d Allow %q", tt.method, tt.path, resp.StatusCode, resp.Header.Get("Allow"), body, tt.status, tt.allow)
 		}
 	}
@@ -197,9 +206,36 @@ func TestControlRoutes(t *testing.T) {
 		t.Fatalf("control paths reached the upstream %d times", n)
 	}
 	resp, body := request(t, http.MethodGet, srv.URL+apis.PeersPath, "")
-	want := `{"peers":[],"xorb_bytes":0,"xorb_gets":{"peer":0,"direct":0}}` + "\n"
+	want := `{"peers":[],"xorb_bytes":0,"xorb_gets":{"peer":0,"direct":0},"xorb_bytes_served":{"peer":0,"direct":0},` +
+		`"pulls":{"sent":0,"accepted":0,"failed":0},"evictions":{"count":0,"bytes":0},"relays":{"attempts":0,"failures":0},` +
+		`"announces":{"total":0,"full":0,"resync":0}}` + "\n"
 	if resp.StatusCode != http.StatusOK || resp.Header.Get("Content-Type") != "application/json" || body != want {
 		t.Fatalf("GET %s = %d %q %q, want %q", apis.PeersPath, resp.StatusCode, resp.Header.Get("Content-Type"), body, want)
+	}
+}
+
+// Readiness creates a probe file in the data directory, so a data directory that refuses new files is not ready.
+func TestReadyzStorage(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores file modes")
+	}
+	var root, dir string
+	_, srv := newTestGateway(t, clustertest.NewHub(t), func(cfg *Config, _ string) { root, dir = cfg.StorageDir, filepath.Join(cfg.StorageDir, "data") })
+	if err := os.Chmod(dir, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o755) })
+	if resp, body := request(t, http.MethodGet, srv.URL+"/readyz", ""); resp.StatusCode != http.StatusServiceUnavailable || !strings.Contains(body, "storage") || strings.Contains(body, root) {
+		t.Fatalf("GET /readyz on a read-only data dir = %d %q, want 503 naming the storage but not its path %s", resp.StatusCode, body, root)
+	}
+	if err := os.Chmod(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if resp, body := request(t, http.MethodGet, srv.URL+"/readyz", ""); resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /readyz on a writable data dir = %d %q, want 200", resp.StatusCode, body)
+	}
+	if left, err := filepath.Glob(filepath.Join(dir, ".readyz-*")); err != nil || len(left) != 0 {
+		t.Fatalf("probe files left in the data dir: %v %v", left, err)
 	}
 }
 
@@ -507,5 +543,67 @@ func TestGatewayIntegration(t *testing.T) {
 	}
 	if err := g.Close(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// Served xorb bytes count what each GET wrote, error bodies included, by whether apis.PeerHeader marked it; HEAD probes write none.
+func TestPeersReportsServedXorbBytes(t *testing.T) {
+	g, srv := newTestGateway(t, clustertest.NewHub(t), nil)
+	x := makeXorb(t, 64, 2, 4<<10)
+	if _, err := g.st.PutXorb(context.Background(), x.hash, bytes.NewReader(x.body)); err != nil {
+		t.Fatal(err)
+	}
+	n, peer := uint64(len(x.body)), []string{apis.PeerHeader, "p1"}
+	steps := []struct {
+		name, method string
+		hdr          []string
+		status       int
+		body         []byte
+		want         apis.ServedBytes
+	}{
+		{"direct GET", http.MethodGet, nil, http.StatusOK, x.body, apis.ServedBytes{Direct: n}},
+		{"peer GET", http.MethodGet, peer, http.StatusOK, x.body, apis.ServedBytes{Peer: n, Direct: n}},
+		{"direct range GET", http.MethodGet, []string{"Range", "bytes=0-15"}, http.StatusPartialContent, x.body[:16], apis.ServedBytes{Peer: n, Direct: n + 16}},
+		{"peer range GET", http.MethodGet, []string{"Range", "bytes=0-15", apis.PeerHeader, "p1"}, http.StatusPartialContent, x.body[:16], apis.ServedBytes{Peer: n + 16, Direct: n + 16}},
+		{"direct HEAD", http.MethodHead, nil, http.StatusOK, nil, apis.ServedBytes{Peer: n + 16, Direct: n + 16}},
+		{"peer HEAD", http.MethodHead, peer, http.StatusOK, nil, apis.ServedBytes{Peer: n + 16, Direct: n + 16}},
+	}
+	for _, s := range steps {
+		resp, body := request(t, s.method, apis.XorbURL(srv.URL, x.hash.String()), "", s.hdr...)
+		if resp.StatusCode != s.status || body != string(s.body) {
+			t.Fatalf("%s = %d with %d bytes, want %d with %d", s.name, resp.StatusCode, len(body), s.status, len(s.body))
+		}
+		if got := clustertest.Diag(t, srv.URL).XorbBytesServed; got != s.want {
+			t.Fatalf("served bytes after the %s = %+v, want %+v", s.name, got, s.want)
+		}
+	}
+	resp, body := request(t, http.MethodGet, apis.XorbURL(srv.URL, strings.Repeat("11", 32)), "")
+	if resp.StatusCode != http.StatusNotFound || body == "" {
+		t.Fatalf("GET of a missing xorb = %d %q, want 404 with an error body", resp.StatusCode, body)
+	}
+	if got, want := clustertest.Diag(t, srv.URL).XorbBytesServed, (apis.ServedBytes{Peer: n + 16, Direct: n + 16 + uint64(len(body))}); got != want {
+		t.Fatalf("served bytes after a 404 = %+v, want %+v counting its error body", got, want)
+	}
+}
+
+// The peers route reports the pulls, evictions and relays of the gateway's own staging and store.
+func TestPeersReportsStagingAndRelayCounters(t *testing.T) {
+	g, srv := newTestGateway(t, clustertest.NewHub(t), func(cfg *Config, _ string) { cfg.XorbCacheSize = 1 })
+	x := makeXorb(t, 65, 2, 4<<10)
+	s := newSeed(t, g.st, "s1")
+	if _, err := g.st.PutXorb(context.Background(), x.hash, bytes.NewReader(x.body)); err != nil {
+		t.Fatal(err)
+	}
+	clustertest.WaitFor(t, clustertest.WaitTimeout, "the seed to accept its pull", func() bool { return clustertest.Diag(t, srv.URL).Pulls.Accepted == 1 })
+	s.holds(x.hash)
+	g.staging.kick()
+	clustertest.WaitFor(t, clustertest.WaitTimeout, "the local copy to be evicted", func() bool { return clustertest.Diag(t, srv.URL).XorbBytes == 0 })
+	// The fake seed serves no xorb bytes, so the read fails over its only holder.
+	if resp, _ := request(t, http.MethodGet, apis.XorbURL(srv.URL, x.hash.String()), ""); resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("GET of the evicted xorb = %d, want 404 from the failed relay", resp.StatusCode)
+	}
+	d := clustertest.Diag(t, srv.URL)
+	if d.Pulls != (apis.PullCounters{Sent: 1, Accepted: 1}) || d.Evictions != (apis.EvictionCounters{Count: 1, Bytes: uint64(len(x.body))}) || d.Relays != (apis.RelayCounters{Attempts: 1, Failures: 1}) {
+		t.Fatalf("pulls %+v, evictions %+v, relays %+v, want 1 pull sent and accepted, 1 eviction of %d bytes, 1 failed relay attempt", d.Pulls, d.Evictions, d.Relays, len(x.body))
 	}
 }

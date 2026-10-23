@@ -29,7 +29,7 @@ func TestParsePeerDefaults(t *testing.T) {
 	// HF_TOKEN and the gateway token variable mean nothing to a peer.
 	getenv := clitest.Getenv("HF_TOKEN", "tok")
 	listen, cfg, err := parse([]string{"-advertise", "http://p:1", "-gateway", "http://g:2"}, getenv, io.Discard)
-	want := peer.Config{Advertise: "http://p:1", Gateway: "http://g:2", CacheDir: "./xet-pd-peer", MaxPulls: 8, PullTimeout: 10 * time.Minute, Heartbeat: 10 * time.Second}
+	want := peer.Config{Advertise: "http://p:1", Gateway: "http://g:2", CacheDir: "./xet-pd-peer", MaxPulls: 8, PullTimeout: 10 * time.Minute, FailureCooldown: 15 * time.Second, Heartbeat: 10 * time.Second}
 	if err != nil || listen != ":8081" || cfg != want {
 		t.Fatalf("parse() = %q, %+v, %v; want %q, %+v", listen, cfg, err, ":8081", want)
 	}
@@ -38,9 +38,9 @@ func TestParsePeerDefaults(t *testing.T) {
 func TestParsePeerEnv(t *testing.T) {
 	getenv := clitest.Getenv(
 		"XET_PD_LISTEN", ":9001", "XET_PD_ADVERTISE", "http://p:1", "XET_PD_GATEWAY", "http://g:2", "XET_PD_CACHE_DIR", "/cache",
-		"XET_PD_XORB_CACHE_SIZE", "2GiB", "XET_PD_MAX_PULLS", "3", "XET_PD_PULL_TIMEOUT", "1m", "XET_PD_HEARTBEAT", "2s", "XET_PD_SECRET", "sec")
+		"XET_PD_XORB_CACHE_SIZE", "2GiB", "XET_PD_MAX_PULLS", "3", "XET_PD_PULL_TIMEOUT", "1m", "XET_PD_FAILURE_COOLDOWN", "30s", "XET_PD_HEARTBEAT", "2s", "XET_PD_SECRET", "sec")
 	listen, cfg, err := parse(nil, getenv, io.Discard)
-	want := peer.Config{Advertise: "http://p:1", Gateway: "http://g:2", CacheDir: "/cache", XorbCacheSize: 2 << 30, MaxPulls: 3, PullTimeout: time.Minute, Heartbeat: 2 * time.Second, Secret: "sec"}
+	want := peer.Config{Advertise: "http://p:1", Gateway: "http://g:2", CacheDir: "/cache", XorbCacheSize: 2 << 30, MaxPulls: 3, PullTimeout: time.Minute, FailureCooldown: 30 * time.Second, Heartbeat: 2 * time.Second, Secret: "sec"}
 	if err != nil || listen != ":9001" || cfg != want {
 		t.Fatalf("parse() = %q, %+v, %v; want %q, %+v", listen, cfg, err, ":9001", want)
 	}
@@ -49,11 +49,11 @@ func TestParsePeerEnv(t *testing.T) {
 func TestParsePeerFlagsOverrideEnv(t *testing.T) {
 	getenv := clitest.Getenv(
 		"XET_PD_LISTEN", ":9001", "XET_PD_ADVERTISE", "http://p:1", "XET_PD_GATEWAY", "http://g:2", "XET_PD_CACHE_DIR", "/cache",
-		"XET_PD_XORB_CACHE_SIZE", "bogus", "XET_PD_MAX_PULLS", "x", "XET_PD_PULL_TIMEOUT", "y", "XET_PD_HEARTBEAT", "z", "XET_PD_SECRET", "sec")
+		"XET_PD_XORB_CACHE_SIZE", "bogus", "XET_PD_MAX_PULLS", "x", "XET_PD_PULL_TIMEOUT", "y", "XET_PD_FAILURE_COOLDOWN", "w", "XET_PD_HEARTBEAT", "z", "XET_PD_SECRET", "sec")
 	args := []string{"-listen", ":7001", "-advertise", "http://fp:1", "-gateway", "http://fg:2", "-cache-dir", "/flag",
-		"-xorb-cache-size", "512MiB", "-max-pulls", "2", "-pull-timeout", "30s", "-heartbeat", "1s", "-secret", "fsec"}
+		"-xorb-cache-size", "512MiB", "-max-pulls", "2", "-pull-timeout", "30s", "-failure-cooldown", "5s", "-heartbeat", "1s", "-secret", "fsec"}
 	listen, cfg, err := parse(args, getenv, io.Discard)
-	want := peer.Config{Advertise: "http://fp:1", Gateway: "http://fg:2", CacheDir: "/flag", XorbCacheSize: 512 << 20, MaxPulls: 2, PullTimeout: 30 * time.Second, Heartbeat: time.Second, Secret: "fsec"}
+	want := peer.Config{Advertise: "http://fp:1", Gateway: "http://fg:2", CacheDir: "/flag", XorbCacheSize: 512 << 20, MaxPulls: 2, PullTimeout: 30 * time.Second, FailureCooldown: 5 * time.Second, Heartbeat: time.Second, Secret: "fsec"}
 	if err != nil || listen != ":7001" || cfg != want {
 		t.Fatalf("parse() = %q, %+v, %v; want %q, %+v", listen, cfg, err, ":7001", want)
 	}
@@ -90,7 +90,7 @@ func TestParsePeerHelp(t *testing.T) {
 	if !errors.Is(err, flag.ErrHelp) {
 		t.Fatalf("err = %v, want flag.ErrHelp", err)
 	}
-	for _, want := range []string{"Usage: peer [flags]", "-advertise", "[env XET_PD_ADVERTISE]", "-pull-timeout", "(default 10m0s)", "[env XET_PD_SECRET]"} {
+	for _, want := range []string{"Usage: peer [flags]", "-advertise", "[env XET_PD_ADVERTISE]", "-pull-timeout", "(default 10m0s)", "[env XET_PD_SECRET]", "-failure-cooldown", "[env XET_PD_FAILURE_COOLDOWN]", "(default 15s)"} {
 		if !strings.Contains(help.String(), want) {
 			t.Errorf("help lacks %q:\n%s", want, help.String())
 		}

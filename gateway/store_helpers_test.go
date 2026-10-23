@@ -40,13 +40,13 @@ func storeRegistry(st *store) *registry {
 }
 
 func sidecarOffsets(st *store, hash xet.XorbHash) ([]uint64, error) {
-	return st.readSidecar(hash)
+	return st.sidecar.read(hash)
 }
 
 func sidecarPath(st *store, hash xet.XorbHash) string {
-	return st.sidecar(hash)
+	return st.sidecar.path(hash)
 }
 
 func putSidecar(st *store, hash xet.XorbHash, offsets []uint64) error {
-	return st.writeSidecar(hash, offsets)
+	return st.sidecar.write(hash, offsets)
 }

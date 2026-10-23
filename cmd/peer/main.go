@@ -8,7 +8,6 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
-	"time"
 
 	"github.com/wzshiming/xet-pd/internal/cli"
 	"github.com/wzshiming/xet-pd/peer"
@@ -41,9 +40,9 @@ func parse(args []string, getenv func(string) string, help io.Writer) (string, p
 	fs.StringVar(&cfg.Gateway, "gateway", "", "gateway origin, scheme://host[:port] (required)", "XET_PD_GATEWAY")
 	fs.StringVar(&cfg.DataDir, "data-dir", "./xet-pd-peer", "data directory", "XET_PD_DATA_DIR")
 	fs.SizeVar(&cfg.XorbCacheSize, "xorb-cache-size", 8<<30, "bytes of local xorbs kept, 0 unlimited", "XET_PD_XORB_CACHE_SIZE")
-	fs.IntVar(&cfg.MaxPulls, "max-pulls", 8, "parallel pulls from the gateway", "XET_PD_MAX_PULLS")
-	fs.DurationVar(&cfg.PullTimeout, "pull-timeout", 10*time.Minute, "time limit of one pull, queueing included", "XET_PD_PULL_TIMEOUT")
-	fs.DurationVar(&cfg.Heartbeat, "heartbeat", 10*time.Second, "announce interval, keep it below the gateway peer ttl", "XET_PD_HEARTBEAT")
+	fs.IntVar(&cfg.MaxPulls, "max-pulls", peer.DefaultMaxPulls, "parallel pulls from the gateway", "XET_PD_MAX_PULLS")
+	fs.DurationVar(&cfg.PullTimeout, "pull-timeout", peer.DefaultPullTimeout, "time limit of one pull, queueing included", "XET_PD_PULL_TIMEOUT")
+	fs.DurationVar(&cfg.Heartbeat, "heartbeat", peer.DefaultHeartbeat, "announce interval, keep it below the gateway peer ttl", "XET_PD_HEARTBEAT")
 	secret, secretFile := fs.SecretFlags()
 	if err := fs.Parse(args, getenv, help); err != nil {
 		return "", peer.Config{}, err

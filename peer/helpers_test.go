@@ -136,11 +136,11 @@ func cooldownOf(p *Peer, h xet.XorbHash) (err error, ok bool) {
 	return c.err, ok
 }
 
-func wakePending(p *Peer) bool { return len(p.wake) != 0 }
+func wakePending(p *Peer) bool { return len(p.ann.wake) != 0 }
 
 // wakeAnnouncer kicks under p.mu, as the production callers do.
 func wakeAnnouncer(p *Peer) {
 	p.mu.Lock()
-	p.kick()
+	p.ann.kick()
 	p.mu.Unlock()
 }

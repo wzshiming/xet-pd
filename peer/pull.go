@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/wzshiming/ioswmr"
@@ -46,6 +47,19 @@ type pull struct {
 type cooled struct {
 	until time.Time
 	err   error
+}
+
+// openSpool creates the spool directory under dataDir and deletes the partial pulls a previous run left in it.
+func openSpool(dataDir string) (string, error) {
+	spoolDir := filepath.Join(dataDir, "spool")
+	if err := os.MkdirAll(spoolDir, 0o755); err != nil {
+		return "", err
+	}
+	stale, _ := filepath.Glob(filepath.Join(spoolDir, "*.part"))
+	for _, f := range stale {
+		_ = os.Remove(f)
+	}
+	return spoolDir, nil
 }
 
 // acquire returns exactly one of a joined or new pull (release it) or a pinned committed xorb (unpin it); force clears a failure cooldown.
@@ -88,83 +102,135 @@ func (p *Peer) acquire(hash xet.XorbHash, force bool) (*pull, *lru.Entry[xet.Xor
 	p.wg.Add(1)
 	go func() {
 		defer p.wg.Done()
-		defer cancel()
-		var err error
-		select {
-		case p.sem <- struct{}{}:
-			p.mu.Lock()
-			f.queued = false
-			p.mu.Unlock()
-			var req *http.Request
-			if req, err = http.NewRequestWithContext(ctx, http.MethodGet, apis.XorbURL(p.cfg.Gateway, f.hash.String()), nil); err == nil {
-				req.Header.Set(apis.PeerHeader, p.id)
-				var resp *http.Response
-				if resp, err = p.client.Do(req); err == nil {
-					switch {
-					case resp.StatusCode == http.StatusNotFound:
-						err = errNotFound
-					case resp.StatusCode != http.StatusOK:
-						err = fmt.Errorf("gateway status %s", resp.Status)
-					case resp.ContentLength > apis.MaxXorbBytes:
-						err = fmt.Errorf("xorb of %d bytes exceeds cap", resp.ContentLength)
-					default:
-						f.stream = ioswmr.NewSWMR(ioswmr.NewTemporaryFileBuffer(func() (*os.File, error) {
-							return os.CreateTemp(p.spoolDir, f.hash.String()+"-*.part")
-						}), ioswmr.WithAutoClose())
-						f.hold, _ = f.stream.NewReader(0)
-						f.length = resp.ContentLength
-						close(f.started)
-						var n int64
-						n, err = io.Copy(f.stream.Writer(), io.LimitReader(resp.Body, apis.MaxXorbBytes+1))
-						switch {
-						case err != nil:
-						case n > apis.MaxXorbBytes:
-							err = errors.New("xorb exceeds cap")
-						case n == 0:
-							err = errEmpty
-						case resp.ContentLength >= 0 && n != resp.ContentLength:
-							err = fmt.Errorf("short body: %d of %d bytes", n, resp.ContentLength)
-						default:
-							f.size = n
-							rs, _ := f.stream.NewReadSeeker(0, int(n))
-							var stored bool
-							stored, err = p.store.PutXorb(ctx, f.hash, rs)
-							_ = rs.Close()
-							if err == nil && !stored {
-								// The store deduplicated against an existing object without reading this spool.
-								rs, _ = f.stream.NewReadSeeker(0, int(n))
-								err = xorb.Validate(rs, f.hash)
-								_ = rs.Close()
-							}
-						}
-					}
-					_ = resp.Body.Close()
-				}
-			}
-			<-p.sem
-		case <-ctx.Done():
-			err = ctx.Err()
-		}
-		if f.stream == nil {
-			close(f.started)
-		} else {
-			_ = f.stream.Writer().CloseWithError(err)
-		}
-		f.err = err
-		p.mu.Lock()
-		if p.pulls[f.hash] == f { // release may have dropped it and a newer pull taken the key
-			delete(p.pulls, f.hash)
-		}
-		if err == nil {
-			p.admit(f.hash, f.size, f)
-		} else if !errors.Is(err, context.Canceled) { // abandoned or closed is no fault of the xorb
-			p.cooldown[f.hash] = cooled{until: time.Now().Add(failedCooldown), err: err}
-		}
-		p.mu.Unlock()
-		close(f.done)
-		f.release()
+		f.run(ctx)
 	}()
 	return f, nil, nil
+}
+
+// run waits for a pull slot, downloads the xorb in it and settles the outcome; it ends the pull's context on return.
+func (f *pull) run(ctx context.Context) {
+	defer f.cancel()
+	p := f.p
+	var err error
+	select {
+	case p.sem <- struct{}{}:
+		p.mu.Lock()
+		f.queued = false
+		p.mu.Unlock()
+		err = f.download(ctx)
+		<-p.sem
+	case <-ctx.Done():
+		err = ctx.Err()
+	}
+	f.finish(err)
+}
+
+// download fetches the xorb from the gateway into the spool, which readers stream meanwhile, and commits it.
+func (f *pull) download(ctx context.Context) error {
+	p := f.p
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, apis.XorbURL(p.cfg.Gateway, f.hash.String()), nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set(apis.PeerHeader, p.id)
+	resp, err := p.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	switch {
+	case resp.StatusCode == http.StatusNotFound:
+		return errNotFound
+	case resp.StatusCode != http.StatusOK:
+		return fmt.Errorf("gateway status %s", resp.Status)
+	case resp.ContentLength > apis.MaxXorbBytes:
+		return fmt.Errorf("xorb of %d bytes exceeds cap", resp.ContentLength)
+	}
+	f.open(resp.ContentLength)
+	n, err := io.Copy(f.stream.Writer(), io.LimitReader(resp.Body, apis.MaxXorbBytes+1))
+	switch {
+	case err != nil:
+		return err
+	case n > apis.MaxXorbBytes:
+		return errors.New("xorb exceeds cap")
+	case n == 0:
+		return errEmpty
+	case resp.ContentLength >= 0 && n != resp.ContentLength:
+		return fmt.Errorf("short body: %d of %d bytes", n, resp.ContentLength)
+	}
+	return f.commit(ctx, n)
+}
+
+// open creates the spool for a body of the declared length, -1 if unknown, and lets readers attach.
+func (f *pull) open(length int64) {
+	f.stream = ioswmr.NewSWMR(ioswmr.NewTemporaryFileBuffer(func() (*os.File, error) {
+		return os.CreateTemp(f.p.spoolDir, f.hash.String()+"-*.part")
+	}), ioswmr.WithAutoClose())
+	f.hold, _ = f.stream.NewReader(0)
+	f.length = length
+	close(f.started)
+}
+
+// commit stores the n spooled bytes as the xorb.
+func (f *pull) commit(ctx context.Context, n int64) error {
+	f.size = n
+	rs, _ := f.stream.NewReadSeeker(0, int(n))
+	stored, err := f.p.store.PutXorb(ctx, f.hash, rs)
+	_ = rs.Close()
+	if err == nil && !stored {
+		// The store deduplicated against an existing object without reading this spool.
+		rs, _ = f.stream.NewReadSeeker(0, int(n))
+		err = xorb.Validate(rs, f.hash)
+		_ = rs.Close()
+	}
+	return err
+}
+
+// finish ends the stream with err, unlists the pull, records the xorb or a cooldown, then wakes waiters and drops the pull's own reference.
+func (f *pull) finish(err error) {
+	p := f.p
+	if f.stream == nil {
+		close(f.started)
+	} else {
+		_ = f.stream.Writer().CloseWithError(err)
+	}
+	f.err = err
+	p.mu.Lock()
+	if p.pulls[f.hash] == f { // release may have dropped it and a newer pull taken the key
+		delete(p.pulls, f.hash)
+	}
+	if err == nil {
+		p.admit(f.hash, f.size, f)
+	} else if !errors.Is(err, context.Canceled) { // abandoned or closed is no fault of the xorb
+		p.cooldown[f.hash] = cooled{until: time.Now().Add(failedCooldown), err: err}
+	}
+	p.mu.Unlock()
+	close(f.done)
+	f.release()
+}
+
+// servable returns the size to serve once headers are handled and the size is known, or once the pull finished.
+func (f *pull) servable(ctx context.Context) (int64, error) {
+	select {
+	case <-f.started:
+	case <-ctx.Done():
+		return -1, ctx.Err()
+	}
+	size := int64(-1)
+	select {
+	case <-f.done:
+	default:
+		size = f.length
+	}
+	if size >= 1 {
+		return size, nil
+	}
+	select {
+	case <-f.done:
+		return f.size, f.err
+	case <-ctx.Done():
+		return -1, ctx.Err()
+	}
 }
 
 func (f *pull) release() {
@@ -185,14 +251,4 @@ func (f *pull) release() {
 	if last && f.hold != nil {
 		_ = f.hold.Close()
 	}
-}
-
-func statusOf(err error) int {
-	switch {
-	case errors.Is(err, errNotFound):
-		return http.StatusNotFound
-	case errors.Is(err, errClosed):
-		return http.StatusServiceUnavailable
-	}
-	return http.StatusBadGateway
 }

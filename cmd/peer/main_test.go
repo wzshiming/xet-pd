@@ -29,7 +29,7 @@ func TestParsePeerDefaults(t *testing.T) {
 	// HF_TOKEN and the gateway token variable mean nothing to a peer.
 	getenv := clitest.Getenv("HF_TOKEN", "tok")
 	listen, cfg, err := parse([]string{"-advertise", "http://p:1", "-gateway", "http://g:2"}, getenv, io.Discard)
-	want := peer.Config{Advertise: "http://p:1", Gateway: "http://g:2", CacheDir: "./xet-pd-peer", MaxPulls: 8, PullTimeout: 10 * time.Minute, Heartbeat: 10 * time.Second}
+	want := peer.Config{Advertise: "http://p:1", Gateway: "http://g:2", DataDir: "./xet-pd-peer", XorbCacheSize: 8 << 30, MaxPulls: 8, PullTimeout: 10 * time.Minute, Heartbeat: 10 * time.Second}
 	if err != nil || listen != ":8081" || cfg != want {
 		t.Fatalf("parse() = %q, %+v, %v; want %q, %+v", listen, cfg, err, ":8081", want)
 	}
@@ -37,10 +37,10 @@ func TestParsePeerDefaults(t *testing.T) {
 
 func TestParsePeerEnv(t *testing.T) {
 	getenv := clitest.Getenv(
-		"XET_PD_LISTEN", ":9001", "XET_PD_ADVERTISE", "http://p:1", "XET_PD_GATEWAY", "http://g:2", "XET_PD_CACHE_DIR", "/cache",
+		"XET_PD_LISTEN", ":9001", "XET_PD_ADVERTISE", "http://p:1", "XET_PD_GATEWAY", "http://g:2", "XET_PD_DATA_DIR", "/cache",
 		"XET_PD_XORB_CACHE_SIZE", "2GiB", "XET_PD_MAX_PULLS", "3", "XET_PD_PULL_TIMEOUT", "1m", "XET_PD_HEARTBEAT", "2s", "XET_PD_SECRET", "sec")
 	listen, cfg, err := parse(nil, getenv, io.Discard)
-	want := peer.Config{Advertise: "http://p:1", Gateway: "http://g:2", CacheDir: "/cache", XorbCacheSize: 2 << 30, MaxPulls: 3, PullTimeout: time.Minute, Heartbeat: 2 * time.Second, Secret: "sec"}
+	want := peer.Config{Advertise: "http://p:1", Gateway: "http://g:2", DataDir: "/cache", XorbCacheSize: 2 << 30, MaxPulls: 3, PullTimeout: time.Minute, Heartbeat: 2 * time.Second, Secret: "sec"}
 	if err != nil || listen != ":9001" || cfg != want {
 		t.Fatalf("parse() = %q, %+v, %v; want %q, %+v", listen, cfg, err, ":9001", want)
 	}
@@ -48,12 +48,12 @@ func TestParsePeerEnv(t *testing.T) {
 
 func TestParsePeerFlagsOverrideEnv(t *testing.T) {
 	getenv := clitest.Getenv(
-		"XET_PD_LISTEN", ":9001", "XET_PD_ADVERTISE", "http://p:1", "XET_PD_GATEWAY", "http://g:2", "XET_PD_CACHE_DIR", "/cache",
+		"XET_PD_LISTEN", ":9001", "XET_PD_ADVERTISE", "http://p:1", "XET_PD_GATEWAY", "http://g:2", "XET_PD_DATA_DIR", "/cache",
 		"XET_PD_XORB_CACHE_SIZE", "bogus", "XET_PD_MAX_PULLS", "x", "XET_PD_PULL_TIMEOUT", "y", "XET_PD_HEARTBEAT", "z", "XET_PD_SECRET", "sec")
-	args := []string{"-listen", ":7001", "-advertise", "http://fp:1", "-gateway", "http://fg:2", "-cache-dir", "/flag",
+	args := []string{"-listen", ":7001", "-advertise", "http://fp:1", "-gateway", "http://fg:2", "-data-dir", "/flag",
 		"-xorb-cache-size", "512MiB", "-max-pulls", "2", "-pull-timeout", "30s", "-heartbeat", "1s", "-secret", "fsec"}
 	listen, cfg, err := parse(args, getenv, io.Discard)
-	want := peer.Config{Advertise: "http://fp:1", Gateway: "http://fg:2", CacheDir: "/flag", XorbCacheSize: 512 << 20, MaxPulls: 2, PullTimeout: 30 * time.Second, Heartbeat: time.Second, Secret: "fsec"}
+	want := peer.Config{Advertise: "http://fp:1", Gateway: "http://fg:2", DataDir: "/flag", XorbCacheSize: 512 << 20, MaxPulls: 2, PullTimeout: 30 * time.Second, Heartbeat: time.Second, Secret: "fsec"}
 	if err != nil || listen != ":7001" || cfg != want {
 		t.Fatalf("parse() = %q, %+v, %v; want %q, %+v", listen, cfg, err, ":7001", want)
 	}
@@ -90,7 +90,7 @@ func TestParsePeerHelp(t *testing.T) {
 	if !errors.Is(err, flag.ErrHelp) {
 		t.Fatalf("err = %v, want flag.ErrHelp", err)
 	}
-	for _, want := range []string{"Usage: peer [flags]", "-advertise", "[env XET_PD_ADVERTISE]", "-pull-timeout", "(default 10m0s)", "[env XET_PD_SECRET]"} {
+	for _, want := range []string{"Usage: peer [flags]", "-advertise", "[env XET_PD_ADVERTISE]", "-data-dir", "[env XET_PD_DATA_DIR]", "(default 8GiB)", "-pull-timeout", "(default 10m0s)", "[env XET_PD_SECRET]"} {
 		if !strings.Contains(help.String(), want) {
 			t.Errorf("help lacks %q:\n%s", want, help.String())
 		}
@@ -165,7 +165,7 @@ func TestRunListenFailureClosesService(t *testing.T) {
 	}
 	defer func() { _ = taken.Close() }()
 	gw := clustertest.NewFakeGateway(t, nil)
-	args := []string{"-listen", taken.Addr().String(), "-advertise", "http://127.0.0.1:1", "-gateway", gw.URL, "-cache-dir", t.TempDir(), "-heartbeat", "20ms"}
+	args := []string{"-listen", taken.Addr().String(), "-advertise", "http://127.0.0.1:1", "-gateway", gw.URL, "-data-dir", t.TempDir(), "-heartbeat", "20ms"}
 	stdout, stderr, code := startRun(context.Background(), args, clitest.Getenv())
 	if got := clitest.Await(t, "exit", code); got != 1 {
 		t.Fatalf("Run = %d, want 1; stderr %q", got, stderr.String())
@@ -186,7 +186,7 @@ func TestRunPeerServesUntilCancelled(t *testing.T) {
 	gw := clustertest.NewFakeGateway(t, nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	args := []string{"-listen", "127.0.0.1:0", "-advertise", "http://127.0.0.1:1", "-gateway", gw.URL, "-cache-dir", t.TempDir(), "-secret", "hunter2"}
+	args := []string{"-listen", "127.0.0.1:0", "-advertise", "http://127.0.0.1:1", "-gateway", gw.URL, "-data-dir", t.TempDir(), "-secret", "hunter2"}
 	stdout, stderr, code := startRun(ctx, args, clitest.Getenv())
 	banner := clitest.Await(t, "banner", stdout)
 	addr, ok := strings.CutPrefix(strings.TrimSpace(banner), "peer listening on ")

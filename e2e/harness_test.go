@@ -249,21 +249,21 @@ func (p *proc) awaitHealthy(origin string) error {
 
 type gatewayProc struct {
 	*proc
-	URL        string
-	StorageDir string
+	URL     string
+	DataDir string
 }
 
 // startGateway runs a gateway on a free loopback port; the secret travels in the environment.
 func startGateway(t *testing.T, upstream, secret string, flags []string, env ...string) *gatewayProc {
 	t.Helper()
 	dir := t.TempDir()
-	args := append([]string{"-listen", "127.0.0.1:0", "-storage-dir", dir, "-upstream", upstream}, flags...)
+	args := append([]string{"-listen", "127.0.0.1:0", "-data-dir", dir, "-upstream", upstream}, flags...)
 	p := startProc(t, "gateway", "gateway", args, append(secretEnv(secret), env...)...)
 	addr, err := p.awaitBanner("gateway listening on ")
 	if err != nil {
 		t.Fatal(err)
 	}
-	g := &gatewayProc{proc: p, URL: "http://" + addr, StorageDir: dir}
+	g := &gatewayProc{proc: p, URL: "http://" + addr, DataDir: dir}
 	if err := p.awaitHealthy(g.URL); err != nil {
 		t.Fatal(err)
 	}
@@ -272,8 +272,8 @@ func startGateway(t *testing.T, upstream, secret string, flags []string, env ...
 
 type peerProc struct {
 	*proc
-	URL      string
-	CacheDir string
+	URL     string
+	DataDir string
 }
 
 // startPeer runs a seed on a reserved loopback port it also advertises, retrying if the port is taken meanwhile.
@@ -281,11 +281,11 @@ func startPeer(t *testing.T, gatewayURL, secret string, flags []string, env ...s
 	t.Helper()
 	for attempt := 1; ; attempt++ {
 		addr, dir := reserveAddr(t), t.TempDir()
-		args := append([]string{"-listen", addr, "-advertise", "http://" + addr, "-gateway", gatewayURL, "-cache-dir", dir}, flags...)
+		args := append([]string{"-listen", addr, "-advertise", "http://" + addr, "-gateway", gatewayURL, "-data-dir", dir}, flags...)
 		p := startProc(t, "peer", "peer "+addr, args, append(secretEnv(secret), env...)...)
 		err := p.awaitHealthy("http://" + addr)
 		if err == nil {
-			return &peerProc{proc: p, URL: "http://" + addr, CacheDir: dir}
+			return &peerProc{proc: p, URL: "http://" + addr, DataDir: dir}
 		}
 		if attempt < 3 && p.exited() && strings.Contains(p.stderr.String(), "address already in use") {
 			p.discard()

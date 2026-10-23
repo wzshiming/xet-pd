@@ -63,7 +63,7 @@ func TestSeedsPulledAfterIngest(t *testing.T) {
 	}
 	fileHash := headReady(t, url).Get("X-Xet-Hash")
 	clustertest.WaitFor(t, seedTimeout, "both seeds to hold the xorb and the gateway to evict it", func() bool { return seeded(clustertest.Diag(t, gw.URL), 2, 1) })
-	if left := xorbHashes(t, filepath.Join(gw.StorageDir, "data")); len(left) != 0 {
+	if left := xorbHashes(t, filepath.Join(gw.DataDir, "data")); len(left) != 0 {
 		t.Fatalf("gateway still stores %v after seeding", left)
 	}
 	before := clustertest.Diag(t, gw.URL)
@@ -90,7 +90,7 @@ func TestSeedsPulledAfterIngest(t *testing.T) {
 	}
 	slices.Sort(hashes)
 	for _, p := range peers {
-		if got := xorbHashes(t, p.CacheDir); !slices.Equal(got, hashes) {
+		if got := xorbHashes(t, p.DataDir); !slices.Equal(got, hashes) {
 			t.Fatalf("seed %s stores %v, want %v", p.URL, got, hashes)
 		}
 	}
@@ -100,7 +100,7 @@ func TestSeedsPulledAfterIngest(t *testing.T) {
 	if after := clustertest.Diag(t, gw.URL); after.XorbGets != before.XorbGets {
 		t.Fatalf("gateway xorb gets %+v -> %+v during the xet download", before.XorbGets, after.XorbGets)
 	}
-	t.Logf("file %s = xorbs %v on both seeds (%d bytes each); hub CDN %d get, %d bytes; gateway xorb gets %+v", fileHash, hashes, xorbSize(t, peers[0].CacheDir, hashes[0]), cdnGets, cdnBytes, before.XorbGets)
+	t.Logf("file %s = xorbs %v on both seeds (%d bytes each); hub CDN %d get, %d bytes; gateway xorb gets %+v", fileHash, hashes, xorbSize(t, peers[0].DataDir, hashes[0]), cdnGets, cdnBytes, before.XorbGets)
 }
 
 // xorbSize is the on-disk size of one xorb under a local store.
@@ -170,7 +170,7 @@ func TestAllSeedsEvictedReingests(t *testing.T) {
 				return false
 			}
 			for _, p := range peers {
-				if !slices.Equal(xorbHashes(t, p.CacheDir), want) {
+				if !slices.Equal(xorbHashes(t, p.DataDir), want) {
 					return false
 				}
 			}
@@ -181,18 +181,18 @@ func TestAllSeedsEvictedReingests(t *testing.T) {
 	hashA := headReady(t, urlA).Get("X-Xet-Hash")
 	clustertest.WaitFor(t, ingestTimeout, "one CDN download of a", cdn(1))
 	clustertest.WaitFor(t, seedTimeout, "both seeds to hold a", func() bool { return seeded(clustertest.Diag(t, gw.URL), 2, 1) })
-	xorbsA := xorbHashes(t, peers[0].CacheDir)
-	if len(xorbsA) != 1 || !slices.Equal(xorbHashes(t, peers[1].CacheDir), xorbsA) {
-		t.Fatalf("seeds store %v and %v after a", xorbsA, xorbHashes(t, peers[1].CacheDir))
+	xorbsA := xorbHashes(t, peers[0].DataDir)
+	if len(xorbsA) != 1 || !slices.Equal(xorbHashes(t, peers[1].DataDir), xorbsA) {
+		t.Fatalf("seeds store %v and %v after a", xorbsA, xorbHashes(t, peers[1].DataDir))
 	}
 
 	hashB := headReady(t, urlB).Get("X-Xet-Hash")
 	clustertest.WaitFor(t, ingestTimeout, "one CDN download of b", cdn(2))
 	clustertest.WaitFor(t, seedTimeout, "both seeds to evict a for b", func() bool {
-		got := xorbHashes(t, peers[0].CacheDir)
+		got := xorbHashes(t, peers[0].DataDir)
 		return len(got) == 1 && got[0] != xorbsA[0] && holding(got)()
 	})
-	xorbsB := xorbHashes(t, peers[0].CacheDir)
+	xorbsB := xorbHashes(t, peers[0].DataDir)
 	clustertest.WaitFor(t, readyTimeout, "the reconstruction of a to fail", func() bool {
 		resp, _ := request(t, http.MethodGet, gw.URL+"/v1/reconstructions/"+hashA, "")
 		return resp.StatusCode == http.StatusNotFound
@@ -220,7 +220,7 @@ func TestAllSeedsEvictedReingests(t *testing.T) {
 	if slices.Equal(xorbsA, xorbsB) {
 		t.Fatalf("a and b share xorb %v", xorbsA)
 	}
-	t.Logf("a %s xorb %s (%d bytes) evicted for b %s xorb %s under a %d byte seed cache, then re-ingested: hub CDN 3 gets", hashA, xorbsA[0], xorbSize(t, peers[0].CacheDir, xorbsA[0]), hashB, xorbsB[0], 5<<18)
+	t.Logf("a %s xorb %s (%d bytes) evicted for b %s xorb %s under a %d byte seed cache, then re-ingested: hub CDN 3 gets", hashA, xorbsA[0], xorbSize(t, peers[0].DataDir, xorbsA[0]), hashB, xorbsB[0], 5<<18)
 }
 
 func TestNoPeersServesFromGateway(t *testing.T) {
@@ -235,7 +235,7 @@ func TestNoPeersServesFromGateway(t *testing.T) {
 	if len(before.Peers) != 0 || before.XorbBytes == 0 || before.XorbGets != (apis.XorbGets{}) {
 		t.Fatalf("diagnostics after ingest = %+v", before)
 	}
-	stored := xorbHashes(t, filepath.Join(gw.StorageDir, "data"))
+	stored := xorbHashes(t, filepath.Join(gw.DataDir, "data"))
 	if len(stored) == 0 {
 		t.Fatal("gateway stores no xorb without seeds")
 	}
@@ -264,7 +264,7 @@ func TestNoPeersServesFromGateway(t *testing.T) {
 	if got := plainGet(t, gw.URL+"/org/repo/resolve/"+hub.Commit+"/model.bin"); clustertest.SHA256(got) != clustertest.SHA256(data) {
 		t.Fatalf("offline commit GET returned %d bytes with sha %s", len(got), clustertest.SHA256(got))
 	}
-	if got := xorbHashes(t, filepath.Join(gw.StorageDir, "data")); !slices.Equal(got, stored) {
+	if got := xorbHashes(t, filepath.Join(gw.DataDir, "data")); !slices.Equal(got, stored) {
 		t.Fatalf("gateway stores %v, want %v retained", got, stored)
 	}
 	t.Logf("gateway kept %v (%d staged bytes) with no seeds; xet download made %d direct xorb gets; offline commit GET served %d bytes", stored, after.XorbBytes, after.XorbGets.Direct, len(data))
@@ -321,7 +321,7 @@ func TestServeWhilePulling(t *testing.T) {
 		t.Fatalf("whole GET completed %v %v before the gateway resumed", r.resp, r.err)
 	default:
 	}
-	if got := xorbHashes(t, p.CacheDir); len(got) != 0 {
+	if got := xorbHashes(t, p.DataDir); len(got) != 0 {
 		t.Fatalf("xorb %v committed before the gateway finished", got)
 	}
 	if n := len(fake.Requests()); n != 1 {
@@ -339,7 +339,7 @@ func TestServeWhilePulling(t *testing.T) {
 		t.Fatalf("whole GET = %v, %d bytes, %v", r.resp, len(r.body), r.err)
 	}
 	clustertest.WaitFor(t, readyTimeout, "the commit to be announced", added)
-	if got := xorbHashes(t, p.CacheDir); !slices.Equal(got, []string{hash.String()}) {
+	if got := xorbHashes(t, p.DataDir); !slices.Equal(got, []string{hash.String()}) {
 		t.Fatalf("seed stores %v, want %s", got, hash)
 	}
 	if n := len(fake.Requests()); n != 1 {
@@ -367,12 +367,12 @@ func TestCLIErrors(t *testing.T) {
 		{name: "peer help", args: []string{"peer", "--help"}, stdout: "[env XET_PD_ADVERTISE]"},
 		{name: "unknown flag", args: []string{"gateway", "-bogus"}, code: 2, stderr: "flag provided but not defined: -bogus"},
 		{name: "peer missing advertise", args: []string{"peer", "-gateway", "http://127.0.0.1:1"}, code: 2, stderr: "advertise is required"},
-		{name: "gateway bad upstream", args: []string{"gateway", "-storage-dir", dir, "-upstream", "ftp://hub"}, code: 1, stderr: "upstream: scheme is not http(s)"},
-		{name: "peer listen taken", args: []string{"peer", "-listen", reserveTaken(t), "-advertise", "http://127.0.0.1:1", "-gateway", "http://127.0.0.1:1", "-cache-dir", t.TempDir()}, code: 1, stderr: "address already in use"},
+		{name: "gateway bad upstream", args: []string{"gateway", "-data-dir", dir, "-upstream", "ftp://hub"}, code: 1, stderr: "upstream: scheme is not http(s)"},
+		{name: "peer listen taken", args: []string{"peer", "-listen", reserveTaken(t), "-advertise", "http://127.0.0.1:1", "-gateway", "http://127.0.0.1:1", "-data-dir", t.TempDir()}, code: 1, stderr: "address already in use"},
 		{name: "secret flags exclusive", args: []string{"gateway", "-secret", secret, "-secret-file", secretFile}, code: 2, stderr: "mutually exclusive"},
 		{name: "secret env exclusive", args: []string{"gateway"}, env: []string{"XET_PD_SECRET=" + secret, "XET_PD_SECRET_FILE=" + secretFile}, code: 2, stderr: "mutually exclusive"},
 		{name: "secret file missing", args: []string{"peer", "-advertise", "http://127.0.0.1:1", "-gateway", "http://127.0.0.1:1", "-secret-file", filepath.Join(dir, "missing")}, code: 2, stderr: "secret file"},
-		{name: "advertise credentials", args: []string{"peer", "-advertise", "http://bob:" + secret + "@127.0.0.1:1", "-gateway", "http://127.0.0.1:1", "-cache-dir", t.TempDir()}, code: 1, stderr: "advertise: userinfo not allowed"},
+		{name: "advertise credentials", args: []string{"peer", "-advertise", "http://bob:" + secret + "@127.0.0.1:1", "-gateway", "http://127.0.0.1:1", "-data-dir", t.TempDir()}, code: 1, stderr: "advertise: userinfo not allowed"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

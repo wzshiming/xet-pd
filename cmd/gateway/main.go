@@ -37,7 +37,7 @@ func parse(args []string, getenv func(string) string, help io.Writer) (string, g
 	)
 	fs := cli.NewFlagSet("gateway")
 	fs.StringVar(&listen, "listen", ":8080", "listen address", "XET_PD_LISTEN")
-	fs.StringVar(&cfg.StorageDir, "storage-dir", "./xet-pd-gateway", "data directory", "XET_PD_STORAGE_DIR")
+	fs.StringVar(&cfg.DataDir, "data-dir", "./xet-pd-gateway", "data directory", "XET_PD_DATA_DIR")
 	fs.StringVar(&cfg.Upstream, "upstream", "https://huggingface.co", "upstream hub origin, scheme://host[:port]", "HF_ENDPOINT")
 	fs.StringVar(&cfg.UpstreamToken, "upstream-token", "", "bearer token for the upstream hub", "HF_TOKEN")
 	fs.StringVar(&cfg.SigningKey, "signing-key", "", "HMAC key of CAS read tokens; empty leaves CAS routes open", "XET_PD_SIGNING_KEY")

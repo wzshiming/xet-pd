@@ -119,7 +119,7 @@ func TestStartupDropsCorruptObject(t *testing.T) {
 		t.Fatal(err)
 	}
 	g := clustertest.NewFakeGateway(t, clustertest.ServeByHash(nil))
-	p, _ := newTestPeer(t, g.URL, func(c *Config) { c.CacheDir, c.Heartbeat = dir, time.Hour })
+	p, _ := newTestPeer(t, g.URL, func(c *Config) { c.DataDir, c.Heartbeat = dir, time.Hour })
 	if got := g.Announce(t, 0).Req; !got.Full || !slices.Equal(got.Add, hashes(a)) {
 		t.Fatalf("startup announce = %+v, want only %s", got, a)
 	}
@@ -564,7 +564,7 @@ func TestUnreadableStoredObjectIsNotDropped(t *testing.T) {
 	g := clustertest.NewFakeGateway(t, clustertest.ServeByHash(nil))
 	p, srv := newTestPeer(t, g.URL, func(c *Config) { c.Heartbeat = time.Hour })
 	commitDirect(t, p, hash, body)
-	path := xorbPath(p.cfg.CacheDir, hash)
+	path := xorbPath(p.cfg.DataDir, hash)
 	if err := os.Chmod(path, 0); err != nil {
 		t.Fatal(err)
 	}
@@ -730,7 +730,7 @@ func TestRestartRebuildsUsageAndOrder(t *testing.T) {
 	}
 	g := clustertest.NewFakeGateway(t, clustertest.ServeByHash(map[xet.XorbHash][]byte{d: bodyD}))
 	p, srv := newTestPeer(t, g.URL, func(cfg *Config) {
-		cfg.CacheDir, cfg.Heartbeat, cfg.XorbCacheSize = dir, time.Hour, int64(len(bodyA)+len(bodyC))
+		cfg.DataDir, cfg.Heartbeat, cfg.XorbCacheSize = dir, time.Hour, int64(len(bodyA)+len(bodyC))
 	})
 	// Oldest by mtime goes first at startup, and the Full matches what survived.
 	if got := g.Announce(t, 0).Req; !got.Full || !slices.Equal(got.Add, hashes(a, c)) {

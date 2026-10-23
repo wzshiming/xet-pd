@@ -32,7 +32,7 @@ import (
 type Config struct {
 	Advertise     string        // public origin of this peer, scheme://host[:port]
 	Gateway       string        // upstream gateway origin
-	CacheDir      string        // data directory: xorbs/ committed objects, spool/ in-flight pulls
+	DataDir       string        // data directory: xorbs/ committed objects, spool/ in-flight pulls
 	XorbCacheSize int64         // bytes of committed xorbs to keep, 0 unlimited; spools are extra
 	MaxPulls      int           // parallel pulls from the gateway, default 8
 	PullTimeout   time.Duration // per pull including queueing, default 10m
@@ -76,8 +76,8 @@ func New(cfg Config) (*Peer, error) {
 	if cfg.Gateway, err = apis.Origin(cfg.Gateway); err != nil {
 		return nil, fmt.Errorf("gateway: %w", err)
 	}
-	if cfg.CacheDir == "" {
-		return nil, errors.New("cache dir is required")
+	if cfg.DataDir == "" {
+		return nil, errors.New("data dir is required")
 	}
 	if cfg.XorbCacheSize < 0 || cfg.MaxPulls < 0 || cfg.PullTimeout < 0 || cfg.Heartbeat < 0 {
 		return nil, errors.New("negative config value")
@@ -85,11 +85,11 @@ func New(cfg Config) (*Peer, error) {
 	cfg.MaxPulls = cmp.Or(cfg.MaxPulls, 8)
 	cfg.PullTimeout = cmp.Or(cfg.PullTimeout, 10*time.Minute)
 	cfg.Heartbeat = cmp.Or(cfg.Heartbeat, 10*time.Second)
-	store, err := local.NewStorage(local.WithBasePath(cfg.CacheDir))
+	store, err := local.NewStorage(local.WithBasePath(cfg.DataDir))
 	if err != nil {
 		return nil, err
 	}
-	spoolDir := filepath.Join(cfg.CacheDir, "spool")
+	spoolDir := filepath.Join(cfg.DataDir, "spool")
 	if err := os.MkdirAll(spoolDir, 0o755); err != nil {
 		return nil, err
 	}

@@ -71,11 +71,11 @@ func TestHFCLI(t *testing.T) {
 		return seeded(clustertest.Diag(t, gw.URL), 2, len(xorbs))
 	})
 	for _, p := range peers {
-		if got := xorbHashes(t, p.CacheDir); !slices.Equal(got, xorbs) {
+		if got := xorbHashes(t, p.DataDir); !slices.Equal(got, xorbs) {
 			t.Fatalf("seed %s stores %v, want %v", p.URL, got, xorbs)
 		}
 	}
-	if left := xorbHashes(t, filepath.Join(gw.StorageDir, "data")); len(left) != 0 {
+	if left := xorbHashes(t, filepath.Join(gw.DataDir, "data")); len(left) != 0 {
 		t.Fatalf("gateway still stores %v after seeding", left)
 	}
 	if urls := reconstructionURLs(t, gw.URL, fileHash); !fromSeeds(peers, urls) {
@@ -114,7 +114,7 @@ func TestHFCLI(t *testing.T) {
 	if strings.Contains(coldLog+warmLog, secret) {
 		t.Error("hf output echoes the secret")
 	}
-	if left := xorbHashes(t, filepath.Join(gw.StorageDir, "data")); len(left) != 0 {
+	if left := xorbHashes(t, filepath.Join(gw.DataDir, "data")); len(left) != 0 {
 		t.Errorf("gateway stores %v after the warm run", left)
 	}
 	if urls := reconstructionURLs(t, gw.URL, fileHash); !fromSeeds(peers, urls) {

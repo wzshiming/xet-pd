@@ -24,7 +24,7 @@ import (
 
 // Config configures New; zero values take the noted defaults.
 type Config struct {
-	StorageDir    string // required: data/ holds the store, mirror/ the index, spools and chunk cache
+	DataDir       string // required: data/ holds the store, mirror/ the index, spools and chunk cache
 	Upstream      string // required hub origin, scheme://host[:port]
 	UpstreamToken string
 	SigningKey    string        // HMAC key of CAS read tokens; empty leaves CAS routes open
@@ -53,8 +53,8 @@ type Gateway struct {
 // New composes the store, hub mirror, CAS server and staging behind one read-only handler.
 func New(cfg Config) (*Gateway, error) {
 	var err error
-	if cfg.StorageDir == "" {
-		return nil, errors.New("gateway: storage dir is required")
+	if cfg.DataDir == "" {
+		return nil, errors.New("gateway: data dir is required")
 	}
 	if cfg.Upstream == "" {
 		return nil, errors.New("gateway: upstream is required")
@@ -80,7 +80,7 @@ func New(cfg Config) (*Gateway, error) {
 		return nil, errors.New("gateway: min seeds exceed replicas")
 	}
 	reg := newRegistry(cfg.PeerTTL)
-	st, err := newStore(filepath.Join(cfg.StorageDir, "data"), reg)
+	st, err := newStore(filepath.Join(cfg.DataDir, "data"), reg)
 	if err != nil {
 		return nil, fmt.Errorf("gateway: %w", err)
 	}
@@ -88,7 +88,7 @@ func New(cfg Config) (*Gateway, error) {
 	if err != nil {
 		return nil, fmt.Errorf("gateway: %w", err)
 	}
-	mirrorDir := filepath.Join(cfg.StorageDir, "mirror")
+	mirrorDir := filepath.Join(cfg.DataDir, "mirror")
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	provider := client.StaticUpstreamProvider(cfg.Upstream, cfg.UpstreamToken)
 	mir, err := mirror.NewMirror(

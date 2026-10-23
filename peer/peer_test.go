@@ -77,7 +77,7 @@ func commitDirect(t *testing.T, p *Peer, hash xet.XorbHash, body []byte) {
 
 func newTestPeer(t *testing.T, gw string, mod func(*Config)) (*Peer, *httptest.Server) {
 	t.Helper()
-	cfg := Config{Advertise: "http://seed.test", Gateway: gw, CacheDir: t.TempDir()}
+	cfg := Config{Advertise: "http://seed.test", Gateway: gw, DataDir: t.TempDir()}
 	if mod != nil {
 		mod(&cfg)
 	}
@@ -135,7 +135,7 @@ func TestStartupFullAnnouncesSeededInventory(t *testing.T) {
 		w.WriteHeader(http.StatusInternalServerError)
 	})
 	p, srv := newTestPeer(t, g.URL, func(c *Config) {
-		c.CacheDir, c.Heartbeat, c.Secret = dir, time.Hour, "s3cret"
+		c.DataDir, c.Heartbeat, c.Secret = dir, time.Hour, "s3cret"
 	})
 	first := g.Announce(t, 0)
 	want := apis.AnnounceRequest{Peer: apis.Peer{ID: p.id, URL: "http://seed.test"}, Epoch: p.epoch, Full: true, Add: hashes(a, b)}
@@ -155,9 +155,9 @@ func TestStartupFullAnnouncesSeededInventory(t *testing.T) {
 }
 
 func TestConfigValidation(t *testing.T) {
-	base := Config{Advertise: "http://seed:8080/", Gateway: "https://gw.example/", CacheDir: t.TempDir()}
+	base := Config{Advertise: "http://seed:8080/", Gateway: "https://gw.example/", DataDir: t.TempDir()}
 	bad := map[string]func(*Config){
-		"missing cache dir":     func(c *Config) { c.CacheDir = "" },
+		"missing data dir":      func(c *Config) { c.DataDir = "" },
 		"gateway userinfo":      func(c *Config) { c.Gateway = "http://u:p@gw" },
 		"gateway query":         func(c *Config) { c.Gateway = "http://gw?x=1" },
 		"gateway fragment":      func(c *Config) { c.Gateway = "http://gw#f" },
@@ -214,7 +214,7 @@ func TestNewIdentityAndSpoolCleanup(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	a, err := New(Config{Advertise: "http://seed:8080", Gateway: "http://gw", CacheDir: dir})
+	a, err := New(Config{Advertise: "http://seed:8080", Gateway: "http://gw", DataDir: dir})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -227,7 +227,7 @@ func TestNewIdentityAndSpoolCleanup(t *testing.T) {
 			t.Fatalf("New removed %s: %v", f, err)
 		}
 	}
-	b, err := New(Config{Advertise: "http://seed:8080/", Gateway: "http://gw2", CacheDir: t.TempDir()})
+	b, err := New(Config{Advertise: "http://seed:8080/", Gateway: "http://gw2", DataDir: t.TempDir()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -235,7 +235,7 @@ func TestNewIdentityAndSpoolCleanup(t *testing.T) {
 	if a.id == "" || a.id != b.id {
 		t.Fatalf("id not stable for the same advertise: %q vs %q", a.id, b.id)
 	}
-	c, err := New(Config{Advertise: "http://other:8080", Gateway: "http://gw", CacheDir: t.TempDir()})
+	c, err := New(Config{Advertise: "http://other:8080", Gateway: "http://gw", DataDir: t.TempDir()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -595,7 +595,7 @@ func TestUpstreamFailures(t *testing.T) {
 		if n := len(g.Requests()); n != 1 {
 			t.Fatalf("gateway GETs = %d, want 1 (cooldown)", n)
 		}
-		if ok, _ := filepath.Glob(filepath.Join(p.cfg.CacheDir, "xorbs", "*", "*", ".xorb-*")); len(ok) != 0 {
+		if ok, _ := filepath.Glob(filepath.Join(p.cfg.DataDir, "xorbs", "*", "*", ".xorb-*")); len(ok) != 0 {
 			t.Fatalf("storage temp files left: %v", ok)
 		}
 	})

@@ -162,8 +162,9 @@ func TestRunInitFailure(t *testing.T) {
 	if code := command.Run(context.Background(), args, clitest.Getenv(), &stdout, &stderr); code != 1 {
 		t.Fatalf("Run = %d, want 1; stderr %q", code, stderr.String())
 	}
-	if stdout.Len() != 0 || !strings.Contains(stderr.String(), "gateway: gateway: upstream: scheme is not http(s)") {
-		t.Fatalf("stdout %q, stderr %q", stdout.String(), stderr.String())
+	const want = "gateway: upstream: scheme is not http(s)\n"
+	if stdout.Len() != 0 || stderr.String() != want {
+		t.Fatalf("stdout %q, stderr %q; want empty, %q", stdout.String(), stderr.String(), want)
 	}
 }
 

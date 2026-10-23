@@ -115,8 +115,8 @@ func TestConfigValidation(t *testing.T) {
 			}
 			g, err := New(cfg)
 			if tt.wantErr != "" {
-				if err == nil || !strings.HasPrefix(err.Error(), "gateway: ") || !strings.Contains(err.Error(), tt.wantErr) {
-					t.Fatalf("New = %v, want gateway error mentioning %q", err, tt.wantErr)
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("New = %v, want error mentioning %q", err, tt.wantErr)
 				}
 				if strings.Contains(err.Error(), "hunter2") {
 					t.Fatalf("New echoes the url: %v", err)

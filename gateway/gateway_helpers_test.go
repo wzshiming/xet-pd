@@ -43,7 +43,7 @@ func gatewayRegistry(g *Gateway) *registry {
 
 // effectiveConfig needs no lock: the ttl and the staging config are fixed by New.
 func effectiveConfig(g *Gateway) (time.Duration, stagingConfig) {
-	return g.reg.ttl, stagingConfigOf(g.staging)
+	return registryTTL(g.reg), stagingConfigOf(g.staging)
 }
 
 func registeredPeers(r *registry) int {
@@ -51,3 +51,6 @@ func registeredPeers(r *registry) int {
 	defer r.mu.RUnlock()
 	return len(r.peers)
 }
+
+// registryTTL needs no lock: the ttl is fixed by newRegistry.
+func registryTTL(r *registry) time.Duration { return r.ttl }

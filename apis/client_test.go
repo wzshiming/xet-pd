@@ -10,6 +10,7 @@ import (
 )
 
 func TestNewTransport(t *testing.T) {
+	t.Parallel()
 	tr := NewTransport()
 	if tr == http.DefaultTransport || !tr.DisableCompression || tr.ResponseHeaderTimeout != 30*time.Second {
 		t.Fatalf("NewTransport: shared %v, DisableCompression %v, ResponseHeaderTimeout %v, want a clone, true, 30s", tr == http.DefaultTransport, tr.DisableCompression, tr.ResponseHeaderTimeout)
@@ -17,6 +18,7 @@ func TestNewTransport(t *testing.T) {
 }
 
 func TestNewClientDoesNotFollowRedirects(t *testing.T) {
+	t.Parallel()
 	srv := httptest.NewServer(http.RedirectHandler("/elsewhere", http.StatusFound))
 	defer srv.Close()
 	resp, err := NewClient(srv.Client().Transport).Get(srv.URL)
@@ -30,6 +32,7 @@ func TestNewClientDoesNotFollowRedirects(t *testing.T) {
 }
 
 func TestPostJSON(t *testing.T) {
+	t.Parallel()
 	type sent struct{ method, ctype, auth, body string }
 	reqs := make(chan sent, 1)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -52,6 +55,7 @@ func TestPostJSON(t *testing.T) {
 }
 
 func TestDecodeJSON(t *testing.T) {
+	t.Parallel()
 	const limit = 16
 	tests := []struct {
 		name, body string

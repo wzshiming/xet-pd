@@ -13,20 +13,11 @@ import (
 	"time"
 
 	"github.com/wzshiming/xet-pd/gateway"
+	"github.com/wzshiming/xet-pd/internal/cli/clitest"
 )
 
-func noEnv(string) string { return "" }
-
-func env(kv ...string) func(string) string {
-	m := map[string]string{}
-	for i := 0; i+1 < len(kv); i += 2 {
-		m[kv[i]] = kv[i+1]
-	}
-	return func(k string) string { return m[k] }
-}
-
 func TestParseGatewayDefaults(t *testing.T) {
-	listen, cfg, err := parse(nil, noEnv, io.Discard)
+	listen, cfg, err := parse(nil, clitest.Getenv(), io.Discard)
 	want := gateway.Config{StorageDir: "./xet-pd-gateway", Upstream: "https://huggingface.co", PeerTTL: 30 * time.Second, Replicas: 2, MinSeeds: 1, XorbCacheSize: 8 << 30}
 	if err != nil || listen != ":8080" || cfg != want {
 		t.Fatalf("parse() = %q, %+v, %v; want %q, %+v", listen, cfg, err, ":8080", want)
@@ -34,7 +25,7 @@ func TestParseGatewayDefaults(t *testing.T) {
 }
 
 func TestParseGatewayEnv(t *testing.T) {
-	getenv := env(
+	getenv := clitest.Getenv(
 		"XET_PD_LISTEN", ":9000", "XET_PD_STORAGE_DIR", "/data", "HF_ENDPOINT", "http://hub:8000",
 		"HF_TOKEN", "tok", "XET_PD_SIGNING_KEY", "sign", "XET_PD_EXTERNAL_URL", "http://gw",
 		"XET_PD_SECRET", "sec", "XET_PD_PEER_TTL", "45s", "XET_PD_REPLICAS", "3", "XET_PD_MIN_SEEDS", "2",
@@ -48,7 +39,7 @@ func TestParseGatewayEnv(t *testing.T) {
 
 // Flags win over the environment, and an unparsable environment value is ignored once its flag is given.
 func TestParseGatewayFlagsOverrideEnv(t *testing.T) {
-	getenv := env(
+	getenv := clitest.Getenv(
 		"XET_PD_LISTEN", ":9000", "XET_PD_STORAGE_DIR", "/data", "HF_ENDPOINT", "http://hub:8000",
 		"HF_TOKEN", "tok", "XET_PD_SIGNING_KEY", "sign", "XET_PD_EXTERNAL_URL", "http://gw",
 		"XET_PD_SECRET", "sec", "XET_PD_PEER_TTL", "bogus", "XET_PD_REPLICAS", "x", "XET_PD_MIN_SEEDS", "1.5",
@@ -70,8 +61,8 @@ func TestParseGatewayUpstreamToken(t *testing.T) {
 		env  func(string) string
 		want string
 	}{
-		{"xet-pd token", nil, env("HF_TOKEN", "tok"), "tok"},
-		{"flag wins", []string{"-upstream-token", "ftok"}, env("HF_TOKEN", "tok"), "ftok"},
+		{"xet-pd token", nil, clitest.Getenv("HF_TOKEN", "tok"), "tok"},
+		{"flag wins", []string{"-upstream-token", "ftok"}, clitest.Getenv("HF_TOKEN", "tok"), "ftok"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -90,15 +81,15 @@ func TestParseGatewayErrors(t *testing.T) {
 		env  func(string) string
 		want string
 	}{
-		{"positional argument", []string{"extra"}, noEnv, `unexpected argument "extra"`},
-		{"unknown flag", []string{"-bogus"}, noEnv, "flag provided but not defined: -bogus"},
-		{"empty upstream", []string{"-upstream", ""}, noEnv, "upstream is required"},
-		{"bad duration flag", []string{"-peer-ttl", "abc"}, noEnv, "invalid value"},
-		{"bad size flag", []string{"-xorb-cache-size", "8GB"}, noEnv, "suffix"},
-		{"bad env duration", nil, env("XET_PD_PEER_TTL", "abc"), `XET_PD_PEER_TTL="abc": parse error`},
-		{"bad env int", nil, env("XET_PD_REPLICAS", "x"), `XET_PD_REPLICAS="x": parse error`},
-		{"bad env size", nil, env("XET_PD_XORB_CACHE_SIZE", "-1"), `XET_PD_XORB_CACHE_SIZE="-1": expected bytes`},
-		{"empty env upstream is still the default", []string{"-upstream", ""}, env("HF_ENDPOINT", "http://hub"), "upstream is required"},
+		{"positional argument", []string{"extra"}, clitest.Getenv(), `unexpected argument "extra"`},
+		{"unknown flag", []string{"-bogus"}, clitest.Getenv(), "flag provided but not defined: -bogus"},
+		{"empty upstream", []string{"-upstream", ""}, clitest.Getenv(), "upstream is required"},
+		{"bad duration flag", []string{"-peer-ttl", "abc"}, clitest.Getenv(), "invalid value"},
+		{"bad size flag", []string{"-xorb-cache-size", "8GB"}, clitest.Getenv(), "suffix"},
+		{"bad env duration", nil, clitest.Getenv("XET_PD_PEER_TTL", "abc"), `XET_PD_PEER_TTL="abc": parse error`},
+		{"bad env int", nil, clitest.Getenv("XET_PD_REPLICAS", "x"), `XET_PD_REPLICAS="x": parse error`},
+		{"bad env size", nil, clitest.Getenv("XET_PD_XORB_CACHE_SIZE", "-1"), `XET_PD_XORB_CACHE_SIZE="-1": expected bytes`},
+		{"empty env upstream is still the default", []string{"-upstream", ""}, clitest.Getenv("HF_ENDPOINT", "http://hub"), "upstream is required"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -116,7 +107,7 @@ func TestParseGatewayErrors(t *testing.T) {
 
 func TestParseGatewayHelp(t *testing.T) {
 	var help bytes.Buffer
-	_, _, err := parse([]string{"-h"}, noEnv, &help)
+	_, _, err := parse([]string{"-h"}, clitest.Getenv(), &help)
 	if !errors.Is(err, flag.ErrHelp) {
 		t.Fatalf("err = %v, want flag.ErrHelp", err)
 	}
@@ -132,7 +123,7 @@ func TestParseGatewaySecretFile(t *testing.T) {
 	if err := os.WriteFile(file, []byte(" s3cr3t \n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	_, cfg, err := parse([]string{"-secret-file", file}, noEnv, io.Discard)
+	_, cfg, err := parse([]string{"-secret-file", file}, clitest.Getenv(), io.Discard)
 	if err != nil || cfg.Secret != "s3cr3t" {
 		t.Fatalf("Secret = %q, %v; want s3cr3t", cfg.Secret, err)
 	}
@@ -152,7 +143,7 @@ func TestRunUsage(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			var stdout, stderr bytes.Buffer
-			if code := command.Run(context.Background(), tt.args, noEnv, &stdout, &stderr); code != tt.code {
+			if code := command.Run(context.Background(), tt.args, clitest.Getenv(), &stdout, &stderr); code != tt.code {
 				t.Fatalf("Run = %d, want %d; stderr %q", code, tt.code, stderr.String())
 			}
 			if (stdout.Len() > 0) != (tt.stdout != "") || !strings.Contains(stdout.String(), tt.stdout) {
@@ -168,7 +159,7 @@ func TestRunUsage(t *testing.T) {
 func TestRunInitFailure(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	args := []string{"-listen", "127.0.0.1:0", "-storage-dir", t.TempDir(), "-upstream", "ftp://hub"}
-	if code := command.Run(context.Background(), args, noEnv, &stdout, &stderr); code != 1 {
+	if code := command.Run(context.Background(), args, clitest.Getenv(), &stdout, &stderr); code != 1 {
 		t.Fatalf("Run = %d, want 1; stderr %q", code, stderr.String())
 	}
 	if stdout.Len() != 0 || !strings.Contains(stderr.String(), "gateway: gateway: upstream: scheme is not http(s)") {
@@ -181,7 +172,7 @@ func TestRunGatewayCancelledBeforeServing(t *testing.T) {
 	cancel()
 	var stdout, stderr bytes.Buffer
 	args := []string{"-listen", "127.0.0.1:0", "-storage-dir", t.TempDir(), "-upstream", "http://127.0.0.1:1"}
-	if code := command.Run(ctx, args, noEnv, &stdout, &stderr); code != 0 {
+	if code := command.Run(ctx, args, clitest.Getenv(), &stdout, &stderr); code != 0 {
 		t.Fatalf("Run = %d, want 0; stderr %q", code, stderr.String())
 	}
 	if !strings.HasPrefix(stdout.String(), "gateway listening on 127.0.0.1:") || stderr.Len() != 0 {

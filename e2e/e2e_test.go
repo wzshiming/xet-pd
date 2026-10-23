@@ -2,11 +2,9 @@ package e2e
 
 import (
 	"bytes"
-	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"slices"
@@ -16,8 +14,6 @@ import (
 	"syscall"
 	"testing"
 	"time"
-
-	"github.com/wzshiming/xet"
 
 	"github.com/wzshiming/xet-pd/apis"
 	"github.com/wzshiming/xet-pd/internal/clustertest"
@@ -274,84 +270,28 @@ func TestNoPeersServesFromGateway(t *testing.T) {
 	t.Logf("gateway kept %v (%d staged bytes) with no seeds; xet download made %d direct xorb gets; offline commit GET served %d bytes", stored, after.XorbBytes, after.XorbGets.Direct, len(data))
 }
 
-// fakeGateway answers announces and serves one xorb whose body stalls after a flushed prefix.
-type fakeGateway struct {
-	*httptest.Server
-	hash    xet.XorbHash
-	body    []byte
-	prefix  int
-	release chan struct{}
-	once    sync.Once
-
-	mu        sync.Mutex
-	gets      int
-	announces []apis.AnnounceRequest
-}
-
-func newFakeGateway(t *testing.T, hash xet.XorbHash, body []byte, prefix int) *fakeGateway {
-	g := &fakeGateway{hash: hash, body: body, prefix: prefix, release: make(chan struct{})}
-	g.Server = httptest.NewServer(http.HandlerFunc(g.serve))
-	t.Cleanup(g.Close)
-	t.Cleanup(g.open) // a stalled handler would hold Close
-	return g
-}
-
-// open lets the stalled body finish.
-func (g *fakeGateway) open() { g.once.Do(func() { close(g.release) }) }
-
-func (g *fakeGateway) serve(w http.ResponseWriter, r *http.Request) {
-	switch {
-	case r.Method == http.MethodPost && r.URL.Path == apis.AnnouncePath:
-		var req apis.AnnounceRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-		g.mu.Lock()
-		g.announces = append(g.announces, req)
-		g.mu.Unlock()
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(apis.AnnounceResponse{TTL: 30})
-	case r.Method == http.MethodGet && r.URL.Path == "/v1/xorbs/default/"+g.hash.String():
-		g.mu.Lock()
-		g.gets++
-		g.mu.Unlock()
-		w.Header().Set("Content-Length", strconv.Itoa(len(g.body)))
-		_, _ = w.Write(g.body[:g.prefix])
-		w.(http.Flusher).Flush()
-		select {
-		case <-g.release:
-		case <-r.Context().Done():
-			return
-		}
-		_, _ = w.Write(g.body[g.prefix:])
-	default:
-		http.NotFound(w, r)
-	}
-}
-
-func (g *fakeGateway) getCount() int {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	return g.gets
-}
-
-// added reports whether any announce so far adds the xorb.
-func (g *fakeGateway) added() bool {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	for _, a := range g.announces {
-		if slices.Contains(a.Add, g.hash.String()) {
-			return true
-		}
-	}
-	return false
-}
-
 func TestServeWhilePulling(t *testing.T) {
 	hash, body := clustertest.MakeXorb(t, 6, 4, 64<<10)
 	const prefix = 100 << 10
-	fake := newFakeGateway(t, hash, body, prefix)
+	release := make(chan struct{})
+	open := sync.OnceFunc(func() { close(release) })
+	stall := clustertest.GatedBody(body, prefix, release)
+	fake := clustertest.NewFakeGateway(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/v1/xorbs/default/"+hash.String() {
+			http.NotFound(w, r)
+			return
+		}
+		stall(w, r)
+	})
+	t.Cleanup(open) // runs before the fake's Close, which a stalled body would hold
+	added := func() bool {
+		for _, a := range fake.Announces() {
+			if slices.Contains(a.Req.Add, hash.String()) {
+				return true
+			}
+		}
+		return false
+	}
 	secret := testSecret(t)
 	p := startPeer(t, fake.URL, secret, []string{"-heartbeat", "100ms"})
 	u := p.URL + "/v1/xorbs/default/" + hash.String()
@@ -363,7 +303,7 @@ func TestServeWhilePulling(t *testing.T) {
 	if resp, out := request(t, http.MethodPost, p.URL+apis.PullPath, payload, "Content-Type", "application/json", "Authorization", "Bearer "+secret); resp.StatusCode != http.StatusAccepted {
 		t.Fatalf("pull = %d %q", resp.StatusCode, out)
 	}
-	clustertest.WaitFor(t, readyTimeout, "the pull to reach the gateway", func() bool { return fake.getCount() == 1 })
+	clustertest.WaitFor(t, readyTimeout, "the pull to reach the gateway", func() bool { return len(fake.Requests()) == 1 })
 
 	resp, got := request(t, http.MethodGet, u, "", "Range", fmt.Sprintf("bytes=0-%d", prefix-1))
 	if resp.StatusCode != http.StatusPartialContent || !bytes.Equal(got, body[:prefix]) {
@@ -371,35 +311,38 @@ func TestServeWhilePulling(t *testing.T) {
 	}
 	late := requestAsync(t, u, "Range", fmt.Sprintf("bytes=%d-%d", prefix, prefix))
 	whole := requestAsync(t, u)
+	// The second heartbeat from here snapshots the inventory after both readers started.
+	before := len(fake.Announces())
+	clustertest.WaitFor(t, clustertest.WaitTimeout, "heartbeats while the gateway stalls", func() bool { return len(fake.Announces()) >= before+2 })
 	select {
 	case r := <-late:
 		t.Fatalf("range past the flushed prefix answered %v %v before the gateway resumed", r.resp, r.err)
 	case r := <-whole:
 		t.Fatalf("whole GET completed %v %v before the gateway resumed", r.resp, r.err)
-	case <-time.After(200 * time.Millisecond):
+	default:
 	}
 	if got := xorbHashes(t, p.CacheDir); len(got) != 0 {
 		t.Fatalf("xorb %v committed before the gateway finished", got)
 	}
-	if n := fake.getCount(); n != 1 {
+	if n := len(fake.Requests()); n != 1 {
 		t.Fatalf("gateway GETs = %d while three readers wait, want 1", n)
 	}
-	if fake.added() {
+	if added() {
 		t.Fatal("xorb announced before the gateway finished")
 	}
 
-	fake.open()
+	open()
 	if r := <-late; r.err != nil || r.resp.StatusCode != http.StatusPartialContent || !bytes.Equal(r.body, body[prefix:prefix+1]) {
 		t.Fatalf("late range = %v, %d bytes, %v", r.resp, len(r.body), r.err)
 	}
 	if r := <-whole; r.err != nil || r.resp.StatusCode != http.StatusOK || r.resp.ContentLength != int64(len(body)) || !bytes.Equal(r.body, body) {
 		t.Fatalf("whole GET = %v, %d bytes, %v", r.resp, len(r.body), r.err)
 	}
-	clustertest.WaitFor(t, readyTimeout, "the commit to be announced", fake.added)
+	clustertest.WaitFor(t, readyTimeout, "the commit to be announced", added)
 	if got := xorbHashes(t, p.CacheDir); !slices.Equal(got, []string{hash.String()}) {
 		t.Fatalf("seed stores %v, want %s", got, hash)
 	}
-	if n := fake.getCount(); n != 1 {
+	if n := len(fake.Requests()); n != 1 {
 		t.Fatalf("gateway GETs = %d, want 1", n)
 	}
 	t.Logf("xorb %s: %d bytes, %d flushed before the stall; one gateway GET shared by three readers", hash, len(body), prefix)

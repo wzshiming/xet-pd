@@ -27,6 +27,7 @@ func testOrder(x *lru.Index[int, string]) []string {
 }
 
 func TestZeroIndexIsEmptyAndUsable(t *testing.T) {
+	t.Parallel()
 	var x lru.Index[int, string]
 	k := 1
 	if x.Len() != 0 || x.Usage() != 0 || x.Get(k) != nil || len(testOrder(&x)) != 0 {
@@ -38,6 +39,7 @@ func TestZeroIndexIsEmptyAndUsable(t *testing.T) {
 }
 
 func TestAddIndexesInOrder(t *testing.T) {
+	t.Parallel()
 	x, es := testIndex("a", "b", "c")
 	if x.Len() != 3 || x.Usage() != 6 {
 		t.Errorf("Len %d, Usage %d, want 3, 6", x.Len(), x.Usage())
@@ -54,6 +56,7 @@ func TestAddIndexesInOrder(t *testing.T) {
 }
 
 func TestGetKeepsOrder(t *testing.T) {
+	t.Parallel()
 	x, _ := testIndex("a", "b")
 	x.Get(1)
 	if got := testOrder(x); !slices.Equal(got, []string{"a", "b"}) {
@@ -62,6 +65,7 @@ func TestGetKeepsOrder(t *testing.T) {
 }
 
 func TestTouchMarksMostRecent(t *testing.T) {
+	t.Parallel()
 	x, es := testIndex("a", "b", "c")
 	x.Touch(es[0])
 	if got := testOrder(x); !slices.Equal(got, []string{"b", "c", "a"}) {
@@ -74,6 +78,7 @@ func TestTouchMarksMostRecent(t *testing.T) {
 }
 
 func TestRemoveUnindexesOnce(t *testing.T) {
+	t.Parallel()
 	x, es := testIndex("a", "b", "c")
 	x.Remove(es[1])
 	if x.Len() != 2 || x.Usage() != 4 || x.Get(2) != nil || !slices.Equal(testOrder(x), []string{"a", "c"}) {
@@ -87,6 +92,7 @@ func TestRemoveUnindexesOnce(t *testing.T) {
 }
 
 func TestAddReplacesSameHash(t *testing.T) {
+	t.Parallel()
 	var x lru.Index[int, string]
 	a := 1
 	stale := x.Add(a, 10, "v1")
@@ -107,7 +113,9 @@ func TestAddReplacesSameHash(t *testing.T) {
 }
 
 func TestOldest(t *testing.T) {
+	t.Parallel()
 	t.Run("remove_yielded", func(t *testing.T) {
+		t.Parallel()
 		x, _ := testIndex("a", "b", "c", "d")
 		var seen []string
 		for e := range x.Oldest() {
@@ -121,6 +129,7 @@ func TestOldest(t *testing.T) {
 		}
 	})
 	t.Run("break", func(t *testing.T) {
+		t.Parallel()
 		x, _ := testIndex("a", "b", "c", "d")
 		var seen []string
 		for e := range x.Oldest() {

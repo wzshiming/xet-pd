@@ -37,11 +37,13 @@ func announceJSON(t *testing.T, req apis.AnnounceRequest) string {
 }
 
 func TestAnnounceRegistersCanonicalInventory(t *testing.T) {
-	g, srv := newTestGateway(t, clustertest.NewHub(t), func(cfg *Config, _ string) { cfg.PeerTTL = 2 * time.Second })
+	// p1 must outlive any -race stall between the posts, or the delta remove turns into a resync.
+	const ttl = time.Hour
+	g, srv := newTestGateway(t, clustertest.NewHub(t), func(cfg *Config, _ string) { cfg.PeerTTL = ttl })
 	upper := strings.ToUpper(testHash)
 	status, body, resp := post(t, srv, announceJSON(t, apis.AnnounceRequest{Peer: apis.Peer{ID: "p1", URL: "http://127.0.0.1:1/"}, Epoch: "e1", Full: true, Add: []string{upper}}))
-	if status != http.StatusOK || resp.Resync || resp.TTL != 2 {
-		t.Fatalf("full announce = %d %q %+v, want ttl 2", status, body, resp)
+	if status != http.StatusOK || resp.Resync || resp.TTL != int64(ttl/time.Second) {
+		t.Fatalf("full announce = %d %q %+v, want ttl %d", status, body, resp, int64(ttl/time.Second))
 	}
 	d := clustertest.Diag(t, srv.URL)
 	if len(d.Peers) != 1 || d.Peers[0].ID != "p1" || d.Peers[0].URL != "http://127.0.0.1:1" || d.Peers[0].Epoch != "e1" || d.Peers[0].Holdings != 1 {

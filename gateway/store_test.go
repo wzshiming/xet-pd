@@ -139,16 +139,6 @@ func decodeAll(t *testing.T, r io.Reader) []byte {
 	}
 }
 
-func newTestStore(t *testing.T, dir string) (*store, *registry) {
-	t.Helper()
-	reg := newRegistry(time.Minute)
-	st, err := newStore(dir, reg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return st, reg
-}
-
 // ingest stores x and the shard describing files over it, as an upload would.
 func ingest(t *testing.T, st *store, x *fixture, sh *shard.Shard) {
 	t.Helper()
@@ -356,13 +346,13 @@ func TestOffsetsSidecarSurvivesDeleteAndRestart(t *testing.T) {
 	if inserted, err := st.PutXorb(ctx, x.hash, bytes.NewReader(x.body)); err != nil || !inserted {
 		t.Fatalf("PutXorb after delete = %v, %v, want inserted", inserted, err)
 	}
-	if err := os.Remove(st.sidecar(x.hash)); err != nil {
+	if err := os.Remove(sidecarPath(st, x.hash)); err != nil {
 		t.Fatal(err)
 	}
 	if inserted, err := st.PutXorb(ctx, x.hash, bytes.NewReader(x.body)); err != nil || inserted {
 		t.Fatalf("dedup PutXorb = %v, %v, want existing", inserted, err)
 	}
-	if got, err := st.readSidecar(x.hash); err != nil || !slices.Equal(got, want) {
+	if got, err := sidecarOffsets(st, x.hash); err != nil || !slices.Equal(got, want) {
 		t.Fatalf("sidecar after dedup PutXorb = %v, %v, want repaired %v", got, err, want)
 	}
 }
@@ -382,7 +372,7 @@ func TestOffsetsFollowReplacedEncoding(t *testing.T) {
 	if inserted, err := st.PutXorb(ctx, x.hash, bytes.NewReader(raw)); err != nil || !inserted {
 		t.Fatalf("PutXorb of the raw encoding = %v, %v, want inserted", inserted, err)
 	}
-	if got, err := st.readSidecar(x.hash); err != nil || !slices.Equal(got, want) {
+	if got, err := sidecarOffsets(st, x.hash); err != nil || !slices.Equal(got, want) {
 		t.Fatalf("sidecar after re-insertion = %v, %v, want refreshed %v", got, err, want)
 	}
 	if err := st.DeleteXorb(ctx, x.hash); err != nil {
@@ -419,16 +409,6 @@ func TestOffsetsFollowReplacedEncoding(t *testing.T) {
 	if got, err := io.ReadAll(f); err != nil || !bytes.Equal(got, x.content(0, 3)) {
 		t.Fatalf("reconstruction over the held encoding differs (%d bytes, %v)", len(got), err)
 	}
-}
-
-// writers counts the writers holding or queued on hash's writer lock.
-func writers(st *store, hash xet.XorbHash) int {
-	st.mu.Lock()
-	defer st.mu.Unlock()
-	if w := st.writers[hash]; w != nil {
-		return w.users
-	}
-	return 0
 }
 
 // Concurrent puts of one hash may carry different encodings; writers serialize so one inserts and the other dedups and re-records.
@@ -479,11 +459,11 @@ func TestConcurrentSameHashPutsSerialize(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, err := st.readSidecar(x.hash); err != nil || !slices.Equal(got, want) {
+	if got, err := sidecarOffsets(st, x.hash); err != nil || !slices.Equal(got, want) {
 		t.Fatalf("sidecar = %v, %v, want the committed file's %v", got, err, want)
 	}
-	if len(st.pins) != 0 {
-		t.Fatalf("pins leaked: %v", st.pins)
+	if p := pins(st); len(p) != 0 {
+		t.Fatalf("pins leaked: %v", p)
 	}
 }
 
@@ -514,7 +494,7 @@ func TestRemoteOffsetsYieldToLocalCommit(t *testing.T) {
 	if r.err != nil || !slices.Equal(r.offsets, want) {
 		t.Fatalf("GetXorbChunkOffsets racing a local commit = %v, %v, want committed %v", r.offsets, r.err, want)
 	}
-	if got, err := st.readSidecar(x.hash); err != nil || !slices.Equal(got, want) {
+	if got, err := sidecarOffsets(st, x.hash); err != nil || !slices.Equal(got, want) {
 		t.Fatalf("sidecar after remote discovery = %v, %v, want committed %v", got, err, want)
 	}
 }
@@ -529,7 +509,7 @@ func TestMalformedSidecarIsRejected(t *testing.T) {
 	}
 	bad := [][]uint64{{16, 8}, {4}, long, {math.MaxUint64}, {math.MaxUint64 - 3, 4}, {apis.MaxXorbBytes + 1}, {8, apis.MaxXorbBytes + 1}}
 	for _, offsets := range bad {
-		if err := st.writeSidecar(x.hash, offsets); err != nil {
+		if err := putSidecar(st, x.hash, offsets); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := st.GetXorbChunkOffsets(ctx, x.hash); err == nil || errors.Is(err, fs.ErrNotExist) {
@@ -541,7 +521,7 @@ func TestMalformedSidecarIsRejected(t *testing.T) {
 	}
 	malformed := []string{"[8,16]x", "[8,16][24]", "[8,16]" + strings.Repeat(" ", maxSidecarBytes), `{"a":8}`, "[-8]", "[8.5]", "[1e3]"}
 	for _, raw := range malformed {
-		if err := os.WriteFile(st.sidecar(x.hash), []byte(raw), 0o644); err != nil {
+		if err := os.WriteFile(sidecarPath(st, x.hash), []byte(raw), 0o644); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := st.GetXorbChunkOffsets(ctx, x.hash); err == nil || errors.Is(err, fs.ErrNotExist) {
@@ -550,7 +530,7 @@ func TestMalformedSidecarIsRejected(t *testing.T) {
 	}
 	accepted := map[string][]uint64{"[]": {}, "null": nil, "[8]": {8}, "[8]" + strings.Repeat(" ", maxSidecarBytes-3): {8}, fmt.Sprintf("[%d]", apis.MaxXorbBytes): {apis.MaxXorbBytes}}
 	for raw, want := range accepted {
-		if err := os.WriteFile(st.sidecar(x.hash), []byte(raw), 0o644); err != nil {
+		if err := os.WriteFile(sidecarPath(st, x.hash), []byte(raw), 0o644); err != nil {
 			t.Fatal(err)
 		}
 		if got, err := st.GetXorbChunkOffsets(ctx, x.hash); err != nil || !slices.Equal(got, want) {
@@ -608,7 +588,7 @@ func TestRelayReadsFromLiveHolder(t *testing.T) {
 		t.Fatalf("range relay request %+v, want bounded Range", last)
 	}
 	want, _ := storage.ReadXorbChunkOffsets(bytes.NewReader(x.body))
-	if got, err := st.readSidecar(x.hash); err != nil || !slices.Equal(got, want) {
+	if got, err := sidecarOffsets(st, x.hash); err != nil || !slices.Equal(got, want) {
 		t.Fatalf("offsets learned from holder = %v, %v, want persisted %v", got, err, want)
 	}
 	if ok, err := st.Storage.HasXorb(ctx, x.hash); err != nil || ok {
@@ -757,8 +737,8 @@ func TestPutShardStagesRemoteOnlyXorb(t *testing.T) {
 	if _, err := st.GetShard(ctx, b.Hash); err != nil {
 		t.Fatalf("GetShard of the new file: %v", err)
 	}
-	if len(st.pins) != 0 {
-		t.Fatalf("pins held after PutShard: %v", st.pins)
+	if p := pins(st); len(p) != 0 {
+		t.Fatalf("pins held after PutShard: %v", p)
 	}
 	if err := st.DeleteXorb(ctx, x.hash); err != nil {
 		t.Fatal(err)
@@ -768,8 +748,8 @@ func TestPutShardStagesRemoteOnlyXorb(t *testing.T) {
 	if _, err := st.PutShard(ctx, shard.BuildShard([]shard.FileInfo{bogus}, x.infos(false))); !errors.Is(err, storage.ErrInvalidShard) {
 		t.Fatalf("PutShard with a wrong SHA-256 over a staged xorb = %v, want ErrInvalidShard", err)
 	}
-	if len(st.pins) != 0 {
-		t.Fatalf("pins held after failed PutShard: %v", st.pins)
+	if p := pins(st); len(p) != 0 {
+		t.Fatalf("pins held after failed PutShard: %v", p)
 	}
 	if err := st.DeleteXorb(ctx, x.hash); err != nil {
 		t.Fatal(err)
@@ -812,8 +792,8 @@ func TestPutShardPinsStagedXorbsDuringVerification(t *testing.T) {
 			t.Fatalf("xorb %s not local after PutShard: %v, %v", f.hash, ok, err)
 		}
 	}
-	if len(st.pins) != 0 {
-		t.Fatalf("pins held after PutShard: %v", st.pins)
+	if p := pins(st); len(p) != 0 {
+		t.Fatalf("pins held after PutShard: %v", p)
 	}
 }
 
@@ -838,10 +818,10 @@ func TestDeleteXorbRefusedWhilePinned(t *testing.T) {
 	if ok, _ := st.Storage.HasXorb(ctx, x.hash); ok {
 		t.Fatal("unpinned xorb survived DeleteXorb")
 	}
-	if _, err := st.readSidecar(x.hash); err != nil {
+	if _, err := sidecarOffsets(st, x.hash); err != nil {
 		t.Fatalf("sidecar must survive DeleteXorb: %v", err)
 	}
-	if len(st.pins) != 0 {
-		t.Fatalf("pins leaked: %v", st.pins)
+	if p := pins(st); len(p) != 0 {
+		t.Fatalf("pins leaked: %v", p)
 	}
 }

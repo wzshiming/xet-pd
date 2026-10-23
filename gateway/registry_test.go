@@ -144,13 +144,6 @@ func TestConcurrentAnnounceAndLookup(t *testing.T) {
 	}
 }
 
-func clockedRegistry(ttl time.Duration) (*registry, *time.Time) {
-	r := newRegistry(ttl)
-	now := time.Unix(1000, 0).UTC()
-	r.now = func() time.Time { return now }
-	return r, &now
-}
-
 func TestTTLExpiryIsStrict(t *testing.T) {
 	r, now := clockedRegistry(time.Minute)
 	base := *now
@@ -193,10 +186,8 @@ func TestStalePeersArePruned(t *testing.T) {
 	r.announce(fullReq(testPeer(1), "e", "h1"))
 	*now = now.Add(time.Minute)
 	r.announce(fullReq(testPeer(2), "e"))
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	if len(r.peers) != 1 {
-		t.Fatalf("peers retained = %d, want stale peer pruned", len(r.peers))
+	if n := registeredPeers(r); n != 1 {
+		t.Fatalf("peers retained = %d, want stale peer pruned", n)
 	}
 }
 

@@ -30,7 +30,7 @@ services:
     image: xet-pd-gateway:local
     command:
       - -listen=:8080
-      - -storage-dir=/data
+      - -data-dir=/data
       - "-upstream=${HF_ENDPOINT:-https://huggingface.co}"
       - -replicas=2
       - -min-seeds=2
@@ -55,7 +55,7 @@ services:
       - -listen=:8081
       - -advertise=http://peer-1:8081
       - -gateway=http://gateway:8080
-      - -cache-dir=/data
+      - -data-dir=/data
       - -xorb-cache-size=1GiB
       - -heartbeat=1s
     environment: *secret
@@ -76,7 +76,7 @@ services:
       - -listen=:8082
       - -advertise=http://peer-2:8082
       - -gateway=http://gateway:8080
-      - -cache-dir=/data
+      - -data-dir=/data
       - -xorb-cache-size=1GiB
       - -heartbeat=1s
     environment: *secret

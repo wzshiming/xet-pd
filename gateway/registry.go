@@ -1,4 +1,3 @@
-// Package gateway implements the xet-pd central gateway.
 package gateway
 
 import (

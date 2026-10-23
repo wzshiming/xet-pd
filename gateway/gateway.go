@@ -1,3 +1,4 @@
+// Package gateway implements the xet-pd central gateway.
 package gateway
 
 import (
@@ -24,7 +25,7 @@ import (
 
 // Config configures New; zero values take the noted defaults.
 type Config struct {
-	StorageDir    string // required: data/ holds the store, mirror/ the index, spools and chunk cache
+	DataDir       string // required: data/ holds the store, mirror/ the index, spools and chunk cache
 	Upstream      string // required hub origin, scheme://host[:port]
 	UpstreamToken string
 	SigningKey    string        // HMAC key of CAS read tokens; empty leaves CAS routes open
@@ -34,6 +35,45 @@ type Config struct {
 	Replicas      int           // seeds asked to hold each xorb, default 2
 	MinSeeds      int           // live holders before the local copy may go, default 1
 	XorbCacheSize int64         // bytes of local xorbs kept, 0 unlimited
+}
+
+// Values the zero Config fields take; cmd/gateway shares them as flag defaults.
+const (
+	DefaultPeerTTL  = 30 * time.Second
+	DefaultReplicas = 2
+	DefaultMinSeeds = 1
+)
+
+// normalize validates cfg, reduces its URLs to origins and fills in the defaults.
+func (cfg *Config) normalize() error {
+	var err error
+	if cfg.DataDir == "" {
+		return errors.New("data dir is required")
+	}
+	if cfg.Upstream == "" {
+		return errors.New("upstream is required")
+	}
+	if cfg.Upstream, err = apis.Origin(cfg.Upstream); err != nil {
+		return fmt.Errorf("upstream: %w", err)
+	}
+	if cfg.ExternalURL != "" {
+		if cfg.ExternalURL, err = apis.Origin(cfg.ExternalURL); err != nil {
+			return fmt.Errorf("external url: %w", err)
+		}
+	}
+	if cfg.PeerTTL < 0 || cfg.Replicas < 0 || cfg.MinSeeds < 0 || cfg.XorbCacheSize < 0 {
+		return errors.New("negative config value")
+	}
+	cfg.PeerTTL = cmp.Or(cfg.PeerTTL, DefaultPeerTTL)
+	if cfg.PeerTTL < time.Second {
+		return errors.New("peer ttl below 1s")
+	}
+	cfg.Replicas = cmp.Or(cfg.Replicas, DefaultReplicas)
+	cfg.MinSeeds = cmp.Or(cfg.MinSeeds, DefaultMinSeeds)
+	if cfg.MinSeeds > cfg.Replicas {
+		return errors.New("min seeds exceed replicas")
+	}
+	return nil
 }
 
 // Gateway is the xet-pd central service: a hub mirror whose xorb bytes live on registered peers.
@@ -52,52 +92,46 @@ type Gateway struct {
 
 // New composes the store, hub mirror, CAS server and staging behind one read-only handler.
 func New(cfg Config) (*Gateway, error) {
-	var err error
-	if cfg.StorageDir == "" {
-		return nil, errors.New("gateway: storage dir is required")
-	}
-	if cfg.Upstream == "" {
-		return nil, errors.New("gateway: upstream is required")
-	}
-	if cfg.Upstream, err = apis.Origin(cfg.Upstream); err != nil {
-		return nil, fmt.Errorf("gateway: upstream: %w", err)
-	}
-	if cfg.ExternalURL != "" {
-		if cfg.ExternalURL, err = apis.Origin(cfg.ExternalURL); err != nil {
-			return nil, fmt.Errorf("gateway: external url: %w", err)
-		}
-	}
-	if cfg.PeerTTL < 0 || cfg.Replicas < 0 || cfg.MinSeeds < 0 || cfg.XorbCacheSize < 0 {
-		return nil, errors.New("gateway: negative config value")
-	}
-	cfg.PeerTTL = cmp.Or(cfg.PeerTTL, 30*time.Second)
-	if cfg.PeerTTL < time.Second {
-		return nil, errors.New("gateway: peer ttl below 1s")
-	}
-	cfg.Replicas = cmp.Or(cfg.Replicas, 2)
-	cfg.MinSeeds = cmp.Or(cfg.MinSeeds, 1)
-	if cfg.MinSeeds > cfg.Replicas {
-		return nil, errors.New("gateway: min seeds exceed replicas")
+	if err := cfg.normalize(); err != nil {
+		return nil, err
 	}
 	reg := newRegistry(cfg.PeerTTL)
-	st, err := newStore(filepath.Join(cfg.StorageDir, "data"), reg)
+	st, err := newStore(filepath.Join(cfg.DataDir, "data"), reg)
 	if err != nil {
-		return nil, fmt.Errorf("gateway: %w", err)
+		return nil, err
 	}
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	cas, err := newCAS(cfg, st, transport)
+	if err != nil {
+		return nil, err
+	}
+	staging, err := newStaging(st, stagingConfig{replicas: cfg.Replicas, minSeeds: cfg.MinSeeds, cacheSize: cfg.XorbCacheSize, secret: cfg.Secret})
+	if err != nil {
+		return nil, err
+	}
+	g := &Gateway{mux: http.NewServeMux(), cas: cas, reg: reg, st: st, staging: staging, secret: cfg.Secret, transport: transport}
+	g.mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
+	g.mux.HandleFunc(apis.AnnouncePath, route(http.MethodPost, g.serveAnnounce))
+	g.mux.HandleFunc(apis.PeersPath, route(http.MethodGet, g.servePeers))
+	g.mux.Handle("/xet-pd/", http.NotFoundHandler()) // unknown control paths never reach the upstream
+	g.mux.HandleFunc("/", g.servePublic)
+	return g, nil
+}
+
+// newCAS serves the CAS routes over st and falls through to a hub mirror of cfg.Upstream; transport carries the upstream downloads.
+func newCAS(cfg Config, st *store, transport *http.Transport) (http.Handler, error) {
 	issuer, err := auth.NewIssuer([]byte(cfg.SigningKey), 0, nil)
 	if err != nil {
-		return nil, fmt.Errorf("gateway: %w", err)
+		return nil, err
 	}
-	mirrorDir := filepath.Join(cfg.StorageDir, "mirror")
-	transport := http.DefaultTransport.(*http.Transport).Clone()
 	provider := client.StaticUpstreamProvider(cfg.Upstream, cfg.UpstreamToken)
 	mir, err := mirror.NewMirror(
 		mirror.WithStorage(st),
-		mirror.WithCacheDir(mirrorDir),
+		mirror.WithCacheDir(filepath.Join(cfg.DataDir, "mirror")),
 		mirror.WithTransport(transport),
 	)
 	if err != nil {
-		return nil, fmt.Errorf("gateway: %w", err)
+		return nil, err
 	}
 	hub := hf.NewHandler(
 		hf.WithMirror(mir),
@@ -115,18 +149,7 @@ func New(cfg Config) (*Gateway, error) {
 	if cfg.SigningKey != "" {
 		authorizer = issuer
 	}
-	cas := server.NewHandler(server.WithStorage(st), server.WithAuthorizer(authorizer), server.WithNext(hub))
-	staging, err := newStaging(st, stagingConfig{replicas: cfg.Replicas, minSeeds: cfg.MinSeeds, cacheSize: cfg.XorbCacheSize, secret: cfg.Secret})
-	if err != nil {
-		return nil, fmt.Errorf("gateway: %w", err)
-	}
-	g := &Gateway{mux: http.NewServeMux(), cas: cas, reg: reg, st: st, staging: staging, secret: cfg.Secret, transport: transport}
-	g.mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
-	g.mux.HandleFunc(apis.AnnouncePath, route(http.MethodPost, g.serveAnnounce))
-	g.mux.HandleFunc(apis.PeersPath, route(http.MethodGet, g.servePeers))
-	g.mux.Handle("/xet-pd/", http.NotFoundHandler()) // unknown control paths never reach the upstream
-	g.mux.HandleFunc("/", g.servePublic)
-	return g, nil
+	return server.NewHandler(server.WithStorage(st), server.WithAuthorizer(authorizer), server.WithNext(hub)), nil
 }
 
 func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {

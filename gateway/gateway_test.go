@@ -6,7 +6,6 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -23,27 +22,6 @@ import (
 	"github.com/wzshiming/xet-pd/peer"
 )
 
-// newTestGateway serves a gateway whose own origin is handed to mod before New runs.
-func newTestGateway(t *testing.T, hub *clustertest.Hub, mod func(cfg *Config, self string)) (*Gateway, *httptest.Server) {
-	t.Helper()
-	srv := httptest.NewUnstartedServer(nil)
-	cfg := Config{StorageDir: t.TempDir(), Upstream: hub.URL}
-	if mod != nil {
-		mod(&cfg, "http://"+srv.Listener.Addr().String())
-	}
-	g, err := New(cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	srv.Config.Handler = g
-	srv.Start()
-	t.Cleanup(func() {
-		_ = g.Close()
-		srv.Close()
-	})
-	return g, srv
-}
-
 // startPeer runs a real seed with a fresh directory on addr; "127.0.0.1:0" picks a port.
 func startPeer(t *testing.T, gw, secret, addr string) (string, func()) {
 	t.Helper()
@@ -51,7 +29,7 @@ func startPeer(t *testing.T, gw, secret, addr string) (string, func()) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	p, err := peer.New(peer.Config{Advertise: "http://" + ln.Addr().String(), Gateway: gw, CacheDir: t.TempDir(), Secret: secret})
+	p, err := peer.New(peer.Config{Advertise: "http://" + ln.Addr().String(), Gateway: gw, DataDir: t.TempDir(), Secret: secret})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -105,7 +83,7 @@ func TestConfigValidation(t *testing.T) {
 		wantErr string
 	}{
 		{"missing upstream", func(c *Config) { c.Upstream = "" }, "upstream"},
-		{"missing storage dir", func(c *Config) { c.StorageDir = "" }, "storage dir"},
+		{"missing data dir", func(c *Config) { c.DataDir = "" }, "data dir"},
 		{"upstream path", func(c *Config) { c.Upstream += "/hub" }, "upstream"},
 		{"upstream userinfo", func(c *Config) { c.Upstream = "http://u:p@127.0.0.1:1" }, "upstream"},
 		{"upstream query", func(c *Config) { c.Upstream += "?x=1" }, "upstream"},
@@ -131,14 +109,14 @@ func TestConfigValidation(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			cfg := Config{StorageDir: t.TempDir(), Upstream: hub.URL}
+			cfg := Config{DataDir: t.TempDir(), Upstream: hub.URL}
 			if tt.mod != nil {
 				tt.mod(&cfg)
 			}
 			g, err := New(cfg)
 			if tt.wantErr != "" {
-				if err == nil || !strings.HasPrefix(err.Error(), "gateway: ") || !strings.Contains(err.Error(), tt.wantErr) {
-					t.Fatalf("New = %v, want gateway error mentioning %q", err, tt.wantErr)
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("New = %v, want error mentioning %q", err, tt.wantErr)
 				}
 				if strings.Contains(err.Error(), "hunter2") {
 					t.Fatalf("New echoes the url: %v", err)
@@ -153,11 +131,12 @@ func TestConfigValidation(t *testing.T) {
 			if tt.mod != nil {
 				wantTTL, wantSeeds = 2*time.Second, 2
 			}
-			if g.reg.ttl != wantTTL || g.staging.cfg.replicas != wantReplicas || g.staging.cfg.minSeeds != wantSeeds || g.staging.cfg.cacheSize != cfg.XorbCacheSize {
-				t.Fatalf("effective ttl %v replicas %d minSeeds %d cache %d", g.reg.ttl, g.staging.cfg.replicas, g.staging.cfg.minSeeds, g.staging.cfg.cacheSize)
+			ttl, eff := effectiveConfig(g)
+			if ttl != wantTTL || eff.replicas != wantReplicas || eff.minSeeds != wantSeeds || eff.cacheSize != cfg.XorbCacheSize {
+				t.Fatalf("effective ttl %v replicas %d minSeeds %d cache %d", ttl, eff.replicas, eff.minSeeds, eff.cacheSize)
 			}
 			for _, dir := range []string{"data/offsets", "mirror/index"} {
-				if _, err := os.Stat(filepath.Join(cfg.StorageDir, dir)); err != nil {
+				if _, err := os.Stat(filepath.Join(cfg.DataDir, dir)); err != nil {
 					t.Fatalf("layout: %v", err)
 				}
 			}

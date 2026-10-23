@@ -2,12 +2,10 @@ package gateway
 
 import (
 	"bytes"
-	"cmp"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
-	"maps"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -52,7 +50,7 @@ func newSeed(t *testing.T, st *store, id string) *seed {
 	s.Server = httptest.NewServer(http.HandlerFunc(s.serve))
 	t.Cleanup(s.Close)
 	s.peer = apis.Peer{ID: id, URL: s.URL}
-	st.reg.announce(fullReq(s.peer, "e"))
+	storeRegistry(st).announce(fullReq(s.peer, "e"))
 	return s
 }
 
@@ -67,7 +65,7 @@ func (s *seed) serve(w http.ResponseWriter, r *http.Request) {
 	_ = json.Unmarshal(body, &req)
 	hash, _ := xet.ParseXorbHash(req.Hash)
 	ok, _ := s.st.Storage.HasXorb(r.Context(), hash)
-	_, serr := s.st.readSidecar(hash)
+	_, serr := sidecarOffsets(s.st, hash)
 	s.mu.Lock()
 	s.pulls = append(s.pulls, pull{r.Header.Get("Authorization"), r.Header.Get("Content-Type"), string(body), ok && serr == nil, at})
 	status, redirect, block := s.status, s.redirect, s.block
@@ -120,35 +118,7 @@ func (s *seed) holds(hashes ...xet.XorbHash) {
 	for _, h := range hashes {
 		add = append(add, h.String())
 	}
-	s.st.reg.announce(deltaReq(s.peer, "e", add, nil))
-}
-
-// newTestStaging takes New's replicas and minSeeds defaults and runs maintenance on wakes only unless the config asks for a period.
-func newTestStaging(t *testing.T, st *store, cfg stagingConfig) *staging {
-	t.Helper()
-	cfg.tick = cmp.Or(cfg.tick, time.Hour)
-	cfg.replicas = cmp.Or(cfg.replicas, 2)
-	cfg.minSeeds = cmp.Or(cfg.minSeeds, 1)
-	m, err := newStaging(st, cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = m.Close() })
-	return m
-}
-
-// awaitPass waits for a maintenance pass whose check runs after the call to find the cache over its cap with nothing evictable.
-func awaitPass(t *testing.T, m *staging) {
-	t.Helper()
-	m.mu.Lock()
-	m.warned = false
-	m.mu.Unlock()
-	m.kick()
-	clustertest.WaitFor(t, clustertest.WaitTimeout, "a maintenance pass to find nothing evictable", func() bool {
-		m.mu.Lock()
-		defer m.mu.Unlock()
-		return m.warned
-	})
+	storeRegistry(s.st).announce(deltaReq(s.peer, "e", add, nil))
 }
 
 func TestPutSeedsReplicasOnce(t *testing.T) {
@@ -167,16 +137,12 @@ func TestPutSeedsReplicasOnce(t *testing.T) {
 	for _, p := range selected {
 		clustertest.WaitFor(t, clustertest.WaitTimeout, "pull at "+p.ID, func() bool { return len(seeds[p.ID].requests()) == 1 })
 	}
-	m.mu.Lock()
-	before := maps.Clone(m.xorbs.Get(x.hash).V.asked)
-	m.mu.Unlock()
+	before := askedSeeds(m, x.hash)
 	if inserted, err := st.PutXorb(ctx, x.hash, bytes.NewReader(x.body)); err != nil || inserted {
 		t.Fatalf("dedup PutXorb = %v, %v", inserted, err)
 	}
 	// asked alone gates another pull, and a pass may already have refilled a reset one, so the dedup must leave it unchanged.
-	m.mu.Lock()
-	asked := maps.Clone(m.xorbs.Get(x.hash).V.asked)
-	m.mu.Unlock()
+	asked := askedSeeds(m, x.hash)
 	if !reflect.DeepEqual(asked, before) {
 		t.Fatalf("asked after the dedup PutXorb = %v, want it unchanged from %v", asked, before)
 	}
@@ -255,7 +221,7 @@ func TestAcceptedIsNotAHolding(t *testing.T) {
 			if got := m.snapshot(); got != 0 {
 				t.Fatalf("usage after eviction = %d, want 0", got)
 			}
-			if _, err := st.readSidecar(x.hash); err != nil {
+			if _, err := sidecarOffsets(st, x.hash); err != nil {
 				t.Fatalf("sidecar must survive eviction: %v", err)
 			}
 			if start, end, err := st.GetXorbDataRange(ctx, x.hash, 0, 2); err != nil || end <= start {
@@ -380,10 +346,7 @@ func TestPinnedXorbEvictedAfterUnpin(t *testing.T) {
 		t.Fatal("pinned xorb evicted")
 	}
 	// A pass already under way at awaitPass's kick leaves that kick in wake, where it would stand in for unpin's.
-	select {
-	case <-m.wake:
-	default:
-	}
+	drainWake(m)
 	st.unpin(x.hash)
 	clustertest.WaitFor(t, clustertest.WaitTimeout, "eviction after unpin", func() bool { return !clustertest.HasXorb(t, st.Storage, x.hash) && m.snapshot() == 0 })
 	if got := m.snapshot(); got != 0 {

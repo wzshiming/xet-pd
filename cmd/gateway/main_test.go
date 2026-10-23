@@ -18,7 +18,7 @@ import (
 
 func TestParseGatewayDefaults(t *testing.T) {
 	listen, cfg, err := parse(nil, clitest.Getenv(), io.Discard)
-	want := gateway.Config{StorageDir: "./xet-pd-gateway", Upstream: "https://huggingface.co", PeerTTL: 30 * time.Second, Replicas: 2, MinSeeds: 1, XorbCacheSize: 8 << 30}
+	want := gateway.Config{DataDir: "./xet-pd-gateway", Upstream: "https://huggingface.co", PeerTTL: 30 * time.Second, Replicas: 2, MinSeeds: 1, XorbCacheSize: 8 << 30}
 	if err != nil || listen != ":8080" || cfg != want {
 		t.Fatalf("parse() = %q, %+v, %v; want %q, %+v", listen, cfg, err, ":8080", want)
 	}
@@ -26,12 +26,12 @@ func TestParseGatewayDefaults(t *testing.T) {
 
 func TestParseGatewayEnv(t *testing.T) {
 	getenv := clitest.Getenv(
-		"XET_PD_LISTEN", ":9000", "XET_PD_STORAGE_DIR", "/data", "HF_ENDPOINT", "http://hub:8000",
+		"XET_PD_LISTEN", ":9000", "XET_PD_DATA_DIR", "/data", "HF_ENDPOINT", "http://hub:8000",
 		"HF_TOKEN", "tok", "XET_PD_SIGNING_KEY", "sign", "XET_PD_EXTERNAL_URL", "http://gw",
 		"XET_PD_SECRET", "sec", "XET_PD_PEER_TTL", "45s", "XET_PD_REPLICAS", "3", "XET_PD_MIN_SEEDS", "2",
 		"XET_PD_XORB_CACHE_SIZE", "64MiB")
 	listen, cfg, err := parse(nil, getenv, io.Discard)
-	want := gateway.Config{StorageDir: "/data", Upstream: "http://hub:8000", UpstreamToken: "tok", SigningKey: "sign", ExternalURL: "http://gw", Secret: "sec", PeerTTL: 45 * time.Second, Replicas: 3, MinSeeds: 2, XorbCacheSize: 64 << 20}
+	want := gateway.Config{DataDir: "/data", Upstream: "http://hub:8000", UpstreamToken: "tok", SigningKey: "sign", ExternalURL: "http://gw", Secret: "sec", PeerTTL: 45 * time.Second, Replicas: 3, MinSeeds: 2, XorbCacheSize: 64 << 20}
 	if err != nil || listen != ":9000" || cfg != want {
 		t.Fatalf("parse() = %q, %+v, %v; want %q, %+v", listen, cfg, err, ":9000", want)
 	}
@@ -40,15 +40,15 @@ func TestParseGatewayEnv(t *testing.T) {
 // Flags win over the environment, and an unparsable environment value is ignored once its flag is given.
 func TestParseGatewayFlagsOverrideEnv(t *testing.T) {
 	getenv := clitest.Getenv(
-		"XET_PD_LISTEN", ":9000", "XET_PD_STORAGE_DIR", "/data", "HF_ENDPOINT", "http://hub:8000",
+		"XET_PD_LISTEN", ":9000", "XET_PD_DATA_DIR", "/data", "HF_ENDPOINT", "http://hub:8000",
 		"HF_TOKEN", "tok", "XET_PD_SIGNING_KEY", "sign", "XET_PD_EXTERNAL_URL", "http://gw",
 		"XET_PD_SECRET", "sec", "XET_PD_PEER_TTL", "bogus", "XET_PD_REPLICAS", "x", "XET_PD_MIN_SEEDS", "1.5",
 		"XET_PD_XORB_CACHE_SIZE", "-1")
-	args := []string{"-listen", ":7000", "-storage-dir", "/flag", "-upstream", "http://flag", "-upstream-token", "ftok",
+	args := []string{"-listen", ":7000", "-data-dir", "/flag", "-upstream", "http://flag", "-upstream-token", "ftok",
 		"-signing-key", "fsign", "-external-url", "http://fgw", "-secret", "fsec", "-peer-ttl", "5s", "-replicas", "4",
 		"-min-seeds", "3", "-xorb-cache-size", "1GiB"}
 	listen, cfg, err := parse(args, getenv, io.Discard)
-	want := gateway.Config{StorageDir: "/flag", Upstream: "http://flag", UpstreamToken: "ftok", SigningKey: "fsign", ExternalURL: "http://fgw", Secret: "fsec", PeerTTL: 5 * time.Second, Replicas: 4, MinSeeds: 3, XorbCacheSize: 1 << 30}
+	want := gateway.Config{DataDir: "/flag", Upstream: "http://flag", UpstreamToken: "ftok", SigningKey: "fsign", ExternalURL: "http://fgw", Secret: "fsec", PeerTTL: 5 * time.Second, Replicas: 4, MinSeeds: 3, XorbCacheSize: 1 << 30}
 	if err != nil || listen != ":7000" || cfg != want {
 		t.Fatalf("parse() = %q, %+v, %v; want %q, %+v", listen, cfg, err, ":7000", want)
 	}
@@ -111,7 +111,7 @@ func TestParseGatewayHelp(t *testing.T) {
 	if !errors.Is(err, flag.ErrHelp) {
 		t.Fatalf("err = %v, want flag.ErrHelp", err)
 	}
-	for _, want := range []string{"Usage: gateway [flags]", "-xorb-cache-size", "(default 8GiB)", "[env XET_PD_XORB_CACHE_SIZE]", "[env HF_TOKEN]", "[env XET_PD_SECRET_FILE]", "(default \":8080\")"} {
+	for _, want := range []string{"Usage: gateway [flags]", "-data-dir", "[env XET_PD_DATA_DIR]", "-xorb-cache-size", "(default 8GiB)", "[env XET_PD_XORB_CACHE_SIZE]", "[env HF_TOKEN]", "[env XET_PD_SECRET_FILE]", "(default \":8080\")"} {
 		if !strings.Contains(help.String(), want) {
 			t.Errorf("help lacks %q:\n%s", want, help.String())
 		}
@@ -158,12 +158,13 @@ func TestRunUsage(t *testing.T) {
 
 func TestRunInitFailure(t *testing.T) {
 	var stdout, stderr bytes.Buffer
-	args := []string{"-listen", "127.0.0.1:0", "-storage-dir", t.TempDir(), "-upstream", "ftp://hub"}
+	args := []string{"-listen", "127.0.0.1:0", "-data-dir", t.TempDir(), "-upstream", "ftp://hub"}
 	if code := command.Run(context.Background(), args, clitest.Getenv(), &stdout, &stderr); code != 1 {
 		t.Fatalf("Run = %d, want 1; stderr %q", code, stderr.String())
 	}
-	if stdout.Len() != 0 || !strings.Contains(stderr.String(), "gateway: gateway: upstream: scheme is not http(s)") {
-		t.Fatalf("stdout %q, stderr %q", stdout.String(), stderr.String())
+	const want = "gateway: upstream: scheme is not http(s)\n"
+	if stdout.Len() != 0 || stderr.String() != want {
+		t.Fatalf("stdout %q, stderr %q; want empty, %q", stdout.String(), stderr.String(), want)
 	}
 }
 
@@ -171,7 +172,7 @@ func TestRunGatewayCancelledBeforeServing(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	var stdout, stderr bytes.Buffer
-	args := []string{"-listen", "127.0.0.1:0", "-storage-dir", t.TempDir(), "-upstream", "http://127.0.0.1:1"}
+	args := []string{"-listen", "127.0.0.1:0", "-data-dir", t.TempDir(), "-upstream", "http://127.0.0.1:1"}
 	if code := command.Run(ctx, args, clitest.Getenv(), &stdout, &stderr); code != 0 {
 		t.Fatalf("Run = %d, want 0; stderr %q", code, stderr.String())
 	}

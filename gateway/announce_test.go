@@ -40,6 +40,7 @@ func TestAnnounceRegistersCanonicalInventory(t *testing.T) {
 	// p1 must outlive any -race stall between the posts, or the delta remove turns into a resync.
 	const ttl = time.Hour
 	g, srv := newTestGateway(t, clustertest.NewHub(t), func(cfg *Config, _ string) { cfg.PeerTTL = ttl })
+	reg := gatewayRegistry(g)
 	upper := strings.ToUpper(testHash)
 	status, body, resp := post(t, srv, announceJSON(t, apis.AnnounceRequest{Peer: apis.Peer{ID: "p1", URL: "http://127.0.0.1:1/"}, Epoch: "e1", Full: true, Add: []string{upper}}))
 	if status != http.StatusOK || resp.Resync || resp.TTL != int64(ttl/time.Second) {
@@ -49,12 +50,12 @@ func TestAnnounceRegistersCanonicalInventory(t *testing.T) {
 	if len(d.Peers) != 1 || d.Peers[0].ID != "p1" || d.Peers[0].URL != "http://127.0.0.1:1" || d.Peers[0].Epoch != "e1" || d.Peers[0].Holdings != 1 {
 		t.Fatalf("registry = %+v, want canonical origin and one holding", d.Peers)
 	}
-	if holders := g.reg.holders(testHash); len(holders) != 1 || holders[0].URL != "http://127.0.0.1:1" {
+	if holders := reg.holders(testHash); len(holders) != 1 || holders[0].URL != "http://127.0.0.1:1" {
 		t.Fatalf("holders of the lowercase hash = %v", holders)
 	}
 	status, _, resp = post(t, srv, announceJSON(t, apis.AnnounceRequest{Peer: apis.Peer{ID: "p1", URL: "http://127.0.0.1:1"}, Epoch: "e1", Remove: []string{upper}}))
-	if status != http.StatusOK || resp.Resync || g.reg.aliveHolders(testHash) != 0 {
-		t.Fatalf("delta remove = %d %+v, holders %d", status, resp, g.reg.aliveHolders(testHash))
+	if status != http.StatusOK || resp.Resync || reg.aliveHolders(testHash) != 0 {
+		t.Fatalf("delta remove = %d %+v, holders %d", status, resp, reg.aliveHolders(testHash))
 	}
 	status, _, resp = post(t, srv, announceJSON(t, apis.AnnounceRequest{Peer: apis.Peer{ID: "p1", URL: "http://127.0.0.1:1"}, Epoch: "e2", Add: []string{testHash}}))
 	if status != http.StatusOK || !resp.Resync || len(clustertest.Diag(t, srv.URL).Peers) != 0 {
@@ -68,6 +69,7 @@ func TestAnnounceRegistersCanonicalInventory(t *testing.T) {
 
 func TestAnnounceRejectsInvalidRequestsAtomically(t *testing.T) {
 	g, srv := newTestGateway(t, clustertest.NewHub(t), nil)
+	reg := gatewayRegistry(g)
 	peer := apis.Peer{ID: "p1", URL: "http://127.0.0.1:1"}
 	valid := apis.AnnounceRequest{Peer: peer, Epoch: "e", Full: true, Add: []string{testHash}}
 	tests := []struct {
@@ -110,7 +112,7 @@ func TestAnnounceRejectsInvalidRequestsAtomically(t *testing.T) {
 			t.Fatalf("%s: error echoes request data: %q", tt.name, body)
 		}
 	}
-	if d := clustertest.Diag(t, srv.URL); len(d.Peers) != 0 || g.reg.aliveHolders(testHash) != 0 {
+	if d := clustertest.Diag(t, srv.URL); len(d.Peers) != 0 || reg.aliveHolders(testHash) != 0 {
 		t.Fatalf("registry changed by invalid announces: %+v", d.Peers)
 	}
 }
@@ -119,6 +121,7 @@ func TestAnnounceRejectsInvalidRequestsAtomically(t *testing.T) {
 func TestAnnounceBodyLimit(t *testing.T) {
 	// The 32 MiB posts can outlast the default TTL under -race load.
 	g, srv := newTestGateway(t, clustertest.NewHub(t), func(cfg *Config, _ string) { cfg.PeerTTL = time.Hour })
+	reg := gatewayRegistry(g)
 	pad := func(req apis.AnnounceRequest, n int) string {
 		body := announceJSON(t, req)
 		return body + strings.Repeat(" ", n-len(body))
@@ -131,7 +134,7 @@ func TestAnnounceBodyLimit(t *testing.T) {
 	if status != http.StatusRequestEntityTooLarge || strings.Contains(body, testHash) {
 		t.Fatalf("announce over the limit = %d %q, want 413", status, body)
 	}
-	if g.reg.aliveHolders(testHash) != 1 {
+	if reg.aliveHolders(testHash) != 1 {
 		t.Fatal("oversize delta changed the registry")
 	}
 }
@@ -139,16 +142,17 @@ func TestAnnounceBodyLimit(t *testing.T) {
 func TestAnnounceRequiresSecret(t *testing.T) {
 	const secret = "s3cret"
 	g, srv := newTestGateway(t, clustertest.NewHub(t), func(cfg *Config, _ string) { cfg.Secret = secret })
+	reg := gatewayRegistry(g)
 	body := announceJSON(t, apis.AnnounceRequest{Peer: apis.Peer{ID: "p1", URL: "http://127.0.0.1:1"}, Epoch: "e", Full: true, Add: []string{testHash}})
 	for _, hdr := range [][]string{nil, {"Authorization", "Bearer nope"}, {"Authorization", "Basic " + secret}, {"Authorization", "Bearer " + secret + "x"}} {
 		if status, text, _ := post(t, srv, body, hdr...); status != http.StatusUnauthorized || strings.Contains(text, secret) {
 			t.Fatalf("announce with %v = %d %q, want 401", hdr, status, text)
 		}
 	}
-	if g.reg.aliveHolders(testHash) != 0 {
+	if reg.aliveHolders(testHash) != 0 {
 		t.Fatal("unauthenticated announce changed the registry")
 	}
-	if status, _, resp := post(t, srv, body, "Authorization", "Bearer "+secret); status != http.StatusOK || resp.TTL != 30 || g.reg.aliveHolders(testHash) != 1 {
+	if status, _, resp := post(t, srv, body, "Authorization", "Bearer "+secret); status != http.StatusOK || resp.TTL != 30 || reg.aliveHolders(testHash) != 1 {
 		t.Fatalf("authenticated announce = %d %+v", status, resp)
 	}
 	if _, text := request(t, http.MethodGet, srv.URL+apis.PeersPath, ""); strings.Contains(text, secret) {

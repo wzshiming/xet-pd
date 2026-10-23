@@ -67,20 +67,6 @@ func postPull(t *testing.T, srv *httptest.Server, hash xet.XorbHash) int {
 	return resp.StatusCode
 }
 
-func pullOf(p *Peer, hash xet.XorbHash) *pull {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.pulls[hash]
-}
-
-func admitted(p *Peer, hash xet.XorbHash) func() bool {
-	return func() bool {
-		p.mu.Lock()
-		defer p.mu.Unlock()
-		return p.xorbs.Get(hash) != nil
-	}
-}
-
 func TestQueuedPullDroppedWhenClientLeaves(t *testing.T) {
 	p, srv, g, b, release := backlogged(t)
 	leave := clientGet(t, p, b)
@@ -92,13 +78,11 @@ func TestQueuedPullDroppedWhenClientLeaves(t *testing.T) {
 	leave()
 	clustertest.WaitFor(t, clustertest.WaitTimeout, "b to leave p.pulls after its only client left", func() bool { return pullOf(p, b) == nil })
 	select {
-	case <-fb.done:
+	case <-pullDone(fb):
 	case <-time.After(clustertest.WaitTimeout):
 		t.Fatal("dropped pull of b never finished")
 	}
-	p.mu.Lock()
-	_, cooling := p.cooldown[b]
-	p.mu.Unlock()
+	_, cooling := cooldownOf(p, b)
 	if cooling || len(g.Requests()) != 1 {
 		t.Fatalf("after dropping b: cooling %v, gateway GETs %d, want false and 1", cooling, len(g.Requests()))
 	}
@@ -121,11 +105,9 @@ func TestQueuedGatewayPullKeptWithoutClients(t *testing.T) {
 		t.Fatalf("pull b = %d, want 202", code)
 	}
 	// The handler's release, which settles any drop under p.mu, ran before the 202.
-	p.mu.Lock()
-	fb := p.pulls[b]
-	kept := fb != nil && fb.queued && fb.keep
-	_, cooling := p.cooldown[b]
-	p.mu.Unlock()
+	fb, _, queued, keep := pullStatus(p, b)
+	kept := fb != nil && queued && keep
+	_, cooling := cooldownOf(p, b)
 	if !kept || cooling {
 		t.Fatalf("gateway pull of b after the 202: queued and kept %v, cooling %v, want true and false", kept, cooling)
 	}
@@ -145,16 +127,14 @@ func TestQueuedGatewayPullKeptWhenJoinedClientLeaves(t *testing.T) {
 	// The pull goroutine holds one reference, the joined client the other.
 	var fb *pull
 	clustertest.WaitFor(t, clustertest.WaitTimeout, "a client joining the pull of b", func() bool {
-		p.mu.Lock()
-		defer p.mu.Unlock()
-		fb = p.pulls[b]
-		return fb != nil && fb.refs == 2
+		var refs int
+		fb, refs, _, _ = pullStatus(p, b)
+		return fb != nil && refs == 2
 	})
 	leave()
 	// leave returns after the handler's release, which settles any drop under p.mu.
-	p.mu.Lock()
-	kept := p.pulls[b] == fb && fb.queued && fb.keep
-	p.mu.Unlock()
+	f, _, queued, keep := pullStatus(p, b)
+	kept := f == fb && queued && keep
 	if !kept {
 		t.Fatal("gateway pull of b dropped when a joined client left")
 	}
@@ -178,9 +158,8 @@ func TestQueuedPullKeptOnceGatewayJoins(t *testing.T) {
 	}
 	leave()
 	// leave returns after the handler's release, which settles any drop under p.mu.
-	p.mu.Lock()
-	kept := p.pulls[b] == fb && fb.queued && fb.keep
-	p.mu.Unlock()
+	f, _, queued, keep := pullStatus(p, b)
+	kept := f == fb && queued && keep
 	if !kept {
 		t.Fatal("pull of b dropped when its client left after the gateway joined it")
 	}
@@ -206,13 +185,11 @@ func TestQueuedPullUnlistedBeforeHandlerReturns(t *testing.T) {
 			t.Fatalf("iteration %d: p.pulls[b] = %p once its only client's handler returned, want nil", i, got)
 		}
 		select {
-		case <-fb.done:
+		case <-pullDone(fb):
 		case <-time.After(clustertest.WaitTimeout):
 			t.Fatalf("iteration %d: dropped pull of b never finished", i)
 		}
-		p.mu.Lock()
-		_, cooling := p.cooldown[b]
-		p.mu.Unlock()
+		_, cooling := cooldownOf(p, b)
 		if cooling {
 			t.Fatalf("iteration %d: b cooling after its dropped pull ended", i)
 		}
@@ -228,18 +205,10 @@ func TestQueuedPullDropKeepsNewerPull(t *testing.T) {
 		fb = pullOf(p, b)
 		return fb != nil
 	})
-	newer := &pull{} // stands in for a pull of b listed after fb was dropped
-	p.mu.Lock()
-	p.pulls[b] = newer
-	p.mu.Unlock()
-	t.Cleanup(func() {
-		p.mu.Lock()
-		delete(p.pulls, b)
-		p.mu.Unlock()
-	})
+	newer := plantPull(t, p, b) // stands in for a pull of b listed after fb was dropped
 	leave()
 	select {
-	case <-fb.done:
+	case <-pullDone(fb):
 	case <-time.After(clustertest.WaitTimeout):
 		t.Fatal("dropped pull of b never finished")
 	}

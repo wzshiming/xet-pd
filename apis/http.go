@@ -11,7 +11,7 @@ import (
 	"strings"
 )
 
-// Origin accepts an absolute http(s) origin: a host, an optional port 1..65535 ("host:" is rejected) and no userinfo, path, query or fragment.
+// Origin canonicalizes an absolute http(s) origin to scheme://host[:port], dropping a lone trailing slash; it rejects userinfo, a path, query or fragment, "host:" and ports outside 1..65535, and its errors never echo the input.
 func Origin(raw string) (string, error) {
 	u, err := url.Parse(raw)
 	if err != nil {
@@ -44,7 +44,7 @@ func Authorize(w http.ResponseWriter, r *http.Request, secret string) bool {
 	return false
 }
 
-// XorbURL is the CAS xorb route of hash at origin.
+// XorbURL is origin + XorbPathPrefix + hash: where peers pull a xorb from the gateway, the gateway relays it from a holder and xet clients fetch it as the gateway's reconstruction replies direct them.
 func XorbURL(origin, hash string) string { return origin + XorbPathPrefix + hash }
 
 // ReadJSON decodes a request body of exactly one JSON value within limit bytes into v; otherwise it answers 413 or 400 and reports false.
@@ -61,7 +61,7 @@ func ReadJSON(w http.ResponseWriter, r *http.Request, limit int64, v any) bool {
 	return false
 }
 
-// decode reads exactly one JSON value from r into v.
+// decode reads exactly one JSON value from r into v; ReadJSON and DecodeJSON share it so requests and replies obey the same rule.
 func decode(r io.Reader, v any) error {
 	dec := json.NewDecoder(r)
 	if err := dec.Decode(v); err != nil {

@@ -2,7 +2,6 @@ package peer
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -25,22 +24,6 @@ import (
 	"github.com/wzshiming/xet-pd/internal/clustertest"
 )
 
-// settled waits until no pull, spool or pinned reader is left.
-func settled(t *testing.T, p *Peer) {
-	t.Helper()
-	clustertest.WaitFor(t, clustertest.WaitTimeout, "spool cleanup", spoolEmpty(p))
-	clustertest.WaitFor(t, clustertest.WaitTimeout, "readers released", func() bool {
-		p.mu.Lock()
-		defer p.mu.Unlock()
-		for e := range p.xorbs.Oldest() {
-			if e.V.pins != 0 {
-				return false
-			}
-		}
-		return len(p.pulls) == 0
-	})
-}
-
 // pullAndSettle pulls hash through the peer and waits for the pull to drain.
 func pullAndSettle(t *testing.T, p *Peer, srv *httptest.Server, hash xet.XorbHash, body []byte) {
 	t.Helper()
@@ -49,12 +32,6 @@ func pullAndSettle(t *testing.T, p *Peer, srv *httptest.Server, hash xet.XorbHas
 		t.Fatalf("GET %s = %d, %d bytes, %v", hash, resp.StatusCode, len(got), err)
 	}
 	settled(t, p)
-}
-
-func usage(p *Peer) int64 {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.xorbs.Usage()
 }
 
 // holdWriter is a ResponseWriter whose body writes wait for the gate to open.
@@ -119,7 +96,7 @@ func TestStartupDropsCorruptObject(t *testing.T) {
 		t.Fatal(err)
 	}
 	g := clustertest.NewFakeGateway(t, clustertest.ServeByHash(nil))
-	p, _ := newTestPeer(t, g.URL, func(c *Config) { c.CacheDir, c.Heartbeat = dir, time.Hour })
+	p, _ := newTestPeer(t, g.URL, func(c *Config) { c.DataDir, c.Heartbeat = dir, time.Hour })
 	if got := g.Announce(t, 0).Req; !got.Full || !slices.Equal(got.Add, hashes(a)) {
 		t.Fatalf("startup announce = %+v, want only %s", got, a)
 	}
@@ -333,18 +310,14 @@ func TestResyncSendsFullWithCurrentInventory(t *testing.T) {
 	if lost.Code != http.StatusInternalServerError || !hasAdd(lost, c) || !hasRemove(lost, a) {
 		t.Fatalf("lost delta = %d %+v", lost.Code, lost.Req)
 	}
-	p.mu.Lock()
-	p.kick()
-	p.mu.Unlock()
+	wakeAnnouncer(p)
 	retry := g.Announce(t, n+1)
 	if !retry.Req.Full || !slices.Equal(retry.Req.Add, hashes(b, c)) || len(retry.Req.Remove) != 0 {
 		t.Fatalf("retry after the lost delta = %+v, want Full %v", retry.Req, hashes(b, c))
 	}
 	// A resync demanded on a delta is answered with a Full at once.
 	mode.Store(2)
-	p.mu.Lock()
-	p.kick()
-	p.mu.Unlock()
+	wakeAnnouncer(p)
 	demanded := g.Announce(t, n+2)
 	if demanded.Req.Full || len(demanded.Req.Add)+len(demanded.Req.Remove) != 0 {
 		t.Fatalf("heartbeat before the resync = %+v", demanded.Req)
@@ -353,7 +326,7 @@ func TestResyncSendsFullWithCurrentInventory(t *testing.T) {
 	if !full.Req.Full || !slices.Equal(full.Req.Add, hashes(b, c)) || len(full.Req.Remove) != 0 {
 		t.Fatalf("resync Full = %+v, want %v", full.Req, hashes(b, c))
 	}
-	if clustertest.HasXorb(t, p.store, a) || !clustertest.HasXorb(t, p.store, b) || !clustertest.HasXorb(t, p.store, c) {
+	if stored(t, p, a) || !stored(t, p, b) || !stored(t, p, c) {
 		t.Fatal("store does not match the announced inventory")
 	}
 }
@@ -417,9 +390,7 @@ func TestMissingStoredObjectLeavesInventoryAndPullsAgain(t *testing.T) {
 	pullAndSettle(t, p, srv, hash, body)
 	_, n := g.FindAnnounce(t, 1, func(a clustertest.Announce) bool { return hasAdd(a, hash) })
 	// The stored file is lost underneath a live inventory entry.
-	if err := p.store.DeleteXorb(context.Background(), hash); err != nil {
-		t.Fatal(err)
-	}
+	deleteStored(t, p, hash)
 	if resp, _, _ := do(t, http.MethodGet, xorbURL(srv, hash), apis.PeerHeader, "gw"); resp.StatusCode != http.StatusNotFound {
 		t.Fatalf("relay GET of a missing object = %d", resp.StatusCode)
 	}
@@ -433,8 +404,8 @@ func TestMissingStoredObjectLeavesInventoryAndPullsAgain(t *testing.T) {
 	if n := len(g.Requests()); n != 2 {
 		t.Fatalf("gateway GETs = %d, want 2 (second pull)", n)
 	}
-	if u := usage(p); u != int64(len(body)) || !clustertest.HasXorb(t, p.store, hash) {
-		t.Fatalf("usage after the second pull = %d, present %v", u, clustertest.HasXorb(t, p.store, hash))
+	if u := usage(p); u != int64(len(body)) || !stored(t, p, hash) {
+		t.Fatalf("usage after the second pull = %d, present %v", u, stored(t, p, hash))
 	}
 	if added := g.Announce(t, n+2); added.Req.Full || !slices.Equal(added.Req.Add, hashes(hash)) || len(added.Req.Remove) != 0 {
 		t.Fatalf("announce after the second pull = %+v, want Add %s", added.Req, hash)
@@ -446,9 +417,7 @@ func TestPullRestoresMissingStoredObject(t *testing.T) {
 	gateway := clustertest.NewFakeGateway(t, clustertest.ServeBody(body))
 	seed, _ := newTestPeer(t, gateway.URL, nil)
 	commitDirect(t, seed, hash, body)
-	if err := seed.store.DeleteXorb(context.Background(), hash); err != nil {
-		t.Fatal(err)
-	}
+	deleteStored(t, seed, hash)
 	payload := `{"hash":"` + hash.String() + `"}`
 	request := httptest.NewRequest(http.MethodPost, apis.PullPath, strings.NewReader(payload))
 	response := httptest.NewRecorder()
@@ -458,7 +427,7 @@ func TestPullRestoresMissingStoredObject(t *testing.T) {
 	}
 	clustertest.WaitFor(t, clustertest.WaitTimeout, "pull of the missing object", func() bool { return len(gateway.Requests()) == 1 })
 	settled(t, seed)
-	if !clustertest.HasXorb(t, seed.store, hash) {
+	if !stored(t, seed, hash) {
 		t.Fatal("accepted pull did not restore the missing object")
 	}
 }
@@ -474,9 +443,7 @@ func TestStaleReaderDoesNotTouchNewerGeneration(t *testing.T) {
 	if first == nil || second == nil {
 		t.Fatal("pin failed for a committed object")
 	}
-	if err := p.store.DeleteXorb(context.Background(), hash); err != nil {
-		t.Fatal(err)
-	}
+	deleteStored(t, p, hash)
 	if err := p.serveStored(httptest.NewRecorder(), req, first); !errors.Is(err, fs.ErrNotExist) {
 		t.Fatalf("read of the missing file = %v", err)
 	}
@@ -491,9 +458,7 @@ func TestStaleReaderDoesNotTouchNewerGeneration(t *testing.T) {
 	if rd == nil || rd == first {
 		t.Fatal("new generation missing from the inventory")
 	}
-	p.mu.Lock()
-	pins := rd.V.pins
-	p.mu.Unlock()
+	pins := pinsOf(p, rd)
 	if pins != 1 {
 		t.Fatalf("new generation pins = %d after the stale unpin, want 1", pins)
 	}
@@ -519,9 +484,7 @@ func TestStaleDropDoesNotAnnounce(t *testing.T) {
 	if first == nil || second == nil {
 		t.Fatal("pin failed for a committed object")
 	}
-	if err := p.store.DeleteXorb(context.Background(), hash); err != nil {
-		t.Fatal(err)
-	}
+	deleteStored(t, p, hash)
 	_ = p.serveStored(httptest.NewRecorder(), req, first) // confirms the miss: drops the first generation and announces it
 	_, j := g.FindAnnounce(t, i+1, func(x clustertest.Announce) bool { return hasRemove(x, hash) })
 	hold := make(chan struct{})
@@ -538,7 +501,7 @@ func TestStaleDropDoesNotAnnounce(t *testing.T) {
 	n := len(g.Announces())
 	p.drop(second)
 	p.unpin(second)
-	if len(p.wake) != 0 {
+	if wakePending(p) {
 		t.Fatal("stale drop woke the announcer")
 	}
 	g.SetReply(nil)
@@ -564,7 +527,7 @@ func TestUnreadableStoredObjectIsNotDropped(t *testing.T) {
 	g := clustertest.NewFakeGateway(t, clustertest.ServeByHash(nil))
 	p, srv := newTestPeer(t, g.URL, func(c *Config) { c.Heartbeat = time.Hour })
 	commitDirect(t, p, hash, body)
-	path := xorbPath(p.cfg.CacheDir, hash)
+	path := xorbPath(configOf(p).DataDir, hash)
 	if err := os.Chmod(path, 0); err != nil {
 		t.Fatal(err)
 	}
@@ -599,7 +562,7 @@ func TestReadyDecisionSurvivesEviction(t *testing.T) {
 		t.Fatalf("acquire = %v, %v, %v, want a reserved ready", f, rd, err)
 	}
 	commitDirect(t, p, b, bodyB)
-	if !clustertest.HasXorb(t, p.store, a) {
+	if !stored(t, p, a) {
 		t.Fatal("ready object evicted between the decision and the read")
 	}
 	req := httptest.NewRequest(http.MethodGet, "/v1/xorbs/default/"+a.String(), nil)
@@ -608,10 +571,8 @@ func TestReadyDecisionSurvivesEviction(t *testing.T) {
 		t.Fatalf("read after the ready decision = %d, %v", w.Code, err)
 	}
 	// The read released its pin and the cache fits its cap again, without any gateway fetch.
-	p.mu.Lock()
-	u, pins := p.xorbs.Usage(), rd.V.pins
-	p.mu.Unlock()
-	if u > p.cfg.XorbCacheSize || pins != 0 || len(g.Requests()) != 0 {
+	u, pins := usage(p), pinsOf(p, rd)
+	if u > configOf(p).XorbCacheSize || pins != 0 || len(g.Requests()) != 0 {
 		t.Fatalf("after release: usage %d, pins %d, gateway GETs %d", u, pins, len(g.Requests()))
 	}
 }
@@ -629,7 +590,7 @@ func TestLRUEvictsLeastRecentlyUsed(t *testing.T) {
 	// Reading a makes b the eviction candidate.
 	pullAndSettle(t, p, srv, a, bodyA)
 	pullAndSettle(t, p, srv, c, bodyC)
-	if clustertest.HasXorb(t, p.store, b) || !clustertest.HasXorb(t, p.store, a) || !clustertest.HasXorb(t, p.store, c) {
+	if stored(t, p, b) || !stored(t, p, a) || !stored(t, p, c) {
 		t.Fatal("expected b evicted, a and c kept")
 	}
 	if u := usage(p); u != int64(len(bodyA)+len(bodyC)) {
@@ -644,7 +605,7 @@ func TestLRUEvictsLeastRecentlyUsed(t *testing.T) {
 	}
 	// A GET for the evicted object pulls again instead of trusting stale state.
 	pullAndSettle(t, p, srv, b, bodyB)
-	if clustertest.HasXorb(t, p.store, a) || !clustertest.HasXorb(t, p.store, b) || !clustertest.HasXorb(t, p.store, c) {
+	if stored(t, p, a) || !stored(t, p, b) || !stored(t, p, c) {
 		t.Fatal("expected a evicted after pulling b again")
 	}
 }
@@ -661,23 +622,19 @@ func TestLRUProtectsActiveReadersAndConvergesOnRelease(t *testing.T) {
 	wa, doneA := serveHeld(t, p, a)
 	wb, doneB := serveHeld(t, p, b)
 	// The pull leaves p.pulls under the lock that admits b; the store file lands earlier.
-	clustertest.WaitFor(t, clustertest.WaitTimeout, "b commit", func() bool {
-		p.mu.Lock()
-		defer p.mu.Unlock()
-		return p.pulls[b] == nil
-	})
-	if !clustertest.HasXorb(t, p.store, a) || usage(p) != int64(len(bodyA)+len(bodyB)) {
+	clustertest.WaitFor(t, clustertest.WaitTimeout, "b commit", func() bool { return pullOf(p, b) == nil })
+	if !stored(t, p, a) || usage(p) != int64(len(bodyA)+len(bodyB)) {
 		t.Fatal("object with an active reader was evicted")
 	}
 	finishHeld(t, wa, doneA, bodyA)
-	clustertest.WaitFor(t, clustertest.WaitTimeout, "a evicted on release", func() bool { return !clustertest.HasXorb(t, p.store, a) })
-	if !clustertest.HasXorb(t, p.store, b) {
+	clustertest.WaitFor(t, clustertest.WaitTimeout, "a evicted on release", func() bool { return !stored(t, p, a) })
+	if !stored(t, p, b) {
 		t.Fatal("streamed object evicted while its reader was attached")
 	}
 	finishHeld(t, wb, doneB, bodyB)
 	settled(t, p)
-	if !clustertest.HasXorb(t, p.store, b) || usage(p) != int64(len(bodyB)) {
-		t.Fatalf("final usage = %d, b present %v", usage(p), clustertest.HasXorb(t, p.store, b))
+	if !stored(t, p, b) || usage(p) != int64(len(bodyB)) {
+		t.Fatalf("final usage = %d, b present %v", usage(p), stored(t, p, b))
 	}
 	if n := len(g.Requests()); n != 2 {
 		t.Fatalf("gateway GETs = %d, want 2", n)
@@ -695,7 +652,7 @@ func TestOversizedObjectServedThenEvicted(t *testing.T) {
 		c.Heartbeat, c.XorbCacheSize = 20*time.Millisecond, int64(len(body)/2)
 	})
 	pullAndSettle(t, p, srv, hash, body)
-	if clustertest.HasXorb(t, p.store, hash) || usage(p) != 0 {
+	if stored(t, p, hash) || usage(p) != 0 {
 		t.Fatalf("oversized object kept, usage %d", usage(p))
 	}
 	n := len(g.Announces())
@@ -730,17 +687,17 @@ func TestRestartRebuildsUsageAndOrder(t *testing.T) {
 	}
 	g := clustertest.NewFakeGateway(t, clustertest.ServeByHash(map[xet.XorbHash][]byte{d: bodyD}))
 	p, srv := newTestPeer(t, g.URL, func(cfg *Config) {
-		cfg.CacheDir, cfg.Heartbeat, cfg.XorbCacheSize = dir, time.Hour, int64(len(bodyA)+len(bodyC))
+		cfg.DataDir, cfg.Heartbeat, cfg.XorbCacheSize = dir, time.Hour, int64(len(bodyA)+len(bodyC))
 	})
 	// Oldest by mtime goes first at startup, and the Full matches what survived.
 	if got := g.Announce(t, 0).Req; !got.Full || !slices.Equal(got.Add, hashes(a, c)) {
 		t.Fatalf("startup Full = %+v, want %v", got, hashes(a, c))
 	}
-	if clustertest.HasXorb(t, p.store, b) || usage(p) != int64(len(bodyA)+len(bodyC)) {
-		t.Fatalf("startup eviction: b present %v, usage %d", clustertest.HasXorb(t, p.store, b), usage(p))
+	if stored(t, p, b) || usage(p) != int64(len(bodyA)+len(bodyC)) {
+		t.Fatalf("startup eviction: b present %v, usage %d", stored(t, p, b), usage(p))
 	}
 	pullAndSettle(t, p, srv, d, bodyD)
-	if clustertest.HasXorb(t, p.store, c) || !clustertest.HasXorb(t, p.store, a) || !clustertest.HasXorb(t, p.store, d) {
+	if stored(t, p, c) || !stored(t, p, a) || !stored(t, p, d) {
 		t.Fatal("expected c evicted next, a and d kept")
 	}
 }
@@ -777,7 +734,7 @@ func TestCloseCancelsHungAnnounceAndPull(t *testing.T) {
 	if r := <-late; r.err == nil && r.resp.StatusCode == http.StatusOK {
 		t.Fatal("reader completed after Close")
 	}
-	if clustertest.HasXorb(t, p.store, hash) {
+	if stored(t, p, hash) {
 		t.Fatal("canceled pull published the xorb")
 	}
 	if n := len(g.Announces()); n != 1 {

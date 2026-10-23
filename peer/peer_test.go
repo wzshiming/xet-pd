@@ -64,20 +64,9 @@ func xorbPath(dir string, hash xet.XorbHash) string {
 	return filepath.Join(dir, filepath.FromSlash(storage.ObjectKey("xorbs", hash.String())))
 }
 
-// commitDirect stores body underneath a running peer and registers it as a finished pull would.
-func commitDirect(t *testing.T, p *Peer, hash xet.XorbHash, body []byte) {
-	t.Helper()
-	if _, err := p.store.PutXorb(context.Background(), hash, bytes.NewReader(body)); err != nil {
-		t.Fatal(err)
-	}
-	p.mu.Lock()
-	p.admit(hash, int64(len(body)), nil)
-	p.mu.Unlock()
-}
-
 func newTestPeer(t *testing.T, gw string, mod func(*Config)) (*Peer, *httptest.Server) {
 	t.Helper()
-	cfg := Config{Advertise: "http://seed.test", Gateway: gw, CacheDir: t.TempDir()}
+	cfg := Config{Advertise: "http://seed.test", Gateway: gw, DataDir: t.TempDir()}
 	if mod != nil {
 		mod(&cfg)
 	}
@@ -116,13 +105,6 @@ func do(t *testing.T, method, url string, hdr ...string) (*http.Response, []byte
 	return resp, body, err
 }
 
-func spoolEmpty(p *Peer) func() bool {
-	return func() bool {
-		left, _ := filepath.Glob(filepath.Join(p.spoolDir, "*"))
-		return len(left) == 0
-	}
-}
-
 func TestStartupFullAnnouncesSeededInventory(t *testing.T) {
 	t.Setenv("HF_TOKEN", "hf_must_not_leak")
 	a, bodyA := clustertest.MakeXorb(t, 20, 2, 8<<10)
@@ -135,10 +117,10 @@ func TestStartupFullAnnouncesSeededInventory(t *testing.T) {
 		w.WriteHeader(http.StatusInternalServerError)
 	})
 	p, srv := newTestPeer(t, g.URL, func(c *Config) {
-		c.CacheDir, c.Heartbeat, c.Secret = dir, time.Hour, "s3cret"
+		c.DataDir, c.Heartbeat, c.Secret = dir, time.Hour, "s3cret"
 	})
 	first := g.Announce(t, 0)
-	want := apis.AnnounceRequest{Peer: apis.Peer{ID: p.id, URL: "http://seed.test"}, Epoch: p.epoch, Full: true, Add: hashes(a, b)}
+	want := apis.AnnounceRequest{Peer: apis.Peer{ID: peerID(p), URL: "http://seed.test"}, Epoch: peerEpoch(p), Full: true, Add: hashes(a, b)}
 	if got := first.Req; !slices.Equal(got.Add, want.Add) || got.Peer != want.Peer || got.Epoch != want.Epoch || !got.Full || len(got.Remove) != 0 {
 		t.Fatalf("startup announce = %+v, want %+v", got, want)
 	}
@@ -155,9 +137,9 @@ func TestStartupFullAnnouncesSeededInventory(t *testing.T) {
 }
 
 func TestConfigValidation(t *testing.T) {
-	base := Config{Advertise: "http://seed:8080/", Gateway: "https://gw.example/", CacheDir: t.TempDir()}
+	base := Config{Advertise: "http://seed:8080/", Gateway: "https://gw.example/", DataDir: t.TempDir()}
 	bad := map[string]func(*Config){
-		"missing cache dir":     func(c *Config) { c.CacheDir = "" },
+		"missing data dir":      func(c *Config) { c.DataDir = "" },
 		"gateway userinfo":      func(c *Config) { c.Gateway = "http://u:p@gw" },
 		"gateway query":         func(c *Config) { c.Gateway = "http://gw?x=1" },
 		"gateway fragment":      func(c *Config) { c.Gateway = "http://gw#f" },
@@ -193,11 +175,12 @@ func TestConfigValidation(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = p.Close() }()
-	if p.cfg.Advertise != "http://seed:8080" || p.cfg.Gateway != "https://gw.example" {
-		t.Fatalf("normalized URLs = %q %q", p.cfg.Advertise, p.cfg.Gateway)
+	cfg := configOf(p)
+	if cfg.Advertise != "http://seed:8080" || cfg.Gateway != "https://gw.example" {
+		t.Fatalf("normalized URLs = %q %q", cfg.Advertise, cfg.Gateway)
 	}
-	if p.cfg.MaxPulls != 8 || p.cfg.PullTimeout != 10*time.Minute || p.cfg.Heartbeat != 10*time.Second {
-		t.Fatalf("defaults = %+v", p.cfg)
+	if cfg.MaxPulls != 8 || cfg.PullTimeout != 10*time.Minute || cfg.Heartbeat != 10*time.Second {
+		t.Fatalf("defaults = %+v", cfg)
 	}
 }
 
@@ -214,7 +197,7 @@ func TestNewIdentityAndSpoolCleanup(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	a, err := New(Config{Advertise: "http://seed:8080", Gateway: "http://gw", CacheDir: dir})
+	a, err := New(Config{Advertise: "http://seed:8080", Gateway: "http://gw", DataDir: dir})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -227,24 +210,24 @@ func TestNewIdentityAndSpoolCleanup(t *testing.T) {
 			t.Fatalf("New removed %s: %v", f, err)
 		}
 	}
-	b, err := New(Config{Advertise: "http://seed:8080/", Gateway: "http://gw2", CacheDir: t.TempDir()})
+	b, err := New(Config{Advertise: "http://seed:8080/", Gateway: "http://gw2", DataDir: t.TempDir()})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = b.Close() }()
-	if a.id == "" || a.id != b.id {
-		t.Fatalf("id not stable for the same advertise: %q vs %q", a.id, b.id)
+	if peerID(a) == "" || peerID(a) != peerID(b) {
+		t.Fatalf("id not stable for the same advertise: %q vs %q", peerID(a), peerID(b))
 	}
-	c, err := New(Config{Advertise: "http://other:8080", Gateway: "http://gw", CacheDir: t.TempDir()})
+	c, err := New(Config{Advertise: "http://other:8080", Gateway: "http://gw", DataDir: t.TempDir()})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = c.Close() }()
-	if c.id == a.id {
-		t.Fatalf("different advertise shares id %q", a.id)
+	if peerID(c) == peerID(a) {
+		t.Fatalf("different advertise shares id %q", peerID(a))
 	}
-	if a.epoch == "" || a.epoch == b.epoch {
-		t.Fatalf("epoch must be random per start: %q vs %q", a.epoch, b.epoch)
+	if peerEpoch(a) == "" || peerEpoch(a) == peerEpoch(b) {
+		t.Fatalf("epoch must be random per start: %q vs %q", peerEpoch(a), peerEpoch(b))
 	}
 	if err := a.Close(); err != nil {
 		t.Fatal(err)
@@ -379,7 +362,7 @@ func TestGatedPullServesPrefixBeforeUpstreamCompletes(t *testing.T) {
 		t.Fatalf("range past the flushed prefix returned %d before release", r.resp.StatusCode)
 	default:
 	}
-	if clustertest.HasXorb(t, p.store, hash) {
+	if stored(t, p, hash) {
 		t.Fatal("xorb published before upstream finished")
 	}
 	close(release)
@@ -399,7 +382,7 @@ func TestGatedPullServesPrefixBeforeUpstreamCompletes(t *testing.T) {
 		t.Fatalf("gateway GETs = %d, want 1", n)
 	}
 	h := g.Requests()[0].Header
-	if h.Get(apis.PeerHeader) != p.id || h.Get("Authorization") != "" || h.Get("Range") != "" {
+	if h.Get(apis.PeerHeader) != peerID(p) || h.Get("Authorization") != "" || h.Get("Range") != "" {
 		t.Fatalf("upstream request headers = %v", h)
 	}
 	clustertest.WaitFor(t, clustertest.WaitTimeout, "spool cleanup", spoolEmpty(p))
@@ -426,12 +409,10 @@ func TestStreamDoesNotWaitForValidation(t *testing.T) {
 		t.Fatalf("stream of a body failing validation = %d, %d of %d bytes, %v, want 200 with every byte", resp.StatusCode, len(got), len(served), err)
 	}
 	clustertest.WaitFor(t, clustertest.WaitTimeout, "spool cleanup", spoolEmpty(p))
-	if clustertest.HasXorb(t, p.store, hash) {
+	if stored(t, p, hash) {
 		t.Fatal("xorb failing validation published")
 	}
-	p.mu.Lock()
-	_, cooling := p.cooldown[hash]
-	p.mu.Unlock()
+	_, cooling := cooldownOf(p, hash)
 	if !cooling {
 		t.Fatal("failed pull left no cooldown")
 	}
@@ -446,11 +427,7 @@ func TestStreamDoesNotWaitForValidation(t *testing.T) {
 	if pr.StatusCode != http.StatusAccepted {
 		t.Fatalf("pull in cooldown = %d, want 202", pr.StatusCode)
 	}
-	clustertest.WaitFor(t, clustertest.WaitTimeout, "forced pull exit", func() bool {
-		p.mu.Lock()
-		defer p.mu.Unlock()
-		return len(p.pulls) == 0
-	})
+	clustertest.WaitFor(t, clustertest.WaitTimeout, "forced pull exit", noPulls(p))
 	clustertest.WaitFor(t, clustertest.WaitTimeout, "spool cleanup", spoolEmpty(p))
 	if n := len(g.Requests()); n != 2 {
 		t.Fatalf("gateway GETs after the forced pull = %d, want 2", n)
@@ -550,12 +527,10 @@ func TestUpstreamFailures(t *testing.T) {
 			t.Fatal("empty body served as 200")
 		}
 		clustertest.WaitFor(t, clustertest.WaitTimeout, "spool cleanup", spoolEmpty(p))
-		if clustertest.HasXorb(t, p.store, hash) {
+		if stored(t, p, hash) {
 			t.Fatal("empty xorb published")
 		}
-		p.mu.Lock()
-		err := p.cooldown[hash].err
-		p.mu.Unlock()
+		err, _ := cooldownOf(p, hash)
 		if !errors.Is(err, errEmpty) {
 			t.Fatalf("cooldown error = %v, want %v", err, errEmpty)
 		}
@@ -570,12 +545,10 @@ func TestUpstreamFailures(t *testing.T) {
 			t.Fatal("empty chunked body served as 200")
 		}
 		clustertest.WaitFor(t, clustertest.WaitTimeout, "spool cleanup", spoolEmpty(p))
-		if clustertest.HasXorb(t, p.store, hash) {
+		if stored(t, p, hash) {
 			t.Fatal("empty xorb published")
 		}
-		p.mu.Lock()
-		err := p.cooldown[hash].err
-		p.mu.Unlock()
+		err, _ := cooldownOf(p, hash)
 		if !errors.Is(err, errEmpty) {
 			t.Fatalf("cooldown error = %v, want %v", err, errEmpty)
 		}
@@ -586,7 +559,7 @@ func TestUpstreamFailures(t *testing.T) {
 		u := xorbURL(srv, other)
 		_, _, _ = do(t, http.MethodGet, u)
 		clustertest.WaitFor(t, clustertest.WaitTimeout, "spool cleanup", spoolEmpty(p))
-		if clustertest.HasXorb(t, p.store, other) {
+		if stored(t, p, other) {
 			t.Fatal("invalid xorb published")
 		}
 		if resp, _, _ := do(t, http.MethodGet, u); resp.StatusCode != http.StatusBadGateway {
@@ -595,7 +568,7 @@ func TestUpstreamFailures(t *testing.T) {
 		if n := len(g.Requests()); n != 1 {
 			t.Fatalf("gateway GETs = %d, want 1 (cooldown)", n)
 		}
-		if ok, _ := filepath.Glob(filepath.Join(p.cfg.CacheDir, "xorbs", "*", "*", ".xorb-*")); len(ok) != 0 {
+		if ok, _ := filepath.Glob(filepath.Join(configOf(p).DataDir, "xorbs", "*", "*", ".xorb-*")); len(ok) != 0 {
 			t.Fatalf("storage temp files left: %v", ok)
 		}
 	})
@@ -623,7 +596,7 @@ func TestUpstreamFailures(t *testing.T) {
 			t.Fatalf("short body ended cleanly = %d, %d bytes, want a read error", resp.StatusCode, len(got))
 		}
 		clustertest.WaitFor(t, clustertest.WaitTimeout, "spool cleanup", spoolEmpty(p))
-		if clustertest.HasXorb(t, p.store, hash) {
+		if stored(t, p, hash) {
 			t.Fatal("short xorb published")
 		}
 		if resp, _, _ := do(t, http.MethodGet, u); resp.StatusCode != http.StatusBadGateway || len(g.Requests()) != 1 {
@@ -749,7 +722,7 @@ func TestCloseCancelsPullAndReaders(t *testing.T) {
 	if _, err := io.ReadAll(resp.Body); err == nil {
 		t.Fatal("reader completed after Close")
 	}
-	if clustertest.HasXorb(t, p.store, hash) {
+	if stored(t, p, hash) {
 		t.Fatal("canceled pull published the xorb")
 	}
 	clustertest.WaitFor(t, clustertest.WaitTimeout, "spool cleanup", spoolEmpty(p))
@@ -768,11 +741,7 @@ func TestAcquireAfterCommitReportsReady(t *testing.T) {
 	if resp, got, err := do(t, http.MethodGet, xorbURL(srv, hash)); err != nil || resp.StatusCode != http.StatusOK || !bytes.Equal(got, body) {
 		t.Fatalf("cold GET = %d, %d bytes, %v", resp.StatusCode, len(got), err)
 	}
-	clustertest.WaitFor(t, clustertest.WaitTimeout, "pull exit", func() bool {
-		p.mu.Lock()
-		defer p.mu.Unlock()
-		return len(p.pulls) == 0
-	})
+	clustertest.WaitFor(t, clustertest.WaitTimeout, "pull exit", noPulls(p))
 	clustertest.WaitFor(t, clustertest.WaitTimeout, "spool cleanup", spoolEmpty(p))
 	// A handler that missed the store before that commit now takes its pull decision.
 	f, rd, err := p.acquire(hash, false)
@@ -808,13 +777,11 @@ func TestDeduplicatedSpoolStillValidates(t *testing.T) {
 	close(release)
 	<-late
 	clustertest.WaitFor(t, clustertest.WaitTimeout, "spool cleanup", spoolEmpty(p))
-	p.mu.Lock()
-	_, cooling := p.cooldown[hash]
-	p.mu.Unlock()
+	_, cooling := cooldownOf(p, hash)
 	if !cooling {
 		t.Fatal("corrupt pull passed on the deduplicated copy: no cooldown")
 	}
-	if !clustertest.HasXorb(t, p.store, hash) {
+	if !stored(t, p, hash) {
 		t.Fatal("failed pull removed the committed copy")
 	}
 	resp, got, err := do(t, http.MethodGet, u)
@@ -849,20 +816,18 @@ func TestDeadClientReleasesReaderAndKeepsPull(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	p.mu.Lock()
-	held := p.pulls[hash] != nil && p.pulls[hash].refs == 2
-	p.mu.Unlock()
+	f, refs, _, _ := pullStatus(p, hash)
+	held := f != nil && refs == 2
 	if resp.StatusCode != http.StatusPartialContent || !held {
 		t.Fatalf("multi range = %d, streaming client holds a pull reference %v, want 206 and true", resp.StatusCode, held)
 	}
 	_ = conn.Close()
 	clustertest.WaitFor(t, clustertest.WaitTimeout, "dead client release", func() bool {
-		p.mu.Lock()
-		defer p.mu.Unlock()
-		return p.pulls[hash] != nil && p.pulls[hash].refs == 1
+		f, refs, _, _ := pullStatus(p, hash)
+		return f != nil && refs == 1
 	})
 	close(release)
-	clustertest.WaitFor(t, clustertest.WaitTimeout, "commit", func() bool { return clustertest.HasXorb(t, p.store, hash) })
+	clustertest.WaitFor(t, clustertest.WaitTimeout, "commit", func() bool { return stored(t, p, hash) })
 	clustertest.WaitFor(t, clustertest.WaitTimeout, "spool cleanup", spoolEmpty(p))
 	resp, got, err := do(t, http.MethodGet, xorbURL(srv, hash))
 	if err != nil || resp.StatusCode != http.StatusOK || !bytes.Equal(got, body) {

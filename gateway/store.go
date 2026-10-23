@@ -2,18 +2,15 @@ package gateway
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"io/fs"
 	"net/http"
-	"os"
 	"path/filepath"
 	"slices"
 	"sync"
 
-	"github.com/wzshiming/httpseek"
 	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/shard"
 	"github.com/wzshiming/xet/storage"
@@ -23,17 +20,15 @@ import (
 	"github.com/wzshiming/xet-pd/apis"
 )
 
-// relayAttempts bounds the holders tried per remote open.
-const relayAttempts = 3
-
 // store keeps shards and indexes in the local store while xorb bytes may live only on peers; reads fall back to live holders.
 type store struct {
 	*local.Storage
 	reg       *registry
-	offsetDir string
 	transport *http.Transport // relay fetches; carries no upstream credentials
+	relay     relay
+	sidecar   sidecar
 
-	mu      sync.Mutex // guards pins, writers and local xorb deletion; never held across network I/O
+	mu      sync.Mutex // guards pins and writers; held across DeleteXorb's local unlink so no pin lands mid-delete, never across network I/O
 	pins    map[xet.XorbHash]int
 	writers map[xet.XorbHash]*writerLock
 
@@ -54,11 +49,12 @@ func newStore(dir string, reg *registry) (*store, error) {
 	if err != nil {
 		return nil, err
 	}
-	offsetDir := filepath.Join(dir, "offsets")
-	if err := os.MkdirAll(offsetDir, 0o755); err != nil {
+	tr := apis.NewTransport()
+	sc, err := newSidecar(filepath.Join(dir, "offsets"))
+	if err != nil {
 		return nil, err
 	}
-	return &store{Storage: st, reg: reg, offsetDir: offsetDir, transport: apis.NewTransport(), pins: map[xet.XorbHash]int{}, writers: map[xet.XorbHash]*writerLock{}}, nil
+	return &store{Storage: st, reg: reg, relay: relay{reg: reg, transport: tr}, sidecar: sc, transport: tr, pins: map[xet.XorbHash]int{}, writers: map[xet.XorbHash]*writerLock{}}, nil
 }
 
 // lockWriter blocks until this caller is the only writer of hash; the result releases it.
@@ -152,73 +148,6 @@ func (s *store) GetFileHashBySHA256(ctx context.Context, digest [32]byte) (xet.F
 	return fh, nil
 }
 
-// maxSidecarBytes bounds a JSON array of xet.MaxChunksPerXorb 20-digit offsets.
-const maxSidecarBytes = (xet.MaxChunksPerXorb + 1) * 21
-
-func (s *store) sidecar(hash xet.XorbHash) string {
-	return filepath.Join(s.offsetDir, filepath.FromSlash(storage.ObjectKey("", hash.String())))
-}
-
-// readSidecar accepts exactly one bounded JSON array of valid offsets.
-func (s *store) readSidecar(hash xet.XorbHash) ([]uint64, error) {
-	f, err := os.Open(s.sidecar(hash))
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = f.Close() }()
-	data, err := io.ReadAll(io.LimitReader(f, maxSidecarBytes+1))
-	if err == nil && len(data) > maxSidecarBytes {
-		err = fmt.Errorf("exceeds %d bytes", maxSidecarBytes)
-	}
-	var offsets []uint64
-	if err == nil {
-		err = json.Unmarshal(data, &offsets)
-	}
-	// Accept what a footer read would: a bounded count, each end within the packed cap and at least a header past the previous.
-	if err == nil && len(offsets) > xet.MaxChunksPerXorb {
-		err = fmt.Errorf("%d chunk offsets exceed %d", len(offsets), xet.MaxChunksPerXorb)
-	}
-	prev := uint64(0)
-	for _, off := range offsets {
-		if err != nil {
-			break
-		}
-		if off > apis.MaxXorbBytes {
-			err = fmt.Errorf("chunk offset %d exceeds %d", off, apis.MaxXorbBytes)
-		} else if off < prev || off-prev < 8 {
-			err = fmt.Errorf("chunk offset %d does not follow %d", off, prev)
-		}
-		prev = off
-	}
-	if err != nil {
-		return nil, fmt.Errorf("offsets sidecar of xorb %s: %w", hash, err)
-	}
-	return offsets, nil
-}
-
-func (s *store) writeSidecar(hash xet.XorbHash, offsets []uint64) error {
-	path := s.sidecar(hash)
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return err
-	}
-	f, err := os.CreateTemp(filepath.Dir(path), ".offsets-*")
-	if err != nil {
-		return err
-	}
-	data, _ := json.Marshal(offsets)
-	_, err = f.Write(data)
-	if cerr := f.Close(); err == nil {
-		err = cerr
-	}
-	if err == nil {
-		err = os.Rename(f.Name(), path)
-	}
-	if err != nil {
-		_ = os.Remove(f.Name())
-	}
-	return err
-}
-
 // PutXorb serializes writers of one hash because the local store lets a second one rename over the first.
 func (s *store) PutXorb(ctx context.Context, hash xet.XorbHash, r io.Reader) (bool, error) {
 	s.pin(hash)
@@ -240,7 +169,7 @@ func (s *store) PutXorb(ctx context.Context, hash xet.XorbHash, r io.Reader) (bo
 	}
 	size, err := f.Seek(0, io.SeekEnd)
 	if err == nil {
-		err = s.writeSidecar(hash, offsets)
+		err = s.sidecar.write(hash, offsets)
 	}
 	_ = f.Close()
 	if err != nil {
@@ -258,7 +187,7 @@ func (s *store) localOffsets(ctx context.Context, hash xet.XorbHash) ([]uint64, 
 	if err == nil || !errors.Is(err, fs.ErrNotExist) {
 		return offsets, err
 	}
-	return s.readSidecar(hash)
+	return s.sidecar.read(hash)
 }
 
 // GetXorbChunkOffsets tries local bytes, sidecar, then a holder, persisting what it learns unless local bytes were committed meanwhile.
@@ -267,7 +196,7 @@ func (s *store) GetXorbChunkOffsets(ctx context.Context, hash xet.XorbHash) ([]u
 	if err == nil || !errors.Is(err, fs.ErrNotExist) {
 		return offsets, err
 	}
-	sk, err := s.remote(ctx, hash, 0, -1)
+	sk, err := s.relay.open(ctx, hash, 0, -1)
 	if err != nil {
 		return nil, err
 	}
@@ -279,41 +208,7 @@ func (s *store) GetXorbChunkOffsets(ctx context.Context, hash xet.XorbHash) ([]u
 	if local, err := s.localOffsets(ctx, hash); err == nil {
 		return local, nil
 	}
-	return offsets, s.writeSidecar(hash, offsets)
-}
-
-// remote opens [start, end] of the xorb on a live holder, end -1 meaning EOF; failed holders are skipped before any handle is handed out.
-func (s *store) remote(ctx context.Context, hash xet.XorbHash, start, end int64) (*httpseek.Seeker, error) {
-	holders := s.reg.holders(hash.String())
-	if len(holders) == 0 {
-		return nil, fmt.Errorf("xorb %s has no live holder: %w", hash, fs.ErrNotExist)
-	}
-	var err error
-	for _, p := range holders[:min(len(holders), relayAttempts)] {
-		var req *http.Request
-		if req, err = http.NewRequestWithContext(ctx, http.MethodGet, apis.XorbURL(p.URL, hash.String()), nil); err == nil {
-			req.Header.Set(apis.PeerHeader, "gateway")
-			sk := httpseek.NewRangeSeeker(ctx, s.transport, req, start, end)
-			if end < 0 {
-				if _, err = sk.Seek(0, io.SeekEnd); err == nil {
-					_, err = sk.Seek(start, io.SeekStart)
-				}
-			} else if resp, rerr := sk.Response(); rerr != nil {
-				err = rerr
-			} else if resp.StatusCode != http.StatusPartialContent {
-				err = errors.New(resp.Status)
-			}
-			if err == nil {
-				return sk, nil
-			}
-			_ = sk.Close()
-			err = fmt.Errorf("holder %s: %w", p.ID, err)
-		}
-		if cerr := ctx.Err(); cerr != nil {
-			return nil, cerr
-		}
-	}
-	return nil, fmt.Errorf("xorb %s: %w", hash, err)
+	return offsets, s.sidecar.write(hash, offsets)
 }
 
 func (s *store) GetXorbReadSeekCloser(ctx context.Context, hash xet.XorbHash) (io.ReadSeekCloser, error) {
@@ -324,11 +219,7 @@ func (s *store) GetXorbReadSeekCloser(ctx context.Context, hash xet.XorbHash) (i
 		}
 		return f, err
 	}
-	sk, err := s.remote(ctx, hash, 0, -1)
-	if err != nil {
-		return nil, err
-	}
-	return sk, nil
+	return s.relay.open(ctx, hash, 0, -1)
 }
 
 func (s *store) GetXorbRangeReadCloser(ctx context.Context, hash xet.XorbHash, start, end int64) (io.ReadCloser, error) {
@@ -339,11 +230,7 @@ func (s *store) GetXorbRangeReadCloser(ctx context.Context, hash xet.XorbHash, s
 		}
 		return rc, err
 	}
-	sk, err := s.remote(ctx, hash, start, end)
-	if err != nil {
-		return nil, err
-	}
-	return sk, nil
+	return s.relay.open(ctx, hash, start, end)
 }
 
 // GetReconstructedFile reads through this store, so remote-only xorbs are relayed.
@@ -386,7 +273,7 @@ func (s *store) unpin(hashes ...xet.XorbHash) {
 	}
 }
 
-// DeleteXorb drops the local copy and its offset caches; the sidecar stays for later relays.
+// DeleteXorb drops the local copy and its offset caches under s.mu, atomically with the pin check; the sidecar stays for later relays.
 func (s *store) DeleteXorb(ctx context.Context, hash xet.XorbHash) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -420,7 +307,7 @@ func (s *store) PutShard(ctx context.Context, sh *shard.Shard) (bool, error) {
 		if ok {
 			continue
 		}
-		sk, err := s.remote(ctx, h, 0, -1)
+		sk, err := s.relay.open(ctx, h, 0, -1)
 		if err != nil {
 			return false, err
 		}

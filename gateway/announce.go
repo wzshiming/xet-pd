@@ -23,27 +23,7 @@ func (g *Gateway) serveAnnounce(w http.ResponseWriter, r *http.Request) {
 	if !apis.ReadJSON(w, r, maxAnnounceBytes, &req) {
 		return
 	}
-	// Canonical form, as the registry keys it: origin-only URL, lowercase hashes.
-	var err error
-	if !validID(req.Peer.ID) || !validID(req.Epoch) {
-		err = errors.New("invalid peer id or epoch")
-	} else if u, uerr := apis.Origin(req.Peer.URL); uerr != nil {
-		err = fmt.Errorf("peer url: %w", uerr)
-	} else {
-		req.Peer.URL = u
-	lists:
-		for _, list := range [][]string{req.Add, req.Remove} {
-			for i, h := range list {
-				hash, herr := xet.ParseXorbHash(h)
-				if herr != nil {
-					err = fmt.Errorf("xorb hash: %w", herr)
-					break lists
-				}
-				list[i] = hash.String()
-			}
-		}
-	}
-	if err != nil {
+	if err := canonicalAnnounce(&req); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -53,7 +33,29 @@ func (g *Gateway) serveAnnounce(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(resp)
 }
 
-// validID accepts a peer ID or epoch: 1 to 128 of [A-Za-z0-9._-], safe in headers and logs.
+// canonicalAnnounce rewrites req to the form the registry keys: origin-only URL, lowercase hashes.
+func canonicalAnnounce(req *apis.AnnounceRequest) error {
+	if !validID(req.Peer.ID) || !validID(req.Epoch) {
+		return errors.New("invalid peer id or epoch")
+	}
+	u, err := apis.Origin(req.Peer.URL)
+	if err != nil {
+		return fmt.Errorf("peer url: %w", err)
+	}
+	req.Peer.URL = u
+	for _, list := range [][]string{req.Add, req.Remove} {
+		for i, h := range list {
+			hash, err := xet.ParseXorbHash(h)
+			if err != nil {
+				return fmt.Errorf("xorb hash: %w", err)
+			}
+			list[i] = hash.String()
+		}
+	}
+	return nil
+}
+
+// validID is the apis.Peer ID and Epoch rule; it keeps them safe in headers and logs.
 func validID(s string) bool {
 	if s == "" || len(s) > 128 {
 		return false

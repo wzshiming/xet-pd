@@ -10,11 +10,14 @@ import (
 	"time"
 )
 
-// NewTransport returns a transport that never asks for gzip, so lengths and ranges stay byte-exact, and waits at most 30s for response headers.
+// responseHeaderTimeout bounds the wait for response headers on every xet-pd connection; callers bound whole exchanges through their contexts.
+const responseHeaderTimeout = 30 * time.Second
+
+// NewTransport returns a transport that never asks for gzip, so lengths and ranges stay byte-exact, and waits at most responseHeaderTimeout for response headers.
 func NewTransport() *http.Transport {
 	t := http.DefaultTransport.(*http.Transport).Clone()
 	t.DisableCompression = true
-	t.ResponseHeaderTimeout = 30 * time.Second
+	t.ResponseHeaderTimeout = responseHeaderTimeout
 	return t
 }
 

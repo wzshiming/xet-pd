@@ -15,11 +15,16 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.x"
+      - run: pip install 'huggingface_hub[hf_xet]==2.2.0' 'hf_xet==1.7.0'
       - name: gofmt
         run: |
           out="$(gofmt -l .)"
@@ -30,10 +35,12 @@ jobs:
           fi
       - run: go build ./...
       - run: go vet ./...
-      - run: go test -race -timeout 15m ./...
+      - run: go mod tidy -diff
+      - run: go test -race -count=1 -v -timeout 15m ./...
 
   lint:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
@@ -42,16 +49,3 @@ jobs:
       - uses: golangci/golangci-lint-action@v9
         with:
           version: v2.13.2
-
-  e2e:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-go@v7
-        with:
-          go-version-file: go.mod
-      - uses: actions/setup-python@v7
-        with:
-          python-version: "3.x"
-      - run: pip install -U 'huggingface_hub[hf_xet]'
-      - run: go test -tags e2e -race -count=1 -v -timeout 10m ./e2e

@@ -28,14 +28,15 @@ func main() {
 	os.Exit(code)
 }
 
-// parse resolves the gateway command line into the listen address and configuration.
-func parse(args []string, getenv func(string) string, help io.Writer) (string, gateway.Config, error) {
+// parse resolves the gateway command line into the settings and configuration.
+func parse(args []string, getenv func(string) string, help io.Writer) (cli.Settings, gateway.Config, error) {
 	var (
-		listen string
-		cfg    gateway.Config
+		s   cli.Settings
+		cfg gateway.Config
 	)
 	fs := cli.NewFlagSet("gateway")
-	fs.StringVar(&listen, "listen", ":8080", "listen address", "XET_PD_LISTEN")
+	fs.StringVar(&s.Listen, "listen", ":8080", "listen address", "XET_PD_LISTEN")
+	fs.LogFormatVar(&s.LogFormat)
 	fs.StringVar(&cfg.DataDir, "data-dir", "./xet-pd-gateway", "data directory", "XET_PD_DATA_DIR")
 	fs.StringVar(&cfg.Upstream, "upstream", "https://huggingface.co", "upstream hub origin, scheme://host[:port]", "HF_ENDPOINT")
 	fs.StringVar(&cfg.UpstreamToken, "upstream-token", "", "bearer token for the upstream hub", "HF_TOKEN")
@@ -47,12 +48,12 @@ func parse(args []string, getenv func(string) string, help io.Writer) (string, g
 	fs.SizeVar(&cfg.XorbCacheSize, "xorb-cache-size", 8<<30, "bytes of local xorbs kept, 0 unlimited", "XET_PD_XORB_CACHE_SIZE")
 	secret, secretFile := fs.SecretFlags()
 	if err := fs.Parse(args, getenv, help); err != nil {
-		return "", gateway.Config{}, err
+		return cli.Settings{}, gateway.Config{}, err
 	}
 	if cfg.Upstream == "" {
-		return "", gateway.Config{}, errors.New("upstream is required")
+		return cli.Settings{}, gateway.Config{}, errors.New("upstream is required")
 	}
 	var err error
 	cfg.Secret, err = fs.ResolveSecret(*secret, *secretFile, getenv)
-	return listen, cfg, err
+	return s, cfg, err
 }

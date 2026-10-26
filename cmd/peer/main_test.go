@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/wzshiming/xet-pd/internal/cli"
 	"github.com/wzshiming/xet-pd/internal/cli/clitest"
 	"github.com/wzshiming/xet-pd/internal/clustertest"
 	"github.com/wzshiming/xet-pd/peer"
@@ -28,34 +29,37 @@ func TestMain(m *testing.M) {
 func TestParsePeerDefaults(t *testing.T) {
 	// HF_TOKEN and the gateway token variable mean nothing to a peer.
 	getenv := clitest.Getenv("HF_TOKEN", "tok")
-	listen, cfg, err := parse([]string{"-advertise", "http://p:1", "-gateway", "http://g:2"}, getenv, io.Discard)
+	settings, cfg, err := parse([]string{"-advertise", "http://p:1", "-gateway", "http://g:2"}, getenv, io.Discard)
+	wantSettings := cli.Settings{Listen: ":8081", LogFormat: cli.LogText}
 	want := peer.Config{Advertise: "http://p:1", Gateway: "http://g:2", DataDir: "./xet-pd-peer", XorbCacheSize: 8 << 30, MaxPulls: 8, PullTimeout: 10 * time.Minute, Heartbeat: 10 * time.Second}
-	if err != nil || listen != ":8081" || cfg != want {
-		t.Fatalf("parse() = %q, %+v, %v; want %q, %+v", listen, cfg, err, ":8081", want)
+	if err != nil || settings != wantSettings || cfg != want {
+		t.Fatalf("parse() = %+v, %+v, %v; want %+v, %+v", settings, cfg, err, wantSettings, want)
 	}
 }
 
 func TestParsePeerEnv(t *testing.T) {
 	getenv := clitest.Getenv(
 		"XET_PD_LISTEN", ":9001", "XET_PD_ADVERTISE", "http://p:1", "XET_PD_GATEWAY", "http://g:2", "XET_PD_DATA_DIR", "/cache",
-		"XET_PD_XORB_CACHE_SIZE", "2GiB", "XET_PD_MAX_PULLS", "3", "XET_PD_PULL_TIMEOUT", "1m", "XET_PD_HEARTBEAT", "2s", "XET_PD_SECRET", "sec")
-	listen, cfg, err := parse(nil, getenv, io.Discard)
+		"XET_PD_XORB_CACHE_SIZE", "2GiB", "XET_PD_MAX_PULLS", "3", "XET_PD_PULL_TIMEOUT", "1m", "XET_PD_HEARTBEAT", "2s", "XET_PD_SECRET", "sec", "XET_PD_LOG_FORMAT", "json")
+	settings, cfg, err := parse(nil, getenv, io.Discard)
+	wantSettings := cli.Settings{Listen: ":9001", LogFormat: cli.LogJSON}
 	want := peer.Config{Advertise: "http://p:1", Gateway: "http://g:2", DataDir: "/cache", XorbCacheSize: 2 << 30, MaxPulls: 3, PullTimeout: time.Minute, Heartbeat: 2 * time.Second, Secret: "sec"}
-	if err != nil || listen != ":9001" || cfg != want {
-		t.Fatalf("parse() = %q, %+v, %v; want %q, %+v", listen, cfg, err, ":9001", want)
+	if err != nil || settings != wantSettings || cfg != want {
+		t.Fatalf("parse() = %+v, %+v, %v; want %+v, %+v", settings, cfg, err, wantSettings, want)
 	}
 }
 
 func TestParsePeerFlagsOverrideEnv(t *testing.T) {
 	getenv := clitest.Getenv(
 		"XET_PD_LISTEN", ":9001", "XET_PD_ADVERTISE", "http://p:1", "XET_PD_GATEWAY", "http://g:2", "XET_PD_DATA_DIR", "/cache",
-		"XET_PD_XORB_CACHE_SIZE", "bogus", "XET_PD_MAX_PULLS", "x", "XET_PD_PULL_TIMEOUT", "y", "XET_PD_HEARTBEAT", "z", "XET_PD_SECRET", "sec")
+		"XET_PD_XORB_CACHE_SIZE", "bogus", "XET_PD_MAX_PULLS", "x", "XET_PD_PULL_TIMEOUT", "y", "XET_PD_HEARTBEAT", "z", "XET_PD_SECRET", "sec", "XET_PD_LOG_FORMAT", "bogus")
 	args := []string{"-listen", ":7001", "-advertise", "http://fp:1", "-gateway", "http://fg:2", "-data-dir", "/flag",
-		"-xorb-cache-size", "512MiB", "-max-pulls", "2", "-pull-timeout", "30s", "-heartbeat", "1s", "-secret", "fsec"}
-	listen, cfg, err := parse(args, getenv, io.Discard)
+		"-xorb-cache-size", "512MiB", "-max-pulls", "2", "-pull-timeout", "30s", "-heartbeat", "1s", "-secret", "fsec", "-log-format", "json"}
+	settings, cfg, err := parse(args, getenv, io.Discard)
+	wantSettings := cli.Settings{Listen: ":7001", LogFormat: cli.LogJSON}
 	want := peer.Config{Advertise: "http://fp:1", Gateway: "http://fg:2", DataDir: "/flag", XorbCacheSize: 512 << 20, MaxPulls: 2, PullTimeout: 30 * time.Second, Heartbeat: time.Second, Secret: "fsec"}
-	if err != nil || listen != ":7001" || cfg != want {
-		t.Fatalf("parse() = %q, %+v, %v; want %q, %+v", listen, cfg, err, ":7001", want)
+	if err != nil || settings != wantSettings || cfg != want {
+		t.Fatalf("parse() = %+v, %+v, %v; want %+v, %+v", settings, cfg, err, wantSettings, want)
 	}
 }
 
@@ -70,9 +74,11 @@ func TestParsePeerErrors(t *testing.T) {
 		{"missing advertise", []string{"-gateway", "http://g:2"}, clitest.Getenv(), "advertise is required"},
 		{"missing gateway", []string{"-advertise", "http://p:1"}, clitest.Getenv(), "gateway is required"},
 		{"positional argument", append(both, "extra"), clitest.Getenv(), `unexpected argument "extra"`},
+		{"bad log format flag", append(both, "-log-format", "yaml"), clitest.Getenv(), `invalid value "yaml" for flag -log-format: expected text or json`},
 		{"bad env int", both, clitest.Getenv("XET_PD_MAX_PULLS", "x"), "XET_PD_MAX_PULLS"},
 		{"bad env size", both, clitest.Getenv("XET_PD_XORB_CACHE_SIZE", "1.5GiB"), "XET_PD_XORB_CACHE_SIZE"},
 		{"bad env duration", both, clitest.Getenv("XET_PD_HEARTBEAT", "soon"), "XET_PD_HEARTBEAT"},
+		{"bad env log format", both, clitest.Getenv("XET_PD_LOG_FORMAT", "yaml"), `XET_PD_LOG_FORMAT="yaml": expected text or json`},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -90,7 +96,7 @@ func TestParsePeerHelp(t *testing.T) {
 	if !errors.Is(err, flag.ErrHelp) {
 		t.Fatalf("err = %v, want flag.ErrHelp", err)
 	}
-	for _, want := range []string{"Usage: peer [flags]", "-advertise", "[env XET_PD_ADVERTISE]", "-data-dir", "[env XET_PD_DATA_DIR]", "(default 8GiB)", "-pull-timeout", "(default 10m0s)", "[env XET_PD_SECRET]"} {
+	for _, want := range []string{"Usage: peer [flags]", "-advertise", "[env XET_PD_ADVERTISE]", "-data-dir", "[env XET_PD_DATA_DIR]", "(default 8GiB)", "-pull-timeout", "(default 10m0s)", "[env XET_PD_SECRET]", "-log-format", "[env XET_PD_LOG_FORMAT]", "(default text)"} {
 		if !strings.Contains(help.String(), want) {
 			t.Errorf("help lacks %q:\n%s", want, help.String())
 		}
@@ -134,6 +140,7 @@ func TestRunUsage(t *testing.T) {
 	}{
 		{name: "--help", args: []string{"--help"}, code: 0, stdout: "Usage: peer [flags]"},
 		{name: "missing advertise", args: nil, code: 2, stderr: "peer: advertise is required\nRun \"peer -h\" for flags.\n"},
+		{name: "bad log format", args: []string{"-log-format", "yaml"}, code: 2, stderr: "peer: invalid value \"yaml\" for flag -log-format: expected text or json\nRun \"peer -h\" for flags.\n"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

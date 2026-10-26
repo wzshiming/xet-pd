@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log/slog"
 	"math"
 	"net"
 	"net/http"
@@ -21,14 +22,20 @@ import (
 type Command[C any] struct {
 	// Name is the binary name, the prefix of messages and of the banner.
 	Name string
-	// Parse returns the listen address and the configuration.
-	Parse func(args []string, getenv func(string) string, help io.Writer) (string, C, error)
+	// Parse returns the settings Run applies itself and the configuration.
+	Parse func(args []string, getenv func(string) string, help io.Writer) (Settings, C, error)
 	New   func(C) (Service, error)
+}
+
+// Settings are the command-line choices every Command shares; the zero LogFormat logs as text.
+type Settings struct {
+	Listen    string
+	LogFormat LogFormat
 }
 
 // Run executes the command line and returns the process exit code: 2 usage, 1 runtime failure, 0 otherwise.
 func (c Command[C]) Run(ctx context.Context, args []string, getenv func(string) string, stdout, stderr io.Writer) int {
-	listen, cfg, err := c.Parse(args, getenv, stdout)
+	settings, cfg, err := c.Parse(args, getenv, stdout)
 	switch {
 	case errors.Is(err, flag.ErrHelp):
 		return 0
@@ -36,13 +43,17 @@ func (c Command[C]) Run(ctx context.Context, args []string, getenv func(string) 
 		_, _ = fmt.Fprintf(stderr, "%s: %v\nRun \"%s -h\" for flags.\n", c.Name, err, c.Name)
 		return 2
 	}
+	// Before New, which may already log.
+	if settings.LogFormat == LogJSON {
+		slog.SetDefault(slog.New(slog.NewJSONHandler(stderr, nil)))
+	}
 	svc, err := c.New(cfg)
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "%s: %v\n", c.Name, err)
 		return 1
 	}
 	defer func() { _ = svc.Close() }()
-	if err := ServeHTTP(ctx, listen, svc, stdout, c.Name); err != nil {
+	if err := ServeHTTP(ctx, settings.Listen, svc, stdout, c.Name); err != nil {
 		_, _ = fmt.Fprintf(stderr, "%s: %v\n", c.Name, err)
 		return 1
 	}
@@ -115,6 +126,12 @@ func (s *FlagSet) DurationVar(p *time.Duration, name string, value time.Duration
 func (s *FlagSet) SizeVar(p *int64, name string, value int64, usage string, keys ...string) {
 	*p = value
 	s.Var((*sizeValue)(p), name, s.bind(name, usage, keys))
+}
+
+func (s *FlagSet) LogFormatVar(p *LogFormat) {
+	const name = "log-format"
+	*p = LogText
+	s.Var(p, name, s.bind(name, "log format, text or json", []string{"XET_PD_LOG_FORMAT"}))
 }
 
 // Parse applies the command line, then the environment to flags left unset, and rejects positional arguments; -h prints the usage to help.
@@ -219,4 +236,25 @@ func (v *sizeValue) String() string {
 		}
 	}
 	return strconv.FormatInt(n, 10)
+}
+
+// LogFormat is a flag.Value naming the handler of the default slog logger; text keeps the stdlib one.
+type LogFormat string
+
+const (
+	LogText LogFormat = "text"
+	LogJSON LogFormat = "json"
+)
+
+func (f *LogFormat) Set(s string) error {
+	switch v := LogFormat(s); v {
+	case LogText, LogJSON:
+		*f = v
+		return nil
+	}
+	return errors.New("expected text or json")
+}
+
+func (f *LogFormat) String() string {
+	return string(*f)
 }

@@ -13,14 +13,16 @@ import (
 	"time"
 
 	"github.com/wzshiming/xet-pd/gateway"
+	"github.com/wzshiming/xet-pd/internal/cli"
 	"github.com/wzshiming/xet-pd/internal/cli/clitest"
 )
 
 func TestParseGatewayDefaults(t *testing.T) {
-	listen, cfg, err := parse(nil, clitest.Getenv(), io.Discard)
+	settings, cfg, err := parse(nil, clitest.Getenv(), io.Discard)
+	wantSettings := cli.Settings{Listen: ":8080", LogFormat: cli.LogText}
 	want := gateway.Config{DataDir: "./xet-pd-gateway", Upstream: "https://huggingface.co", PeerTTL: 30 * time.Second, Replicas: 2, MinSeeds: 1, XorbCacheSize: 8 << 30}
-	if err != nil || listen != ":8080" || cfg != want {
-		t.Fatalf("parse() = %q, %+v, %v; want %q, %+v", listen, cfg, err, ":8080", want)
+	if err != nil || settings != wantSettings || cfg != want {
+		t.Fatalf("parse() = %+v, %+v, %v; want %+v, %+v", settings, cfg, err, wantSettings, want)
 	}
 }
 
@@ -29,11 +31,12 @@ func TestParseGatewayEnv(t *testing.T) {
 		"XET_PD_LISTEN", ":9000", "XET_PD_DATA_DIR", "/data", "HF_ENDPOINT", "http://hub:8000",
 		"HF_TOKEN", "tok", "XET_PD_SIGNING_KEY", "sign", "XET_PD_EXTERNAL_URL", "http://gw",
 		"XET_PD_SECRET", "sec", "XET_PD_PEER_TTL", "45s", "XET_PD_REPLICAS", "3", "XET_PD_MIN_SEEDS", "2",
-		"XET_PD_XORB_CACHE_SIZE", "64MiB")
-	listen, cfg, err := parse(nil, getenv, io.Discard)
+		"XET_PD_XORB_CACHE_SIZE", "64MiB", "XET_PD_LOG_FORMAT", "json")
+	settings, cfg, err := parse(nil, getenv, io.Discard)
+	wantSettings := cli.Settings{Listen: ":9000", LogFormat: cli.LogJSON}
 	want := gateway.Config{DataDir: "/data", Upstream: "http://hub:8000", UpstreamToken: "tok", SigningKey: "sign", ExternalURL: "http://gw", Secret: "sec", PeerTTL: 45 * time.Second, Replicas: 3, MinSeeds: 2, XorbCacheSize: 64 << 20}
-	if err != nil || listen != ":9000" || cfg != want {
-		t.Fatalf("parse() = %q, %+v, %v; want %q, %+v", listen, cfg, err, ":9000", want)
+	if err != nil || settings != wantSettings || cfg != want {
+		t.Fatalf("parse() = %+v, %+v, %v; want %+v, %+v", settings, cfg, err, wantSettings, want)
 	}
 }
 
@@ -43,14 +46,15 @@ func TestParseGatewayFlagsOverrideEnv(t *testing.T) {
 		"XET_PD_LISTEN", ":9000", "XET_PD_DATA_DIR", "/data", "HF_ENDPOINT", "http://hub:8000",
 		"HF_TOKEN", "tok", "XET_PD_SIGNING_KEY", "sign", "XET_PD_EXTERNAL_URL", "http://gw",
 		"XET_PD_SECRET", "sec", "XET_PD_PEER_TTL", "bogus", "XET_PD_REPLICAS", "x", "XET_PD_MIN_SEEDS", "1.5",
-		"XET_PD_XORB_CACHE_SIZE", "-1")
+		"XET_PD_XORB_CACHE_SIZE", "-1", "XET_PD_LOG_FORMAT", "bogus")
 	args := []string{"-listen", ":7000", "-data-dir", "/flag", "-upstream", "http://flag", "-upstream-token", "ftok",
 		"-signing-key", "fsign", "-external-url", "http://fgw", "-secret", "fsec", "-peer-ttl", "5s", "-replicas", "4",
-		"-min-seeds", "3", "-xorb-cache-size", "1GiB"}
-	listen, cfg, err := parse(args, getenv, io.Discard)
+		"-min-seeds", "3", "-xorb-cache-size", "1GiB", "-log-format", "json"}
+	settings, cfg, err := parse(args, getenv, io.Discard)
+	wantSettings := cli.Settings{Listen: ":7000", LogFormat: cli.LogJSON}
 	want := gateway.Config{DataDir: "/flag", Upstream: "http://flag", UpstreamToken: "ftok", SigningKey: "fsign", ExternalURL: "http://fgw", Secret: "fsec", PeerTTL: 5 * time.Second, Replicas: 4, MinSeeds: 3, XorbCacheSize: 1 << 30}
-	if err != nil || listen != ":7000" || cfg != want {
-		t.Fatalf("parse() = %q, %+v, %v; want %q, %+v", listen, cfg, err, ":7000", want)
+	if err != nil || settings != wantSettings || cfg != want {
+		t.Fatalf("parse() = %+v, %+v, %v; want %+v, %+v", settings, cfg, err, wantSettings, want)
 	}
 }
 
@@ -86,9 +90,11 @@ func TestParseGatewayErrors(t *testing.T) {
 		{"empty upstream", []string{"-upstream", ""}, clitest.Getenv(), "upstream is required"},
 		{"bad duration flag", []string{"-peer-ttl", "abc"}, clitest.Getenv(), "invalid value"},
 		{"bad size flag", []string{"-xorb-cache-size", "8GB"}, clitest.Getenv(), "suffix"},
+		{"bad log format flag", []string{"-log-format", "yaml"}, clitest.Getenv(), `invalid value "yaml" for flag -log-format: expected text or json`},
 		{"bad env duration", nil, clitest.Getenv("XET_PD_PEER_TTL", "abc"), `XET_PD_PEER_TTL="abc": parse error`},
 		{"bad env int", nil, clitest.Getenv("XET_PD_REPLICAS", "x"), `XET_PD_REPLICAS="x": parse error`},
 		{"bad env size", nil, clitest.Getenv("XET_PD_XORB_CACHE_SIZE", "-1"), `XET_PD_XORB_CACHE_SIZE="-1": expected bytes`},
+		{"bad env log format", nil, clitest.Getenv("XET_PD_LOG_FORMAT", "yaml"), `XET_PD_LOG_FORMAT="yaml": expected text or json`},
 		{"empty env upstream is still the default", []string{"-upstream", ""}, clitest.Getenv("HF_ENDPOINT", "http://hub"), "upstream is required"},
 	}
 	for _, tt := range tests {
@@ -111,7 +117,7 @@ func TestParseGatewayHelp(t *testing.T) {
 	if !errors.Is(err, flag.ErrHelp) {
 		t.Fatalf("err = %v, want flag.ErrHelp", err)
 	}
-	for _, want := range []string{"Usage: gateway [flags]", "-data-dir", "[env XET_PD_DATA_DIR]", "-xorb-cache-size", "(default 8GiB)", "[env XET_PD_XORB_CACHE_SIZE]", "[env HF_TOKEN]", "[env XET_PD_SECRET_FILE]", "(default \":8080\")"} {
+	for _, want := range []string{"Usage: gateway [flags]", "-data-dir", "[env XET_PD_DATA_DIR]", "-xorb-cache-size", "(default 8GiB)", "[env XET_PD_XORB_CACHE_SIZE]", "[env HF_TOKEN]", "[env XET_PD_SECRET_FILE]", "(default \":8080\")", "-log-format", "[env XET_PD_LOG_FORMAT]", "(default text)"} {
 		if !strings.Contains(help.String(), want) {
 			t.Errorf("help lacks %q:\n%s", want, help.String())
 		}
@@ -139,6 +145,7 @@ func TestRunUsage(t *testing.T) {
 		{name: "-h", args: []string{"-h"}, code: 0, stdout: "Usage: gateway [flags]"},
 		{name: "unknown flag", args: []string{"-bogus"}, code: 2, stderr: "gateway: flag provided but not defined: -bogus\nRun \"gateway -h\" for flags.\n"},
 		{name: "positional", args: []string{"extra"}, code: 2, stderr: `unexpected argument "extra"`},
+		{name: "bad log format", args: []string{"-log-format", "yaml"}, code: 2, stderr: "gateway: invalid value \"yaml\" for flag -log-format: expected text or json\nRun \"gateway -h\" for flags.\n"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

@@ -28,14 +28,15 @@ func main() {
 	os.Exit(code)
 }
 
-// parse resolves the peer command line into the listen address and configuration.
-func parse(args []string, getenv func(string) string, help io.Writer) (string, peer.Config, error) {
+// parse resolves the peer command line into the settings and configuration.
+func parse(args []string, getenv func(string) string, help io.Writer) (cli.Settings, peer.Config, error) {
 	var (
-		listen string
-		cfg    peer.Config
+		s   cli.Settings
+		cfg peer.Config
 	)
 	fs := cli.NewFlagSet("peer")
-	fs.StringVar(&listen, "listen", ":8081", "listen address", "XET_PD_LISTEN")
+	fs.StringVar(&s.Listen, "listen", ":8081", "listen address", "XET_PD_LISTEN")
+	fs.LogFormatVar(&s.LogFormat)
 	fs.StringVar(&cfg.Advertise, "advertise", "", "public origin of this peer, scheme://host[:port] (required)", "XET_PD_ADVERTISE")
 	fs.StringVar(&cfg.Gateway, "gateway", "", "gateway origin, scheme://host[:port] (required)", "XET_PD_GATEWAY")
 	fs.StringVar(&cfg.DataDir, "data-dir", "./xet-pd-peer", "data directory", "XET_PD_DATA_DIR")
@@ -45,15 +46,15 @@ func parse(args []string, getenv func(string) string, help io.Writer) (string, p
 	fs.DurationVar(&cfg.Heartbeat, "heartbeat", peer.DefaultHeartbeat, "announce interval, keep it below the gateway peer ttl", "XET_PD_HEARTBEAT")
 	secret, secretFile := fs.SecretFlags()
 	if err := fs.Parse(args, getenv, help); err != nil {
-		return "", peer.Config{}, err
+		return cli.Settings{}, peer.Config{}, err
 	}
 	switch {
 	case cfg.Advertise == "":
-		return "", peer.Config{}, errors.New("advertise is required")
+		return cli.Settings{}, peer.Config{}, errors.New("advertise is required")
 	case cfg.Gateway == "":
-		return "", peer.Config{}, errors.New("gateway is required")
+		return cli.Settings{}, peer.Config{}, errors.New("gateway is required")
 	}
 	var err error
 	cfg.Secret, err = fs.ResolveSecret(*secret, *secretFile, getenv)
-	return listen, cfg, err
+	return s, cfg, err
 }

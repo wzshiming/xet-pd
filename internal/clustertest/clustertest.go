@@ -101,8 +101,14 @@ func Scrape(t testing.TB, origin string) map[string]float64 {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("GET /metrics = %d %q", resp.StatusCode, body)
 	}
+	return ParseMetrics(t, string(body))
+}
+
+// ParseMetrics returns the samples of a Prometheus text exposition, keyed by name{labels} as written.
+func ParseMetrics(t testing.TB, text string) map[string]float64 {
+	t.Helper()
 	samples := map[string]float64{}
-	for line := range strings.Lines(string(body)) {
+	for line := range strings.Lines(text) {
 		line = strings.TrimSpace(line)
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue

@@ -17,17 +17,25 @@ const maxAnnounceBytes = 32 << 20
 // serveAnnounce registers a peer inventory; the registry changes only once the whole request validated.
 func (g *Gateway) serveAnnounce(w http.ResponseWriter, r *http.Request) {
 	if !apis.Authorize(w, r, g.secret) {
+		g.metrics.announce("rejected")
 		return
 	}
 	var req apis.AnnounceRequest
 	if !apis.ReadJSON(w, r, maxAnnounceBytes, &req) {
+		g.metrics.announce("rejected")
 		return
 	}
 	if err := canonicalAnnounce(&req); err != nil {
+		g.metrics.announce("rejected")
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 	resp := g.reg.announce(req)
+	if resp.Resync {
+		g.metrics.announce("resync")
+	} else {
+		g.metrics.announce("ok")
+	}
 	g.staging.kick()
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(resp)

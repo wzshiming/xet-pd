@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 	"slices"
+	"sync/atomic"
 	"time"
 
 	"github.com/wzshiming/xet-pd/apis"
@@ -21,6 +22,7 @@ type announcer struct {
 	p       *Peer
 	control *http.Client  // carries the secret and never follows redirects
 	wake    chan struct{} // coalesced inventory change signal
+	ready   atomic.Bool   // the gateway took an announce without asking to resync; never cleared
 
 	// Only run touches these.
 	acked                map[string]struct{} // inventory the gateway confirmed
@@ -37,6 +39,7 @@ func (a *announcer) run() {
 		snap := a.snapshot()
 		out, err := a.post(a.request(snap))
 		if err != nil {
+			p.metrics.announce("error")
 			if !a.failed {
 				slog.Warn("peer: announce", "err", err)
 			}
@@ -45,6 +48,12 @@ func (a *announcer) run() {
 		} else {
 			a.failed = false
 			a.acked, a.full = snap, out.Resync
+			if out.Resync {
+				p.metrics.announce("resync")
+			} else {
+				p.metrics.announce("ok")
+				a.ready.Store(true)
+			}
 			if !a.warned && out.TTL > 0 && p.cfg.Heartbeat >= time.Duration(out.TTL)*time.Second {
 				slog.Warn("peer: heartbeat not shorter than gateway TTL", "heartbeat", p.cfg.Heartbeat, "ttl", out.TTL)
 				a.warned = true

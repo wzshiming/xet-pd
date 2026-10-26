@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"maps"
+	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -16,6 +17,14 @@ func newTestStore(t *testing.T, dir string) (*store, *registry) {
 		t.Fatal(err)
 	}
 	return st, reg
+}
+
+// meterStore gives st metrics of its own, as New does, and returns the origin serving them.
+func meterStore(t *testing.T, st *store) string {
+	st.metrics = newGatewayMetrics()
+	srv := httptest.NewServer(st.metrics.handler())
+	t.Cleanup(srv.Close)
+	return srv.URL
 }
 
 // writers counts the writers holding or queued on hash's writer lock.

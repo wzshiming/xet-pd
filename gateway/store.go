@@ -27,6 +27,7 @@ type store struct {
 	transport *http.Transport // relay fetches; carries no upstream credentials
 	relay     relay
 	sidecar   sidecar
+	metrics   *gatewayMetrics // set before concurrent use
 
 	mu      sync.Mutex // guards pins and writers; held across DeleteXorb's local unlink so no pin lands mid-delete, never across network I/O
 	pins    map[xet.XorbHash]int
@@ -80,6 +81,7 @@ func (s *store) lockWriter(hash xet.XorbHash) func() {
 
 func (s *store) GetXorbURL(ctx context.Context, hash xet.XorbHash) (string, error) {
 	p, out := s.reg.pick(hash.String(), clientNode(ctx))
+	s.metrics.pick(out)
 	if out == pickNone {
 		return s.Storage.GetXorbURL(ctx, hash)
 	}
@@ -272,6 +274,13 @@ func (s *store) unpin(hashes ...xet.XorbHash) {
 	if idle && s.onIdle != nil {
 		s.onIdle()
 	}
+}
+
+// stats counts the pinned xorbs and those whose writer lock is held or waited for.
+func (s *store) stats() (pinned, writing int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.pins), len(s.writers)
 }
 
 // DeleteXorb drops the local copy and its offset caches under s.mu, atomically with the pin check; the sidecar stays for later relays.

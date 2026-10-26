@@ -210,6 +210,11 @@ func TestControlRoutes(t *testing.T) {
 		{http.MethodGet, "/healthz", http.StatusOK, ""},
 		{http.MethodHead, "/healthz", http.StatusOK, ""},
 		{http.MethodPost, "/healthz", http.StatusForbidden, ""},
+		{http.MethodGet, "/readyz", http.StatusOK, ""},
+		{http.MethodHead, "/readyz", http.StatusOK, ""},
+		{http.MethodPost, "/readyz", http.StatusForbidden, ""},
+		{http.MethodGet, "/metrics", http.StatusOK, ""},
+		{http.MethodPost, "/metrics", http.StatusForbidden, ""},
 		{http.MethodGet, apis.AnnouncePath, http.StatusMethodNotAllowed, http.MethodPost},
 		{http.MethodPost, apis.PeersPath, http.StatusMethodNotAllowed, http.MethodGet},
 		{http.MethodGet, apis.PullPath, http.StatusNotFound, ""},
@@ -222,6 +227,9 @@ func TestControlRoutes(t *testing.T) {
 			t.Fatalf("%s %s = %d Allow %q %q, want %d Allow %q", tt.method, tt.path, resp.StatusCode, resp.Header.Get("Allow"), body, tt.status, tt.allow)
 		}
 	}
+	if resp, _ := request(t, http.MethodGet, srv.URL+"/metrics", ""); !strings.HasPrefix(resp.Header.Get("Content-Type"), "text/plain") {
+		t.Fatalf("GET /metrics Content-Type = %q, want text/plain", resp.Header.Get("Content-Type"))
+	}
 	if n := len(hub.Auth()); n != 0 {
 		t.Fatalf("control paths reached the upstream %d times", n)
 	}
@@ -229,6 +237,117 @@ func TestControlRoutes(t *testing.T) {
 	want := `{"peers":[],"xorb_bytes":0,"xorb_gets":{"peer":0,"direct":0}}` + "\n"
 	if resp.StatusCode != http.StatusOK || resp.Header.Get("Content-Type") != "application/json" || body != want {
 		t.Fatalf("GET %s = %d %q %q, want %q", apis.PeersPath, resp.StatusCode, resp.Header.Get("Content-Type"), body, want)
+	}
+}
+
+func TestReadyzFollowsLocalitySync(t *testing.T) {
+	hub := clustertest.NewHub(t)
+	_, plain := newTestGateway(t, hub, nil)
+	if resp, body := request(t, http.MethodGet, plain.URL+"/readyz", ""); resp.StatusCode != http.StatusOK || body != "" {
+		t.Fatalf("GET /readyz without a resolver = %d %q, want 200 and no body", resp.StatusCode, body)
+	}
+	loc := &nodeMap{nodes: map[string]string{}}
+	_, srv := newTestGateway(t, hub, func(cfg *Config, _ string) { cfg.Locality = loc })
+	const notSynced = "locality index not synced\n"
+	if resp, body := request(t, http.MethodGet, srv.URL+"/readyz", ""); resp.StatusCode != http.StatusServiceUnavailable || body != notSynced {
+		t.Fatalf("GET /readyz before the resolver synced = %d %q, want 503 %q", resp.StatusCode, body, notSynced)
+	}
+	loc.mu.Lock()
+	loc.synced = true
+	loc.mu.Unlock()
+	if resp, body := request(t, http.MethodGet, srv.URL+"/readyz", ""); resp.StatusCode != http.StatusOK || body != "" {
+		t.Fatalf("GET /readyz once the resolver synced = %d %q, want 200 and no body", resp.StatusCode, body)
+	}
+}
+
+func TestMetricsEndpoint(t *testing.T) {
+	const secret, cacheSize = "s3cret", 1 << 30
+	hub := clustertest.NewHub(t)
+	hub.Set("/org/repo/resolve/main/a.bin", clustertest.RandomData(7, 64<<10))
+	_, srv := newTestGateway(t, hub, func(cfg *Config, _ string) {
+		cfg.Secret, cfg.SigningKey, cfg.XorbCacheSize, cfg.PeerTTL = secret, "k", cacheSize, time.Hour
+	})
+	// Every gateway owns its registry: a second one in the process neither panics nor shares counts.
+	_, second := newTestGateway(t, hub, nil)
+	resp, text := request(t, http.MethodGet, srv.URL+"/metrics", "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /metrics without credentials = %d, want 200", resp.StatusCode)
+	}
+	for _, typ := range []string{
+		"xorb_gets_total counter", "locality_picks_total counter", "relay_opens_total counter", "announces_total counter", "pull_requests_total counter",
+		"peers gauge", "peer_holdings gauge", "xorb_cache_bytes gauge", "xorb_cache_entries gauge", "xorb_cache_limit_bytes gauge",
+		"xorb_pins gauge", "xorb_writers gauge", "pull_requests_in_flight gauge", "locality_synced gauge",
+	} {
+		if !strings.Contains("\n"+text, "\n# TYPE xetpd_gateway_"+typ+"\n") {
+			t.Fatalf("GET /metrics lacks # TYPE xetpd_gateway_%s", typ)
+		}
+	}
+	m := clustertest.Scrape(t, srv.URL)
+	if _, ok := m["go_goroutines"]; !ok {
+		t.Fatal("GET /metrics lacks go_goroutines")
+	}
+	for _, key := range []string{
+		`xetpd_gateway_xorb_gets_total{requester="peer"}`, `xetpd_gateway_xorb_gets_total{requester="direct"}`,
+		`xetpd_gateway_locality_picks_total{outcome="local"}`, `xetpd_gateway_locality_picks_total{outcome="fallback"}`, `xetpd_gateway_locality_picks_total{outcome="none"}`,
+		`xetpd_gateway_relay_opens_total{result="ok"}`, `xetpd_gateway_relay_opens_total{result="no_holder"}`, `xetpd_gateway_relay_opens_total{result="canceled"}`, `xetpd_gateway_relay_opens_total{result="error"}`,
+		`xetpd_gateway_announces_total{result="ok"}`, `xetpd_gateway_announces_total{result="resync"}`, `xetpd_gateway_announces_total{result="rejected"}`,
+		`xetpd_gateway_pull_requests_total{result="ok"}`, `xetpd_gateway_pull_requests_total{result="error"}`,
+		"xetpd_gateway_peers", "xetpd_gateway_peer_holdings", "xetpd_gateway_xorb_cache_bytes", "xetpd_gateway_xorb_cache_entries",
+		"xetpd_gateway_xorb_pins", "xetpd_gateway_xorb_writers", "xetpd_gateway_pull_requests_in_flight",
+	} {
+		if v, ok := m[key]; !ok || v != 0 {
+			t.Fatalf("fresh %s = %v (present %v), want a visible 0", key, v, ok)
+		}
+	}
+	if limit, synced := m["xetpd_gateway_xorb_cache_limit_bytes"], m["xetpd_gateway_locality_synced"]; limit != cacheSize || synced != 1 {
+		t.Fatalf("cache limit %v, locality synced %v, want %d and 1 without a resolver", limit, synced, cacheSize)
+	}
+
+	const peerGets, directGets = `xetpd_gateway_xorb_gets_total{requester="peer"}`, `xetpd_gateway_xorb_gets_total{requester="direct"}`
+	request(t, http.MethodGet, srv.URL+"/v1/xorbs/default/"+testHash, "", apis.PeerHeader, "p1")
+	request(t, http.MethodGet, srv.URL+"/v1/xorbs/default/"+testHash, "")
+	m = clustertest.Scrape(t, srv.URL)
+	if gets := clustertest.Diag(t, srv.URL).XorbGets; m[peerGets] != 1 || m[directGets] != 1 || gets != (apis.XorbGets{Peer: 1, Direct: 1}) {
+		t.Fatalf("%s = %v, %s = %v, %s xorb_gets %+v, want 1 each on both", peerGets, m[peerGets], directGets, m[directGets], apis.PeersPath, gets)
+	}
+
+	waitReady(t, srv.URL+"/org/repo/resolve/main/a.bin")
+	clustertest.WaitFor(t, clustertest.WaitTimeout, "the ingest to release its pins and writer locks", func() bool {
+		m = clustertest.Scrape(t, srv.URL)
+		return m["xetpd_gateway_xorb_pins"] == 0 && m["xetpd_gateway_xorb_writers"] == 0
+	})
+	cached, entries, inFlight := m["xetpd_gateway_xorb_cache_bytes"], m["xetpd_gateway_xorb_cache_entries"], m["xetpd_gateway_pull_requests_in_flight"]
+	if d := clustertest.Diag(t, srv.URL); d.XorbBytes == 0 || cached != float64(d.XorbBytes) || entries != 1 || inFlight != 0 {
+		t.Fatalf("after the ingest: cache bytes %v, entries %v, pull requests in flight %v; %s xorb_bytes %d", cached, entries, inFlight, apis.PeersPath, d.XorbBytes)
+	}
+
+	auth := []string{"Authorization", "Bearer " + secret}
+	for _, req := range []apis.AnnounceRequest{
+		{Peer: apis.Peer{ID: "p1", URL: "http://127.0.0.1:1"}, Epoch: "e", Full: true, Add: []string{testHash}},
+		{Peer: apis.Peer{ID: "p2", URL: "http://127.0.0.1:2"}, Epoch: "e", Full: true, Add: []string{testHash, strings.Repeat("ab", 32)}},
+		{Peer: apis.Peer{ID: "p3", URL: "http://127.0.0.1:3"}, Epoch: "e", Add: []string{testHash}},
+	} {
+		if status, body, _ := post(t, srv, announceJSON(t, req), auth...); status != http.StatusOK {
+			t.Fatalf("announce of %s = %d %q", req.Peer.ID, status, body)
+		}
+	}
+	if status, body, _ := post(t, srv, "nope", auth...); status != http.StatusBadRequest {
+		t.Fatalf("malformed announce = %d %q, want 400", status, body)
+	}
+	m = clustertest.Scrape(t, srv.URL)
+	for key, want := range map[string]float64{
+		`xetpd_gateway_announces_total{result="ok"}`:       2,
+		`xetpd_gateway_announces_total{result="resync"}`:   1,
+		`xetpd_gateway_announces_total{result="rejected"}`: 1,
+		"xetpd_gateway_peers":                              2,
+		"xetpd_gateway_peer_holdings":                      3,
+	} {
+		if m[key] != want {
+			t.Fatalf("after two Full announces, a delta from an unknown peer and a malformed one: %s = %v, want %v", key, m[key], want)
+		}
+	}
+	if v, ok := clustertest.Scrape(t, second.URL)[`xetpd_gateway_announces_total{result="ok"}`]; !ok || v != 0 {
+		t.Fatalf("second gateway announces ok = %v (present %v), want its own 0", v, ok)
 	}
 }
 
@@ -357,7 +476,27 @@ func TestReconstructionPrefersClientNodePeer(t *testing.T) {
 	}
 	loc.set(host, "node-a")
 	fileHash := waitReady(t, srv.URL+"/org/repo/resolve/main/a.bin").Header.Get("X-Xet-Hash")
+	outcomes := []string{"local", "fallback", "none"}
+	picks := func() map[string]float64 {
+		samples := clustertest.Scrape(t, srv.URL)
+		out := map[string]float64{}
+		for _, o := range outcomes {
+			out[o] = samples[`xetpd_gateway_locality_picks_total{outcome="`+o+`"}`]
+		}
+		return out
+	}
+	pickedOnly := func(before map[string]float64, outcome string) {
+		t.Helper()
+		after := picks()
+		for _, o := range outcomes {
+			if o == outcome && after[o] <= before[o] || o != outcome && after[o] != before[o] {
+				t.Fatalf("locality picks %v -> %v, want only %s to grow", before, after, outcome)
+			}
+		}
+	}
+	before := picks()
 	urls := fetchURLs(t, srv.URL, fileHash)
+	pickedOnly(before, "none")
 	from := func(origin string) map[string]string {
 		out := map[string]string{}
 		for h := range urls {
@@ -377,20 +516,28 @@ func TestReconstructionPrefersClientNodePeer(t *testing.T) {
 	pa := apis.Peer{ID: "pa", URL: "http://127.0.0.1:1", Node: "node-a"}
 	pb := apis.Peer{ID: "pb", URL: "http://127.0.0.1:2", Node: "node-b"}
 	announce(pb, slices.Collect(maps.Keys(urls))...)
+	before = picks()
 	if got := fetchURLs(t, srv.URL, fileHash); !maps.Equal(got, from(pb.URL)) {
 		t.Fatalf("with a holder on another node = %v, want %v", got, from(pb.URL))
 	}
+	pickedOnly(before, "fallback")
 	announce(pa)
+	before = picks()
 	if got := fetchURLs(t, srv.URL, fileHash); !maps.Equal(got, from(pa.URL)) {
 		t.Fatalf("with a peer on the client's node = %v, want %v", got, from(pa.URL))
 	}
+	pickedOnly(before, "local")
+	before = picks()
 	if got := fetchURLs(t, srv.URL, fileHash, apis.PeerHeader, pa.ID); !maps.Equal(got, from(pb.URL)) {
 		t.Fatalf("for a request carrying %s = %v, want the holder %v", apis.PeerHeader, got, from(pb.URL))
 	}
+	pickedOnly(before, "fallback")
 	loc.set(host, "")
+	before = picks()
 	if got := fetchURLs(t, srv.URL, fileHash); !maps.Equal(got, from(pb.URL)) {
 		t.Fatalf("for a client the resolver cannot place = %v, want the holder %v", got, from(pb.URL))
 	}
+	pickedOnly(before, "fallback")
 }
 
 func TestReconstructionWithoutLocalityKeepsHolderRule(t *testing.T) {
@@ -483,6 +630,9 @@ func TestGatewayIntegration(t *testing.T) {
 	if d := clustertest.Diag(t, srv.URL); d.XorbGets != (apis.XorbGets{Peer: 2}) {
 		t.Fatalf("xorb gets after seeding = %+v", d.XorbGets)
 	}
+	clustertest.WaitFor(t, clustertest.WaitTimeout, "both pull requests counted ok", func() bool {
+		return clustertest.Scrape(t, srv.URL)[`xetpd_gateway_pull_requests_total{result="ok"}`] >= 2
+	})
 
 	// A fresh xet client downloads straight from the seeds.
 	download := func() {
@@ -556,6 +706,13 @@ func TestGatewayIntegration(t *testing.T) {
 	if d := clustertest.Diag(t, srv.URL); d.XorbGets != (apis.XorbGets{Peer: 2}) {
 		t.Fatalf("xorb gets after xet download = %+v, want no direct gets", d.XorbGets)
 	}
+	// The gateway evicted its copy, so a plain download relays the bytes from the seeds.
+	if resp, body := request(t, http.MethodGet, srv.URL+"/xet-bridge/"+clustertest.SHA256(data), ""); resp.StatusCode != http.StatusOK || clustertest.SHA256([]byte(body)) != clustertest.SHA256(data) {
+		t.Fatalf("plain download after eviction = %d, %d bytes", resp.StatusCode, len(body))
+	}
+	if n := clustertest.Scrape(t, srv.URL)[`xetpd_gateway_relay_opens_total{result="ok"}`]; n < 1 {
+		t.Fatalf("relay opens ok after a plain download from the seeds = %v, want at least 1", n)
+	}
 
 	// Both seeds restart empty on the same addresses: every copy is gone.
 	before := clustertest.Diag(t, srv.URL)
@@ -602,6 +759,13 @@ func TestGatewayIntegration(t *testing.T) {
 		if a != "Bearer "+upstreamToken {
 			t.Fatalf("upstream saw Authorization %q", a)
 		}
+	}
+	// The 404 paths after the total loss stop at the shard check; a GET of a xorb nobody holds reaches the relay.
+	if resp, _ := request(t, http.MethodGet, srv.URL+"/v1/xorbs/default/"+testHash, ""); resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("GET of a xorb nobody holds = %d, want 404", resp.StatusCode)
+	}
+	if n := clustertest.Scrape(t, srv.URL)[`xetpd_gateway_relay_opens_total{result="no_holder"}`]; n < 1 {
+		t.Fatalf("relay opens with no holder = %v, want at least 1", n)
 	}
 	if err := g.Close(); err != nil {
 		t.Fatal(err)

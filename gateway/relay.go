@@ -21,12 +21,14 @@ const relayAttempts = 3
 type relay struct {
 	reg       *registry
 	transport http.RoundTripper
+	metrics   *gatewayMetrics
 }
 
 // open returns [start, end] of the xorb from a live holder, end -1 meaning EOF; failed holders are skipped before any handle is handed out.
 func (r relay) open(ctx context.Context, hash xet.XorbHash, start, end int64) (io.ReadSeekCloser, error) {
 	holders := r.reg.holders(hash.String())
 	if len(holders) == 0 {
+		r.metrics.relay("no_holder")
 		return nil, fmt.Errorf("xorb %s has no live holder: %w", hash, fs.ErrNotExist)
 	}
 	var err error
@@ -45,14 +47,17 @@ func (r relay) open(ctx context.Context, hash xet.XorbHash, start, end int64) (i
 				err = errors.New(resp.Status)
 			}
 			if err == nil {
+				r.metrics.relay("ok")
 				return sk, nil
 			}
 			_ = sk.Close()
 			err = fmt.Errorf("holder %s: %w", p.ID, err)
 		}
 		if cerr := ctx.Err(); cerr != nil {
+			r.metrics.relay("canceled")
 			return nil, cerr
 		}
 	}
+	r.metrics.relay("error")
 	return nil, fmt.Errorf("xorb %s: %w", hash, err)
 }

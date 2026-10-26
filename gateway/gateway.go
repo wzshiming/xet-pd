@@ -95,6 +95,7 @@ type Gateway struct {
 	secret    string
 	locality  NodeResolver
 	transport *http.Transport // upstream xet downloads
+	metrics   *gatewayMetrics
 
 	peerGets, directGets atomic.Uint64
 	once                 sync.Once
@@ -105,22 +106,27 @@ func New(cfg Config) (*Gateway, error) {
 	if err := cfg.normalize(); err != nil {
 		return nil, err
 	}
+	m := newGatewayMetrics()
 	reg := newRegistry(cfg.PeerTTL)
 	st, err := newStore(filepath.Join(cfg.DataDir, "data"), reg)
 	if err != nil {
 		return nil, err
 	}
+	st.metrics, st.relay.metrics = m, m
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	cas, err := newCAS(cfg, st, transport)
 	if err != nil {
 		return nil, err
 	}
-	staging, err := newStaging(st, stagingConfig{replicas: cfg.Replicas, minSeeds: cfg.MinSeeds, cacheSize: cfg.XorbCacheSize, secret: cfg.Secret})
+	staging, err := newStaging(st, stagingConfig{replicas: cfg.Replicas, minSeeds: cfg.MinSeeds, cacheSize: cfg.XorbCacheSize, secret: cfg.Secret, metrics: m})
 	if err != nil {
 		return nil, err
 	}
-	g := &Gateway{mux: http.NewServeMux(), cas: cas, reg: reg, st: st, staging: staging, secret: cfg.Secret, locality: cfg.Locality, transport: transport}
+	g := &Gateway{mux: http.NewServeMux(), cas: cas, reg: reg, st: st, staging: staging, secret: cfg.Secret, locality: cfg.Locality, transport: transport, metrics: m}
+	m.reg.MustRegister(gatewayState{g})
 	g.mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
+	g.mux.HandleFunc("GET /readyz", g.serveReadyz)
+	g.mux.Handle("GET /metrics", m.handler())
 	g.mux.HandleFunc(apis.AnnouncePath, route(http.MethodPost, g.serveAnnounce))
 	g.mux.HandleFunc(apis.PeersPath, route(http.MethodGet, g.servePeers))
 	g.mux.Handle("/xet-pd/", http.NotFoundHandler()) // unknown control paths never reach the upstream
@@ -236,4 +242,16 @@ func (g *Gateway) servePeers(w http.ResponseWriter, _ *http.Request) {
 	d := apis.PeersResponse{Peers: g.reg.snapshot(), XorbBytes: g.staging.snapshot(), XorbGets: apis.XorbGets{Peer: g.peerGets.Load(), Direct: g.directGets.Load()}}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(d)
+}
+
+func (g *Gateway) serveReadyz(w http.ResponseWriter, _ *http.Request) {
+	if !g.localitySynced() {
+		http.Error(w, "locality index not synced", http.StatusServiceUnavailable)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+}
+
+func (g *Gateway) localitySynced() bool {
+	return g.locality == nil || g.locality.Synced()
 }

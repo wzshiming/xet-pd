@@ -105,6 +105,20 @@ func do(t *testing.T, method, url string, hdr ...string) (*http.Response, []byte
 	return resp, body, err
 }
 
+// awaitSamples waits until every sample in want reads its value on the /metrics of srv.
+func awaitSamples(t *testing.T, srv *httptest.Server, want map[string]float64) {
+	t.Helper()
+	clustertest.WaitFor(t, clustertest.WaitTimeout, fmt.Sprintf("samples %v", want), func() bool {
+		got := clustertest.Scrape(t, srv.URL)
+		for key, v := range want {
+			if got[key] != v {
+				return false
+			}
+		}
+		return true
+	})
+}
+
 func TestStartupFullAnnouncesSeededInventory(t *testing.T) {
 	t.Setenv("HF_TOKEN", "hf_must_not_leak")
 	a, bodyA := clustertest.MakeXorb(t, 20, 2, 8<<10)
@@ -330,6 +344,78 @@ func TestXorbRouteIgnoresPrefix(t *testing.T) {
 	}
 }
 
+func TestMetricsEndpoint(t *testing.T) {
+	hash, body := clustertest.MakeXorb(t, 53, 2, 8<<10)
+	cold, coldBody := clustertest.MakeXorb(t, 54, 2, 8<<10)
+	g := clustertest.NewFakeGateway(t, clustertest.ServeBody(coldBody))
+	p, srv := newTestPeer(t, g.URL, func(c *Config) { c.Heartbeat, c.Secret, c.XorbCacheSize = time.Hour, "s3cret", 1<<20 })
+	resp, text, err := do(t, http.MethodGet, srv.URL+"/metrics")
+	if err != nil || resp.StatusCode != http.StatusOK || !strings.HasPrefix(resp.Header.Get("Content-Type"), "text/plain") {
+		t.Fatalf("GET /metrics without credentials = %d %q, %v, want 200 text/plain", resp.StatusCode, resp.Header.Get("Content-Type"), err)
+	}
+	for _, typ := range []string{
+		"xorb_gets_total counter", "pulls_total counter", "announces_total counter", "restore_dropped_total counter",
+		"xorb_cache_bytes gauge", "xorb_cache_entries gauge", "xorb_cache_limit_bytes gauge", "pulls_in_flight gauge", "cooldowns gauge",
+	} {
+		if !strings.Contains("\n"+string(text), "\n# TYPE xetpd_peer_"+typ+"\n") {
+			t.Fatalf("GET /metrics lacks # TYPE xetpd_peer_%s", typ)
+		}
+	}
+	m := clustertest.Scrape(t, srv.URL)
+	for _, key := range []string{"go_goroutines", `xetpd_peer_announces_total{result="ok"}`, `xetpd_peer_announces_total{result="resync"}`, `xetpd_peer_announces_total{result="error"}`} {
+		if _, ok := m[key]; !ok {
+			t.Fatalf("GET /metrics lacks %s", key)
+		}
+	}
+	for _, key := range []string{
+		`xetpd_peer_xorb_gets_total{requester="client",status="200"}`, `xetpd_peer_xorb_gets_total{requester="client",status="206"}`, `xetpd_peer_xorb_gets_total{requester="client",status="404"}`,
+		`xetpd_peer_xorb_gets_total{requester="gateway",status="200"}`, `xetpd_peer_xorb_gets_total{requester="gateway",status="206"}`, `xetpd_peer_xorb_gets_total{requester="gateway",status="404"}`,
+		`xetpd_peer_pulls_total{result="ok"}`, `xetpd_peer_pulls_total{result="not_found"}`, `xetpd_peer_pulls_total{result="canceled"}`, `xetpd_peer_pulls_total{result="timeout"}`, `xetpd_peer_pulls_total{result="error"}`,
+		"xetpd_peer_restore_dropped_total", "xetpd_peer_xorb_cache_bytes", "xetpd_peer_xorb_cache_entries", "xetpd_peer_pulls_in_flight", "xetpd_peer_cooldowns",
+	} {
+		if v, ok := m[key]; !ok || v != 0 {
+			t.Fatalf("fresh %s = %v (present %v), want a visible 0", key, v, ok)
+		}
+	}
+
+	commitDirect(t, p, hash, body)
+	if resp, _, _ := do(t, http.MethodHead, xorbURL(srv, hash)); resp.StatusCode != http.StatusOK {
+		t.Fatalf("HEAD of a stored xorb = %d, want 200", resp.StatusCode)
+	}
+	// net/http sends a HEAD's header only once the handler returned, so a count would already show.
+	for key, v := range clustertest.Scrape(t, srv.URL) {
+		if strings.HasPrefix(key, "xetpd_peer_xorb_gets_total{") && v != 0 {
+			t.Errorf("%s = %v after a HEAD, want 0: only GETs count", key, v)
+		}
+	}
+	for _, req := range []struct {
+		url    string
+		hdr    []string
+		status int
+	}{
+		{xorbURL(srv, hash), nil, http.StatusOK},
+		{xorbURL(srv, hash), []string{"Range", "bytes=0-9"}, http.StatusPartialContent},
+		{xorbURL(srv, cold), []string{apis.PeerHeader, "gw"}, http.StatusNotFound},
+		{srv.URL + "/v1/xorbs/default/nothex", nil, http.StatusBadRequest},
+	} {
+		if resp, _, _ := do(t, http.MethodGet, req.url, req.hdr...); resp.StatusCode != req.status {
+			t.Fatalf("GET %s %q = %d, want %d", req.url, req.hdr, resp.StatusCode, req.status)
+		}
+	}
+	awaitSamples(t, srv, map[string]float64{
+		`xetpd_peer_xorb_gets_total{requester="client",status="200"}`:  1,
+		`xetpd_peer_xorb_gets_total{requester="client",status="206"}`:  1,
+		`xetpd_peer_xorb_gets_total{requester="gateway",status="404"}`: 1,
+		`xetpd_peer_xorb_gets_total{requester="client",status="400"}`:  1,
+	})
+	m = clustertest.Scrape(t, srv.URL)
+	if m["xetpd_peer_xorb_cache_bytes"] != float64(usage(p)) || m["xetpd_peer_xorb_cache_entries"] != 1 || m["xetpd_peer_xorb_cache_limit_bytes"] != float64(configOf(p).XorbCacheSize) {
+		t.Fatalf("cache bytes %v, entries %v, limit %v, want %d, 1 and %d", m["xetpd_peer_xorb_cache_bytes"], m["xetpd_peer_xorb_cache_entries"], m["xetpd_peer_xorb_cache_limit_bytes"], usage(p), configOf(p).XorbCacheSize)
+	}
+	pullAndSettle(t, p, srv, cold, coldBody)
+	awaitSamples(t, srv, map[string]float64{`xetpd_peer_pulls_total{result="ok"}`: 1, "xetpd_peer_pulls_in_flight": 0})
+}
+
 type result struct {
 	resp *http.Response
 	body []byte
@@ -345,6 +431,9 @@ func doAsync(t *testing.T, url string, hdr ...string) <-chan result {
 	}()
 	return out
 }
+
+// streamClient bounds the wait for a response header that must arrive while the pull behind it is held.
+var streamClient = &http.Client{Transport: &http.Transport{ResponseHeaderTimeout: clustertest.WaitTimeout}}
 
 func TestGatedPullServesPrefixBeforeUpstreamCompletes(t *testing.T) {
 	hash, body := clustertest.MakeXorb(t, 2, 4, 16<<10)
@@ -408,7 +497,7 @@ func TestStreamDoesNotWaitForValidation(t *testing.T) {
 	p, srv := newTestPeer(t, g.URL, nil)
 	u := xorbURL(srv, hash)
 
-	resp, err := http.Get(u)
+	resp, err := streamClient.Get(u)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -457,7 +546,7 @@ func TestConcurrentColdRequestsShareOnePull(t *testing.T) {
 	var wg sync.WaitGroup
 	for i := range n {
 		wg.Go(func() {
-			resp, err := http.Get(u)
+			resp, err := streamClient.Get(u)
 			if err != nil {
 				t.Error(err)
 				return
@@ -471,7 +560,7 @@ func TestConcurrentColdRequestsShareOnePull(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
-	dropped, err := http.DefaultClient.Do(req)
+	dropped, err := streamClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -510,6 +599,7 @@ func TestUpstreamFailures(t *testing.T) {
 		if n := len(g.Requests()); n != 1 {
 			t.Fatalf("gateway GETs = %d, want 1 (cooldown)", n)
 		}
+		awaitSamples(t, srv, map[string]float64{`xetpd_peer_pulls_total{result="not_found"}`: 1})
 	})
 	t.Run("upstream error", func(t *testing.T) {
 		g := clustertest.NewFakeGateway(t, status(http.StatusInternalServerError))
@@ -582,6 +672,7 @@ func TestUpstreamFailures(t *testing.T) {
 		if ok, _ := filepath.Glob(filepath.Join(configOf(p).DataDir, "xorbs", "*", "*", ".xorb-*")); len(ok) != 0 {
 			t.Fatalf("storage temp files left: %v", ok)
 		}
+		awaitSamples(t, srv, map[string]float64{`xetpd_peer_pulls_total{result="error"}`: 1, "xetpd_peer_cooldowns": 1})
 	})
 	t.Run("short body", func(t *testing.T) {
 		release := make(chan struct{})
@@ -596,7 +687,7 @@ func TestUpstreamFailures(t *testing.T) {
 		})
 		p, srv := newTestPeer(t, g.URL, nil)
 		u := xorbURL(srv, hash)
-		resp, err := http.Get(u)
+		resp, err := streamClient.Get(u)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -715,7 +806,7 @@ func TestCloseCancelsPullAndReaders(t *testing.T) {
 	g := clustertest.NewFakeGateway(t, clustertest.GatedBody(body, 4<<10, make(chan struct{})))
 	p, srv := newTestPeer(t, g.URL, nil)
 	u := xorbURL(srv, hash)
-	resp, err := http.Get(u)
+	resp, err := streamClient.Get(u)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -823,9 +914,12 @@ func TestDeadClientReleasesReaderAndKeepsPull(t *testing.T) {
 	if err := req.Write(conn); err != nil {
 		t.Fatal(err)
 	}
+	if err := conn.SetReadDeadline(time.Now().Add(clustertest.WaitTimeout)); err != nil {
+		t.Fatal(err)
+	}
 	resp, err := http.ReadResponse(bufio.NewReader(conn), req)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("multi range header while the pull is held: %v", err)
 	}
 	f, refs, _, _ := pullStatus(p, hash)
 	held := f != nil && refs == 2

@@ -75,6 +75,7 @@ type Peer struct {
 	client   *http.Client // data fetches, no secret
 	mux      *http.ServeMux
 	ann      *announcer
+	metrics  *peerMetrics
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -120,7 +121,9 @@ func New(cfg Config) (*Peer, error) {
 		sem:      make(chan struct{}, cfg.MaxPulls),
 		pulls:    map[xet.XorbHash]*pull{},
 		cooldown: map[xet.XorbHash]cooled{},
+		metrics:  newPeerMetrics(),
 	}
+	p.metrics.reg.MustRegister(peerState{p})
 	p.ann = &announcer{p: p, control: apis.NewClient(transport), wake: make(chan struct{}, 1), full: true}
 	p.mux = p.routes()
 	if err := p.restore(); err != nil {
@@ -145,4 +148,23 @@ func (p *Peer) Close() error {
 		p.client.CloseIdleConnections()
 	})
 	return nil
+}
+
+type peerStats struct {
+	bytes                     int64
+	entries, pulls, cooldowns int
+}
+
+// stats leaves out cooldowns past their end that acquire has yet to sweep.
+func (p *Peer) stats() peerStats {
+	now := time.Now()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	s := peerStats{bytes: p.xorbs.Usage(), entries: p.xorbs.Len(), pulls: len(p.pulls)}
+	for _, c := range p.cooldown {
+		if now.Before(c.until) {
+			s.cooldowns++
+		}
+	}
+	return s
 }

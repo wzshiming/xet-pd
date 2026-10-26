@@ -1,0 +1,45 @@
+# xet-pd on Kubernetes: one gateway Deployment on a PVC behind Service xet-pd-gateway, and a peer DaemonSet
+# serving xorbs on each node's IP, port 8081.
+#   kubectl kustomize deploy/k8s/base   # check the render
+#   kubectl apply -k deploy/k8s/base    # or an overlay listing this directory under resources
+#
+# Secret, required: pods wait in CreateContainerConfigError until xet-pd-secret exists. Generate it in an
+# overlay with a secretGenerator, or create it once:
+#   kubectl -n xet-pd create secret generic xet-pd-secret --from-literal=XET_PD_SECRET=$(openssl rand -hex 32)
+# Hub token, optional:
+#   kubectl -n xet-pd create secret generic xet-pd-hf-token --from-literal=HF_TOKEN=<token>
+# Images: :master moves with every push to master; production pins sha-xxxxxxx or a release version through
+# an images entry with newTag.
+# Upstream: HF_ENDPOINT below is the hub the gateway mirrors, not the clients' endpoint. Override it in an
+# overlay configMapGenerator named xet-pd-gateway with behavior: merge and options.disableNameSuffixHash: true,
+# then run kubectl -n xet-pd rollout restart deploy/xet-pd-gateway.
+# Clients in any namespace set only HF_ENDPOINT; xorbs then come from the peer on their own node:
+#   HF_ENDPOINT=http://xet-pd-gateway.xet-pd.svc:8080 hf download <repo>
+# Tainted nodes get no peer; patch the DaemonSet with tolerations: [{operator: Exists}] to cover them.
+# Port 8081 taken on the nodes: change PEER_PORT and the peer containerPort together.
+# Gateway PVC: size it above XET_PD_XORB_CACHE_SIZE (8GiB by default) plus the mirror metadata, set
+# storageClassName when the cluster has no default StorageClass, and add a chown init container when the
+# storage ignores fsGroup.
+# Peer disk: each node keeps about XET_PD_XORB_CACHE_SIZE (8GiB by default) plus in-flight pull spools in
+# hostPath /var/lib/xet-pd/peer, and deleting the DaemonSet leaves it there.
+# Large peer caches: raise the peer startupProbe failureThreshold, as a peer validates its whole cache
+# before it listens.
+# Another instance in the same cluster: give it its own namespace and a namePrefix, since the ClusterRole and
+# its binding are cluster-wide; its peers then need XET_PD_GATEWAY patched to the prefixed Service, and their
+# own PEER_PORT and hostPath.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: xet-pd
+resources:
+  - namespace.yaml
+  - gateway-rbac.yaml
+  - gateway-pvc.yaml
+  - gateway-deployment.yaml
+  - gateway-service.yaml
+  - peer-daemonset.yaml
+configMapGenerator:
+  - name: xet-pd-gateway
+    literals:
+      - HF_ENDPOINT=https://huggingface.co
+    options:
+      disableNameSuffixHash: true

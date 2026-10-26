@@ -1,0 +1,137 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: xet-pd-peer
+  namespace: xet-pd
+  labels:
+    app.kubernetes.io/name: xet-pd-peer
+    app.kubernetes.io/component: peer
+    app.kubernetes.io/part-of: xet-pd
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: xet-pd-peer
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 10%
+      # A surge pod could not bind the port the old pod still holds on the node.
+      maxSurge: 0
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: xet-pd-peer
+        app.kubernetes.io/component: peer
+        app.kubernetes.io/part-of: xet-pd
+    spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      automountServiceAccountToken: false
+      nodeSelector:
+        kubernetes.io/os: linux
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+        # hostPath directories are created root-owned, and fsGroup does not apply to hostPath.
+        - name: chown-data
+          image: ghcr.io/wzshiming/xet-pd-peer:master
+          imagePullPolicy: Always
+          command: ["chown", "10001:10001", "/data"]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+          securityContext:
+            runAsUser: 0
+            runAsNonRoot: false
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+              add:
+                - CHOWN
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      containers:
+        - name: peer
+          image: ghcr.io/wzshiming/xet-pd-peer:master
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 8081
+          env:
+            - name: NODE_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            # Must match the http containerPort, which the probes use.
+            - name: PEER_PORT
+              value: "8081"
+            # The node IP only, not every interface of the host.
+            - name: XET_PD_LISTEN
+              value: $(NODE_IP):$(PEER_PORT)
+            - name: XET_PD_ADVERTISE
+              value: http://$(NODE_IP):$(PEER_PORT)
+            - name: XET_PD_GATEWAY
+              value: http://xet-pd-gateway.$(POD_NAMESPACE).svc:8080
+            - name: XET_PD_NODE
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: XET_PD_DATA_DIR
+              value: /data
+            - name: XET_PD_LOG_FORMAT
+              value: json
+            - name: XET_PD_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: xet-pd-secret
+                  key: XET_PD_SECRET
+          # A peer validates its whole cache before it listens.
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+            failureThreshold: 60
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: data
+          hostPath:
+            path: /var/lib/xet-pd/peer
+            type: DirectoryOrCreate

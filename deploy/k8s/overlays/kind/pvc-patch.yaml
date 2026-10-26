@@ -1,0 +1,9 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: xet-pd-gateway
+  namespace: xet-pd
+spec:
+  resources:
+    requests:
+      storage: 1Gi

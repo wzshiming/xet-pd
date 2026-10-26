@@ -40,10 +40,11 @@ func TestParsePeerDefaults(t *testing.T) {
 func TestParsePeerEnv(t *testing.T) {
 	getenv := clitest.Getenv(
 		"XET_PD_LISTEN", ":9001", "XET_PD_ADVERTISE", "http://p:1", "XET_PD_GATEWAY", "http://g:2", "XET_PD_DATA_DIR", "/cache",
-		"XET_PD_XORB_CACHE_SIZE", "2GiB", "XET_PD_MAX_PULLS", "3", "XET_PD_PULL_TIMEOUT", "1m", "XET_PD_HEARTBEAT", "2s", "XET_PD_SECRET", "sec", "XET_PD_LOG_FORMAT", "json")
+		"XET_PD_XORB_CACHE_SIZE", "2GiB", "XET_PD_MAX_PULLS", "3", "XET_PD_PULL_TIMEOUT", "1m", "XET_PD_HEARTBEAT", "2s", "XET_PD_SECRET", "sec", "XET_PD_LOG_FORMAT", "json",
+		"XET_PD_NODE", "node-1")
 	settings, cfg, err := parse(nil, getenv, io.Discard)
 	wantSettings := cli.Settings{Listen: ":9001", LogFormat: cli.LogJSON}
-	want := peer.Config{Advertise: "http://p:1", Gateway: "http://g:2", DataDir: "/cache", XorbCacheSize: 2 << 30, MaxPulls: 3, PullTimeout: time.Minute, Heartbeat: 2 * time.Second, Secret: "sec"}
+	want := peer.Config{Advertise: "http://p:1", Gateway: "http://g:2", DataDir: "/cache", XorbCacheSize: 2 << 30, MaxPulls: 3, PullTimeout: time.Minute, Heartbeat: 2 * time.Second, Secret: "sec", Node: "node-1"}
 	if err != nil || settings != wantSettings || cfg != want {
 		t.Fatalf("parse() = %+v, %+v, %v; want %+v, %+v", settings, cfg, err, wantSettings, want)
 	}
@@ -52,12 +53,13 @@ func TestParsePeerEnv(t *testing.T) {
 func TestParsePeerFlagsOverrideEnv(t *testing.T) {
 	getenv := clitest.Getenv(
 		"XET_PD_LISTEN", ":9001", "XET_PD_ADVERTISE", "http://p:1", "XET_PD_GATEWAY", "http://g:2", "XET_PD_DATA_DIR", "/cache",
-		"XET_PD_XORB_CACHE_SIZE", "bogus", "XET_PD_MAX_PULLS", "x", "XET_PD_PULL_TIMEOUT", "y", "XET_PD_HEARTBEAT", "z", "XET_PD_SECRET", "sec", "XET_PD_LOG_FORMAT", "bogus")
+		"XET_PD_XORB_CACHE_SIZE", "bogus", "XET_PD_MAX_PULLS", "x", "XET_PD_PULL_TIMEOUT", "y", "XET_PD_HEARTBEAT", "z", "XET_PD_SECRET", "sec", "XET_PD_LOG_FORMAT", "bogus",
+		"XET_PD_NODE", "env-node")
 	args := []string{"-listen", ":7001", "-advertise", "http://fp:1", "-gateway", "http://fg:2", "-data-dir", "/flag",
-		"-xorb-cache-size", "512MiB", "-max-pulls", "2", "-pull-timeout", "30s", "-heartbeat", "1s", "-secret", "fsec", "-log-format", "json"}
+		"-xorb-cache-size", "512MiB", "-max-pulls", "2", "-pull-timeout", "30s", "-heartbeat", "1s", "-secret", "fsec", "-log-format", "json", "-node", "flag-node"}
 	settings, cfg, err := parse(args, getenv, io.Discard)
 	wantSettings := cli.Settings{Listen: ":7001", LogFormat: cli.LogJSON}
-	want := peer.Config{Advertise: "http://fp:1", Gateway: "http://fg:2", DataDir: "/flag", XorbCacheSize: 512 << 20, MaxPulls: 2, PullTimeout: 30 * time.Second, Heartbeat: time.Second, Secret: "fsec"}
+	want := peer.Config{Advertise: "http://fp:1", Gateway: "http://fg:2", DataDir: "/flag", XorbCacheSize: 512 << 20, MaxPulls: 2, PullTimeout: 30 * time.Second, Heartbeat: time.Second, Secret: "fsec", Node: "flag-node"}
 	if err != nil || settings != wantSettings || cfg != want {
 		t.Fatalf("parse() = %+v, %+v, %v; want %+v, %+v", settings, cfg, err, wantSettings, want)
 	}
@@ -96,7 +98,7 @@ func TestParsePeerHelp(t *testing.T) {
 	if !errors.Is(err, flag.ErrHelp) {
 		t.Fatalf("err = %v, want flag.ErrHelp", err)
 	}
-	for _, want := range []string{"Usage: peer [flags]", "-advertise", "[env XET_PD_ADVERTISE]", "-data-dir", "[env XET_PD_DATA_DIR]", "(default 8GiB)", "-pull-timeout", "(default 10m0s)", "[env XET_PD_SECRET]", "-log-format", "[env XET_PD_LOG_FORMAT]", "(default text)"} {
+	for _, want := range []string{"Usage: peer [flags]", "-advertise", "[env XET_PD_ADVERTISE]", "-data-dir", "[env XET_PD_DATA_DIR]", "(default 8GiB)", "-pull-timeout", "(default 10m0s)", "[env XET_PD_SECRET]", "-log-format", "[env XET_PD_LOG_FORMAT]", "(default text)", "-node", "[env XET_PD_NODE]"} {
 		if !strings.Contains(help.String(), want) {
 			t.Errorf("help lacks %q:\n%s", want, help.String())
 		}

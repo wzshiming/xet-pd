@@ -4,18 +4,22 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"maps"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/client"
 	"github.com/wzshiming/xet/client/hf"
+	"github.com/wzshiming/xet/download"
 
 	"github.com/wzshiming/xet-pd/apis"
 	"github.com/wzshiming/xet-pd/internal/clustertest"
@@ -73,6 +77,57 @@ func waitReady(t *testing.T, resolveURL string) *http.Response {
 		return resp.Header.Get("X-Xet-Hash") != ""
 	})
 	return resp
+}
+
+// nodeMap is a NodeResolver over a host-to-node table the test may change; Synced reports synced.
+type nodeMap struct {
+	mu     sync.Mutex
+	nodes  map[string]string
+	synced bool
+}
+
+func (m *nodeMap) NodeOf(ip string) (string, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	node, ok := m.nodes[ip]
+	return node, ok
+}
+
+func (m *nodeMap) Synced() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.synced
+}
+
+// set maps host to node; an empty node forgets host.
+func (m *nodeMap) set(host, node string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if node == "" {
+		delete(m.nodes, host)
+	} else {
+		m.nodes[host] = node
+	}
+}
+
+// fetchURLs maps each xorb of fileHash's V1 reconstruction to the URL the gateway at gw hands a request carrying hdr.
+func fetchURLs(t *testing.T, gw, fileHash string, hdr ...string) map[string]string {
+	t.Helper()
+	resp, body := request(t, http.MethodGet, gw+"/v1/reconstructions/"+fileHash, "", hdr...)
+	var v1 download.ReconstructionResponseV1
+	if resp.StatusCode != http.StatusOK || json.Unmarshal([]byte(body), &v1) != nil || len(v1.FetchInfo) == 0 {
+		t.Fatalf("reconstruction of %s = %d %q", fileHash, resp.StatusCode, body)
+	}
+	urls := map[string]string{}
+	for hash, entries := range v1.FetchInfo {
+		for _, e := range entries {
+			if u, seen := urls[hash]; seen && u != e.URL {
+				t.Fatalf("xorb %s fetched from both %s and %s", hash, u, e.URL)
+			}
+			urls[hash] = e.URL
+		}
+	}
+	return urls
 }
 
 func TestConfigValidation(t *testing.T) {
@@ -288,6 +343,75 @@ func TestCloseIsIdempotent(t *testing.T) {
 	}
 	if resp, _ := request(t, http.MethodGet, srv.URL+"/healthz", ""); resp.StatusCode != http.StatusOK {
 		t.Fatalf("healthz after Close = %d", resp.StatusCode)
+	}
+}
+
+func TestReconstructionPrefersClientNodePeer(t *testing.T) {
+	hub := clustertest.NewHub(t)
+	hub.Set("/org/repo/resolve/main/a.bin", clustertest.RandomData(7, 64<<10))
+	loc := &nodeMap{nodes: map[string]string{}} // never synced: the gateway acts on what the resolver already knows
+	_, srv := newTestGateway(t, hub, func(cfg *Config, _ string) { cfg.Locality, cfg.PeerTTL = loc, time.Hour })
+	host, _, err := net.SplitHostPort(srv.Listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	loc.set(host, "node-a")
+	fileHash := waitReady(t, srv.URL+"/org/repo/resolve/main/a.bin").Header.Get("X-Xet-Hash")
+	urls := fetchURLs(t, srv.URL, fileHash)
+	from := func(origin string) map[string]string {
+		out := map[string]string{}
+		for h := range urls {
+			out[h] = apis.XorbURL(origin, h)
+		}
+		return out
+	}
+	if !maps.Equal(urls, from(srv.URL)) {
+		t.Fatalf("without peers = %v, want the gateway %v", urls, from(srv.URL))
+	}
+	announce := func(p apis.Peer, add ...string) {
+		t.Helper()
+		if status, body, _ := post(t, srv, announceJSON(t, apis.AnnounceRequest{Peer: p, Epoch: "e", Full: true, Add: add})); status != http.StatusOK {
+			t.Fatalf("announce of %s = %d %q", p.ID, status, body)
+		}
+	}
+	pa := apis.Peer{ID: "pa", URL: "http://127.0.0.1:1", Node: "node-a"}
+	pb := apis.Peer{ID: "pb", URL: "http://127.0.0.1:2", Node: "node-b"}
+	announce(pb, slices.Collect(maps.Keys(urls))...)
+	if got := fetchURLs(t, srv.URL, fileHash); !maps.Equal(got, from(pb.URL)) {
+		t.Fatalf("with a holder on another node = %v, want %v", got, from(pb.URL))
+	}
+	announce(pa)
+	if got := fetchURLs(t, srv.URL, fileHash); !maps.Equal(got, from(pa.URL)) {
+		t.Fatalf("with a peer on the client's node = %v, want %v", got, from(pa.URL))
+	}
+	if got := fetchURLs(t, srv.URL, fileHash, apis.PeerHeader, pa.ID); !maps.Equal(got, from(pb.URL)) {
+		t.Fatalf("for a request carrying %s = %v, want the holder %v", apis.PeerHeader, got, from(pb.URL))
+	}
+	loc.set(host, "")
+	if got := fetchURLs(t, srv.URL, fileHash); !maps.Equal(got, from(pb.URL)) {
+		t.Fatalf("for a client the resolver cannot place = %v, want the holder %v", got, from(pb.URL))
+	}
+}
+
+func TestReconstructionWithoutLocalityKeepsHolderRule(t *testing.T) {
+	hub := clustertest.NewHub(t)
+	hub.Set("/org/repo/resolve/main/a.bin", clustertest.RandomData(7, 64<<10))
+	_, srv := newTestGateway(t, hub, func(cfg *Config, _ string) { cfg.PeerTTL = time.Hour })
+	fileHash := waitReady(t, srv.URL+"/org/repo/resolve/main/a.bin").Header.Get("X-Xet-Hash")
+	urls := fetchURLs(t, srv.URL, fileHash)
+	holder := apis.Peer{ID: "pb", URL: "http://127.0.0.1:2", Node: "node-b"}
+	for _, req := range []apis.AnnounceRequest{
+		{Peer: apis.Peer{ID: "pa", URL: "http://127.0.0.1:1", Node: "node-a"}, Epoch: "e", Full: true},
+		{Peer: holder, Epoch: "e", Full: true, Add: slices.Collect(maps.Keys(urls))},
+	} {
+		if status, body, _ := post(t, srv, announceJSON(t, req)); status != http.StatusOK {
+			t.Fatalf("announce of %s = %d %q", req.Peer.ID, status, body)
+		}
+	}
+	for h, u := range fetchURLs(t, srv.URL, fileHash) {
+		if u != apis.XorbURL(holder.URL, h) {
+			t.Fatalf("xorb %s fetched from %s, want the holder %s", h, u, holder.URL)
+		}
 	}
 }
 

@@ -194,6 +194,37 @@ func TestFlagSetHelp(t *testing.T) {
 	}
 }
 
+// choice is a flag.Value that takes only "a" or "b".
+type choice string
+
+func (c *choice) Set(s string) error {
+	if s != "a" && s != "b" {
+		return errors.New("expected a or b")
+	}
+	*c = choice(s)
+	return nil
+}
+
+func (c *choice) String() string { return string(*c) }
+
+func TestFlagSetVarFallsBackToEnvironment(t *testing.T) {
+	t.Parallel()
+	parse := func(getenv func(string) string) (choice, error) {
+		c := choice("a")
+		fs := NewFlagSet("test")
+		fs.Var(&c, "choice", "which one", "TEST_CHOICE")
+		err := fs.Parse(nil, getenv, io.Discard)
+		return c, err
+	}
+	if c, err := parse(clitest.Getenv("TEST_CHOICE", "b")); err != nil || c != "b" {
+		t.Fatalf("Parse with TEST_CHOICE=b = %q, %v; want b", c, err)
+	}
+	const want = `TEST_CHOICE="c": expected a or b`
+	if _, err := parse(clitest.Getenv("TEST_CHOICE", "c")); err == nil || err.Error() != want {
+		t.Fatalf("Parse with TEST_CHOICE=c = %v; want %q", err, want)
+	}
+}
+
 // secretOf parses args with only the secret flags registered and resolves the secret.
 func secretOf(args []string, getenv func(string) string) (string, error) {
 	fs := NewFlagSet("test")

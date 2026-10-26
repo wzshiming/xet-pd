@@ -117,10 +117,10 @@ func TestStartupFullAnnouncesSeededInventory(t *testing.T) {
 		w.WriteHeader(http.StatusInternalServerError)
 	})
 	p, srv := newTestPeer(t, g.URL, func(c *Config) {
-		c.DataDir, c.Heartbeat, c.Secret = dir, time.Hour, "s3cret"
+		c.DataDir, c.Heartbeat, c.Secret, c.Node = dir, time.Hour, "s3cret", "node-a"
 	})
 	first := g.Announce(t, 0)
-	want := apis.AnnounceRequest{Peer: apis.Peer{ID: peerID(p), URL: "http://seed.test"}, Epoch: peerEpoch(p), Full: true, Add: hashes(a, b)}
+	want := apis.AnnounceRequest{Peer: apis.Peer{ID: peerID(p), URL: "http://seed.test", Node: "node-a"}, Epoch: peerEpoch(p), Full: true, Add: hashes(a, b)}
 	if got := first.Req; !slices.Equal(got.Add, want.Add) || got.Peer != want.Peer || got.Epoch != want.Epoch || !got.Full || len(got.Remove) != 0 {
 		t.Fatalf("startup announce = %+v, want %+v", got, want)
 	}
@@ -181,6 +181,17 @@ func TestConfigValidation(t *testing.T) {
 	}
 	if cfg.MaxPulls != 8 || cfg.PullTimeout != 10*time.Minute || cfg.Heartbeat != 10*time.Second {
 		t.Fatalf("defaults = %+v", cfg)
+	}
+}
+
+func TestConfigRejectsInvalidNode(t *testing.T) {
+	p, err := New(Config{Advertise: "http://seed:8080", Gateway: "http://gw", DataDir: t.TempDir(), Node: "bad node"})
+	if err == nil {
+		_ = p.Close()
+		t.Fatal(`New accepted node "bad node"`)
+	}
+	if want := `node "bad node": expected 1 to 253 of [A-Za-z0-9._-]`; err.Error() != want {
+		t.Fatalf("New error = %q, want %q", err, want)
 	}
 }
 

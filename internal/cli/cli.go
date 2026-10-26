@@ -123,15 +123,18 @@ func (s *FlagSet) DurationVar(p *time.Duration, name string, value time.Duration
 	s.FlagSet.DurationVar(p, name, value, s.bind(name, usage, keys))
 }
 
+func (s *FlagSet) Var(value flag.Value, name, usage string, keys ...string) {
+	s.FlagSet.Var(value, name, s.bind(name, usage, keys))
+}
+
 func (s *FlagSet) SizeVar(p *int64, name string, value int64, usage string, keys ...string) {
 	*p = value
-	s.Var((*sizeValue)(p), name, s.bind(name, usage, keys))
+	s.Var((*sizeValue)(p), name, usage, keys...)
 }
 
 func (s *FlagSet) LogFormatVar(p *LogFormat) {
-	const name = "log-format"
 	*p = LogText
-	s.Var(p, name, s.bind(name, "log format, text or json", []string{"XET_PD_LOG_FORMAT"}))
+	s.Var(p, "log-format", "log format, text or json", "XET_PD_LOG_FORMAT")
 }
 
 // Parse applies the command line, then the environment to flags left unset, and rejects positional arguments; -h prints the usage to help.

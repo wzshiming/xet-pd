@@ -244,6 +244,26 @@ func TestGetXorbURLPrefersLiveHolder(t *testing.T) {
 	}
 }
 
+func TestGetXorbURLPrefersClientNodePeer(t *testing.T) {
+	x := makeXorb(t, 1, 2, 4<<10)
+	st, reg := newTestStore(t, t.TempDir())
+	onN1 := withClientNode(context.Background(), "n1")
+	want := "/v1/xorbs/default/" + x.hash.String()
+	if u, err := st.GetXorbURL(onN1, x.hash); err != nil || u != want {
+		t.Fatalf("GetXorbURL without peers = %q, %v, want relative %q", u, err, want)
+	}
+	reg.announce(fullReq(nodePeer(1, "n1"), "e"))
+	reg.announce(fullReq(nodePeer(2, "n2"), "e", x.hash.String()))
+	if u, err := st.GetXorbURL(onN1, x.hash); err != nil || u != "http://p1"+want {
+		t.Fatalf("GetXorbURL for a client on n1 = %q, %v, want the peer on n1", u, err)
+	}
+	for _, ctx := range []context.Context{withClientNode(context.Background(), "n9"), context.Background()} {
+		if u, err := st.GetXorbURL(ctx, x.hash); err != nil || u != "http://p2"+want {
+			t.Fatalf("GetXorbURL for a client on %q = %q, %v, want the holder", clientNode(ctx), u, err)
+		}
+	}
+}
+
 func TestChunkDedupAlwaysMisses(t *testing.T) {
 	x := makeXorb(t, 3, 2, 4<<10)
 	st, _ := newTestStore(t, t.TempDir())

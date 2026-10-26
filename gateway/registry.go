@@ -90,17 +90,36 @@ func (r *registry) rank(hash string) []ranked {
 	return list
 }
 
-func (r *registry) pick(hash string) (apis.Peer, bool) {
+type pickOutcome uint8
+
+const (
+	pickNone pickOutcome = iota
+	pickFallback
+	pickLocal
+)
+
+// pick chooses the peer a client on node fetches hash from: a live peer on that node, holders first then by ID; else the best holder, else the top-ranked peer; pickNone when none is live, and an empty node is local to nothing.
+func (r *registry) pick(hash, node string) (apis.Peer, pickOutcome) {
 	list := r.rank(hash)
-	for _, p := range list {
-		if p.holder {
-			return p.Peer, true
+	var local, fallback *ranked
+	for i := range list {
+		p := &list[i]
+		switch {
+		case node != "" && p.Node == node:
+			if local == nil || p.holder && !local.holder || p.holder == local.holder && p.ID < local.ID {
+				local = p
+			}
+		case fallback == nil || p.holder && !fallback.holder:
+			fallback = p
 		}
 	}
-	if len(list) == 0 {
-		return apis.Peer{}, false
+	switch {
+	case local != nil:
+		return local.Peer, pickLocal
+	case fallback != nil:
+		return fallback.Peer, pickFallback
 	}
-	return list[0].Peer, true
+	return apis.Peer{}, pickNone
 }
 
 func (r *registry) holders(hash string) []apis.Peer {
@@ -123,7 +142,7 @@ func (r *registry) snapshot() []apis.PeerStatus {
 	out := make([]apis.PeerStatus, 0, len(r.peers))
 	for _, p := range r.peers {
 		if now.Before(p.expiry) {
-			out = append(out, apis.PeerStatus{ID: p.ID, URL: p.URL, Epoch: p.epoch, Expiry: p.expiry, Holdings: len(p.holdings)})
+			out = append(out, apis.PeerStatus{ID: p.ID, URL: p.URL, Node: p.Node, Epoch: p.epoch, Expiry: p.expiry, Holdings: len(p.holdings)})
 		}
 	}
 	r.mu.RUnlock()

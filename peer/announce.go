@@ -82,7 +82,7 @@ func (a *announcer) snapshot() map[string]struct{} {
 // request announces snap whole when full, else as its delta from acked.
 func (a *announcer) request(snap map[string]struct{}) apis.AnnounceRequest {
 	p := a.p
-	req := apis.AnnounceRequest{Peer: apis.Peer{ID: p.id, URL: p.cfg.Advertise}, Epoch: p.epoch, Full: a.full}
+	req := apis.AnnounceRequest{Peer: apis.Peer{ID: p.id, URL: p.cfg.Advertise, Node: p.cfg.Node}, Epoch: p.epoch, Full: a.full}
 	for h := range snap {
 		if _, ok := a.acked[h]; a.full || !ok {
 			req.Add = append(req.Add, h)

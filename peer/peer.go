@@ -24,6 +24,7 @@ import (
 // Config configures New; zero MaxPulls, PullTimeout and Heartbeat take the defaults below.
 type Config struct {
 	Advertise     string        // public origin of this peer, scheme://host[:port]
+	Node          string        // node this peer runs on, as the gateway's locality resolver names it; empty announces none
 	Gateway       string        // upstream gateway origin
 	DataDir       string        // data directory: xorbs/ committed objects, spool/ in-flight pulls
 	XorbCacheSize int64         // bytes of committed xorbs to keep, 0 unlimited; spools are extra
@@ -40,7 +41,7 @@ const (
 	DefaultHeartbeat   = 10 * time.Second
 )
 
-// normalize canonicalizes both origins, rejects a missing data dir or negative values and fills in the defaults.
+// normalize canonicalizes both origins, rejects an invalid node, a missing data dir or negative values and fills in the defaults.
 func (c *Config) normalize() error {
 	var err error
 	if c.Advertise, err = apis.Origin(c.Advertise); err != nil {
@@ -48,6 +49,9 @@ func (c *Config) normalize() error {
 	}
 	if c.Gateway, err = apis.Origin(c.Gateway); err != nil {
 		return fmt.Errorf("gateway: %w", err)
+	}
+	if c.Node != "" && !apis.ValidLabel(c.Node, apis.MaxNodeLen) {
+		return fmt.Errorf("node %q: expected 1 to %d of [A-Za-z0-9._-]", c.Node, apis.MaxNodeLen)
 	}
 	if c.DataDir == "" {
 		return errors.New("data dir is required")

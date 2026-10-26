@@ -20,6 +20,27 @@ const XorbPathPrefix = "/v1/xorbs/default/"
 // MaxXorbBytes caps a packed xorb, chunk headers and footer included: peers pull nothing larger and the gateway trusts no offset beyond it.
 const MaxXorbBytes = 128 << 20
 
+// Label bounds: Peer.ID and AnnounceRequest.Epoch take up to MaxIDLen bytes, Peer.Node up to MaxNodeLen, the length of a Kubernetes node name.
+const (
+	MaxIDLen   = 128
+	MaxNodeLen = 253
+)
+
+// ValidLabel reports whether s is 1 to maxLen bytes of [A-Za-z0-9._-], the character set of Peer.ID, Peer.Node and AnnounceRequest.Epoch that keeps them safe in headers and logs.
+func ValidLabel(s string, maxLen int) bool {
+	if s == "" || len(s) > maxLen {
+		return false
+	}
+	for _, c := range []byte(s) {
+		switch {
+		case c == '-', c == '_', c == '.', c >= '0' && c <= '9', c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
 // PullRequest is the PullPath body.
 type PullRequest struct {
 	// Hash is the xorb to fetch from the gateway, 64 hex digits in either case.
@@ -32,11 +53,13 @@ type Peer struct {
 	ID string `json:"id"`
 	// URL is the peer's origin, scheme://host[:port] as Origin canonicalizes it, where its xorbs are fetched and pulls are posted.
 	URL string `json:"url"`
+	// Node names where the peer runs, as the gateway's locality resolver names nodes: 1 to 253 of [A-Za-z0-9._-] when set; empty when unknown, and such a peer is local to no client.
+	Node string `json:"node,omitempty"`
 }
 
 // AnnounceRequest is the AnnouncePath body: who announces and what it holds, whole or as a delta against what the gateway last accepted.
 type AnnounceRequest struct {
-	// Peer is the announcer; a delta from an unknown, expired or moved peer is refused with Resync.
+	// Peer is the announcer; a delta from an unknown or expired peer, or one whose URL or Node changed, is refused with Resync.
 	Peer Peer `json:"peer"`
 	// Epoch is drawn at random once per peer start, 1 to 128 of [A-Za-z0-9._-]; a delta under another epoch than the registered one is refused with Resync.
 	Epoch string `json:"epoch"`
@@ -62,6 +85,8 @@ type PeerStatus struct {
 	ID string `json:"id"`
 	// URL is the peer's canonical origin.
 	URL string `json:"url"`
+	// Node is the peer's Peer.Node, omitted when empty.
+	Node string `json:"node,omitempty"`
 	// Epoch is the epoch of the peer's last accepted announce.
 	Epoch string `json:"epoch"`
 	// Expiry is when the peer is dropped unless it announces again: its last accepted announce plus TTL.

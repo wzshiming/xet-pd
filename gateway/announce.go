@@ -35,8 +35,11 @@ func (g *Gateway) serveAnnounce(w http.ResponseWriter, r *http.Request) {
 
 // canonicalAnnounce rewrites req to the form the registry keys: origin-only URL, lowercase hashes.
 func canonicalAnnounce(req *apis.AnnounceRequest) error {
-	if !validID(req.Peer.ID) || !validID(req.Epoch) {
+	if !apis.ValidLabel(req.Peer.ID, apis.MaxIDLen) || !apis.ValidLabel(req.Epoch, apis.MaxIDLen) {
 		return errors.New("invalid peer id or epoch")
+	}
+	if req.Peer.Node != "" && !apis.ValidLabel(req.Peer.Node, apis.MaxNodeLen) {
+		return errors.New("invalid peer node")
 	}
 	u, err := apis.Origin(req.Peer.URL)
 	if err != nil {
@@ -53,19 +56,4 @@ func canonicalAnnounce(req *apis.AnnounceRequest) error {
 		}
 	}
 	return nil
-}
-
-// validID is the apis.Peer ID and Epoch rule; it keeps them safe in headers and logs.
-func validID(s string) bool {
-	if s == "" || len(s) > 128 {
-		return false
-	}
-	for _, c := range []byte(s) {
-		switch {
-		case c == '-', c == '_', c == '.', c >= '0' && c <= '9', c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z':
-		default:
-			return false
-		}
-	}
-	return true
 }

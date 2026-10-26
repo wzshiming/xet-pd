@@ -79,10 +79,11 @@ func (s *store) lockWriter(hash xet.XorbHash) func() {
 }
 
 func (s *store) GetXorbURL(ctx context.Context, hash xet.XorbHash) (string, error) {
-	if p, ok := s.reg.pick(hash.String()); ok {
-		return apis.XorbURL(p.URL, hash.String()), nil
+	p, out := s.reg.pick(hash.String(), clientNode(ctx))
+	if out == pickNone {
+		return s.Storage.GetXorbURL(ctx, hash)
 	}
-	return s.Storage.GetXorbURL(ctx, hash)
+	return apis.XorbURL(p.URL, hash.String()), nil
 }
 
 // HasXorb reports a local copy or a live holder; local errors are never masked by holders.

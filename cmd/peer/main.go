@@ -38,6 +38,7 @@ func parse(args []string, getenv func(string) string, help io.Writer) (cli.Setti
 	fs.StringVar(&s.Listen, "listen", ":8081", "listen address", "XET_PD_LISTEN")
 	fs.LogFormatVar(&s.LogFormat)
 	fs.StringVar(&cfg.Advertise, "advertise", "", "public origin of this peer, scheme://host[:port] (required)", "XET_PD_ADVERTISE")
+	fs.StringVar(&cfg.Node, "node", "", "node this peer runs on, as the gateway's locality resolver names it; empty announces none", "XET_PD_NODE")
 	fs.StringVar(&cfg.Gateway, "gateway", "", "gateway origin, scheme://host[:port] (required)", "XET_PD_GATEWAY")
 	fs.StringVar(&cfg.DataDir, "data-dir", "./xet-pd-peer", "data directory", "XET_PD_DATA_DIR")
 	fs.SizeVar(&cfg.XorbCacheSize, "xorb-cache-size", 8<<30, "bytes of local xorbs kept, 0 unlimited", "XET_PD_XORB_CACHE_SIZE")

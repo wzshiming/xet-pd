@@ -3,9 +3,11 @@ package gateway
 
 import (
 	"cmp"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"path/filepath"
 	"regexp"
@@ -35,6 +37,13 @@ type Config struct {
 	Replicas      int           // seeds asked to hold each xorb, default 2
 	MinSeeds      int           // live holders before the local copy may go, default 1
 	XorbCacheSize int64         // bytes of local xorbs kept, 0 unlimited
+	Locality      NodeResolver  // resolves client addresses to nodes so each client is sent to the peer on its node; nil picks by holdings alone
+}
+
+// NodeResolver names the node a client runs on from the host of its remote address; Synced tells whether it has seen the whole cluster once.
+type NodeResolver interface {
+	NodeOf(ip string) (node string, ok bool)
+	Synced() bool
 }
 
 // Values the zero Config fields take; cmd/gateway shares them as flag defaults.
@@ -84,6 +93,7 @@ type Gateway struct {
 	st        *store
 	staging   *staging
 	secret    string
+	locality  NodeResolver
 	transport *http.Transport // upstream xet downloads
 
 	peerGets, directGets atomic.Uint64
@@ -109,7 +119,7 @@ func New(cfg Config) (*Gateway, error) {
 	if err != nil {
 		return nil, err
 	}
-	g := &Gateway{mux: http.NewServeMux(), cas: cas, reg: reg, st: st, staging: staging, secret: cfg.Secret, transport: transport}
+	g := &Gateway{mux: http.NewServeMux(), cas: cas, reg: reg, st: st, staging: staging, secret: cfg.Secret, locality: cfg.Locality, transport: transport}
 	g.mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
 	g.mux.HandleFunc(apis.AnnouncePath, route(http.MethodPost, g.serveAnnounce))
 	g.mux.HandleFunc(apis.PeersPath, route(http.MethodGet, g.servePeers))
@@ -184,7 +194,7 @@ var pathsInfoRe = regexp.MustCompile(`^/api/(models|datasets|spaces)/.+/paths-in
 // telemetryPath takes xet-core >= 1.7.0's per-transfer summary; the CAS handler validates and discards it.
 const telemetryPath = "/v1/telemetry"
 
-// servePublic keeps the CAS and hub surface read-only (GET/HEAD plus two POSTs that write nothing: paths-info reads the hub, telemetry is discarded) and tallies xorb GETs; peer pulls carry apis.PeerHeader.
+// servePublic keeps the CAS and hub surface read-only (GET/HEAD plus two POSTs that write nothing: paths-info reads the hub, telemetry is discarded) and tallies xorb GETs; peer pulls carry apis.PeerHeader; a client request is tagged with the node its address resolves to.
 func (g *Gateway) servePublic(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case r.Method == http.MethodGet, r.Method == http.MethodHead:
@@ -201,7 +211,25 @@ func (g *Gateway) servePublic(w http.ResponseWriter, r *http.Request) {
 			g.directGets.Add(1)
 		}
 	}
+	if g.locality != nil && r.Header.Get(apis.PeerHeader) == "" {
+		if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+			if node, ok := g.locality.NodeOf(host); ok {
+				r = r.WithContext(withClientNode(r.Context(), node))
+			}
+		}
+	}
 	g.cas.ServeHTTP(w, r)
+}
+
+type clientNodeKey struct{}
+
+func withClientNode(ctx context.Context, node string) context.Context {
+	return context.WithValue(ctx, clientNodeKey{}, node)
+}
+
+func clientNode(ctx context.Context) string {
+	node, _ := ctx.Value(clientNodeKey{}).(string)
+	return node
 }
 
 func (g *Gateway) servePeers(w http.ResponseWriter, _ *http.Request) {

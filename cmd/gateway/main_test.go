@@ -6,21 +6,27 @@ import (
 	"errors"
 	"flag"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"k8s.io/client-go/rest"
+
 	"github.com/wzshiming/xet-pd/gateway"
 	"github.com/wzshiming/xet-pd/internal/cli"
 	"github.com/wzshiming/xet-pd/internal/cli/clitest"
+	"github.com/wzshiming/xet-pd/internal/clustertest"
+	"github.com/wzshiming/xet-pd/internal/podnode"
 )
 
 func TestParseGatewayDefaults(t *testing.T) {
 	settings, cfg, err := parse(nil, clitest.Getenv(), io.Discard)
 	wantSettings := cli.Settings{Listen: ":8080", LogFormat: cli.LogText}
-	want := gateway.Config{DataDir: "./xet-pd-gateway", Upstream: "https://huggingface.co", PeerTTL: 30 * time.Second, Replicas: 2, MinSeeds: 1, XorbCacheSize: 8 << 30}
+	want := config{Config: gateway.Config{DataDir: "./xet-pd-gateway", Upstream: "https://huggingface.co", PeerTTL: 30 * time.Second, Replicas: 2, MinSeeds: 1, XorbCacheSize: 8 << 30}, locality: localityNone}
 	if err != nil || settings != wantSettings || cfg != want {
 		t.Fatalf("parse() = %+v, %+v, %v; want %+v, %+v", settings, cfg, err, wantSettings, want)
 	}
@@ -31,10 +37,10 @@ func TestParseGatewayEnv(t *testing.T) {
 		"XET_PD_LISTEN", ":9000", "XET_PD_DATA_DIR", "/data", "HF_ENDPOINT", "http://hub:8000",
 		"HF_TOKEN", "tok", "XET_PD_SIGNING_KEY", "sign", "XET_PD_EXTERNAL_URL", "http://gw",
 		"XET_PD_SECRET", "sec", "XET_PD_PEER_TTL", "45s", "XET_PD_REPLICAS", "3", "XET_PD_MIN_SEEDS", "2",
-		"XET_PD_XORB_CACHE_SIZE", "64MiB", "XET_PD_LOG_FORMAT", "json")
+		"XET_PD_XORB_CACHE_SIZE", "64MiB", "XET_PD_LOG_FORMAT", "json", "XET_PD_LOCALITY", "k8s")
 	settings, cfg, err := parse(nil, getenv, io.Discard)
 	wantSettings := cli.Settings{Listen: ":9000", LogFormat: cli.LogJSON}
-	want := gateway.Config{DataDir: "/data", Upstream: "http://hub:8000", UpstreamToken: "tok", SigningKey: "sign", ExternalURL: "http://gw", Secret: "sec", PeerTTL: 45 * time.Second, Replicas: 3, MinSeeds: 2, XorbCacheSize: 64 << 20}
+	want := config{Config: gateway.Config{DataDir: "/data", Upstream: "http://hub:8000", UpstreamToken: "tok", SigningKey: "sign", ExternalURL: "http://gw", Secret: "sec", PeerTTL: 45 * time.Second, Replicas: 3, MinSeeds: 2, XorbCacheSize: 64 << 20}, locality: localityK8s}
 	if err != nil || settings != wantSettings || cfg != want {
 		t.Fatalf("parse() = %+v, %+v, %v; want %+v, %+v", settings, cfg, err, wantSettings, want)
 	}
@@ -46,13 +52,13 @@ func TestParseGatewayFlagsOverrideEnv(t *testing.T) {
 		"XET_PD_LISTEN", ":9000", "XET_PD_DATA_DIR", "/data", "HF_ENDPOINT", "http://hub:8000",
 		"HF_TOKEN", "tok", "XET_PD_SIGNING_KEY", "sign", "XET_PD_EXTERNAL_URL", "http://gw",
 		"XET_PD_SECRET", "sec", "XET_PD_PEER_TTL", "bogus", "XET_PD_REPLICAS", "x", "XET_PD_MIN_SEEDS", "1.5",
-		"XET_PD_XORB_CACHE_SIZE", "-1", "XET_PD_LOG_FORMAT", "bogus")
+		"XET_PD_XORB_CACHE_SIZE", "-1", "XET_PD_LOG_FORMAT", "bogus", "XET_PD_LOCALITY", "bogus")
 	args := []string{"-listen", ":7000", "-data-dir", "/flag", "-upstream", "http://flag", "-upstream-token", "ftok",
 		"-signing-key", "fsign", "-external-url", "http://fgw", "-secret", "fsec", "-peer-ttl", "5s", "-replicas", "4",
-		"-min-seeds", "3", "-xorb-cache-size", "1GiB", "-log-format", "json"}
+		"-min-seeds", "3", "-xorb-cache-size", "1GiB", "-log-format", "json", "-locality", "k8s"}
 	settings, cfg, err := parse(args, getenv, io.Discard)
 	wantSettings := cli.Settings{Listen: ":7000", LogFormat: cli.LogJSON}
-	want := gateway.Config{DataDir: "/flag", Upstream: "http://flag", UpstreamToken: "ftok", SigningKey: "fsign", ExternalURL: "http://fgw", Secret: "fsec", PeerTTL: 5 * time.Second, Replicas: 4, MinSeeds: 3, XorbCacheSize: 1 << 30}
+	want := config{Config: gateway.Config{DataDir: "/flag", Upstream: "http://flag", UpstreamToken: "ftok", SigningKey: "fsign", ExternalURL: "http://fgw", Secret: "fsec", PeerTTL: 5 * time.Second, Replicas: 4, MinSeeds: 3, XorbCacheSize: 1 << 30}, locality: localityK8s}
 	if err != nil || settings != wantSettings || cfg != want {
 		t.Fatalf("parse() = %+v, %+v, %v; want %+v, %+v", settings, cfg, err, wantSettings, want)
 	}
@@ -95,6 +101,8 @@ func TestParseGatewayErrors(t *testing.T) {
 		{"bad env int", nil, clitest.Getenv("XET_PD_REPLICAS", "x"), `XET_PD_REPLICAS="x": parse error`},
 		{"bad env size", nil, clitest.Getenv("XET_PD_XORB_CACHE_SIZE", "-1"), `XET_PD_XORB_CACHE_SIZE="-1": expected bytes`},
 		{"bad env log format", nil, clitest.Getenv("XET_PD_LOG_FORMAT", "yaml"), `XET_PD_LOG_FORMAT="yaml": expected text or json`},
+		{"bad locality flag", []string{"-locality", "x"}, clitest.Getenv(), `invalid value "x" for flag -locality: expected none or k8s`},
+		{"bad env locality", nil, clitest.Getenv("XET_PD_LOCALITY", "x"), `XET_PD_LOCALITY="x": expected none or k8s`},
 		{"empty env upstream is still the default", []string{"-upstream", ""}, clitest.Getenv("HF_ENDPOINT", "http://hub"), "upstream is required"},
 	}
 	for _, tt := range tests {
@@ -117,7 +125,7 @@ func TestParseGatewayHelp(t *testing.T) {
 	if !errors.Is(err, flag.ErrHelp) {
 		t.Fatalf("err = %v, want flag.ErrHelp", err)
 	}
-	for _, want := range []string{"Usage: gateway [flags]", "-data-dir", "[env XET_PD_DATA_DIR]", "-xorb-cache-size", "(default 8GiB)", "[env XET_PD_XORB_CACHE_SIZE]", "[env HF_TOKEN]", "[env XET_PD_SECRET_FILE]", "(default \":8080\")", "-log-format", "[env XET_PD_LOG_FORMAT]", "(default text)"} {
+	for _, want := range []string{"Usage: gateway [flags]", "-data-dir", "[env XET_PD_DATA_DIR]", "-xorb-cache-size", "(default 8GiB)", "[env XET_PD_XORB_CACHE_SIZE]", "[env HF_TOKEN]", "[env XET_PD_SECRET_FILE]", "(default \":8080\")", "-log-format", "[env XET_PD_LOG_FORMAT]", "(default text)", "-locality", "[env XET_PD_LOCALITY]", "(default none)"} {
 		if !strings.Contains(help.String(), want) {
 			t.Errorf("help lacks %q:\n%s", want, help.String())
 		}
@@ -146,6 +154,7 @@ func TestRunUsage(t *testing.T) {
 		{name: "unknown flag", args: []string{"-bogus"}, code: 2, stderr: "gateway: flag provided but not defined: -bogus\nRun \"gateway -h\" for flags.\n"},
 		{name: "positional", args: []string{"extra"}, code: 2, stderr: `unexpected argument "extra"`},
 		{name: "bad log format", args: []string{"-log-format", "yaml"}, code: 2, stderr: "gateway: invalid value \"yaml\" for flag -log-format: expected text or json\nRun \"gateway -h\" for flags.\n"},
+		{name: "bad locality", args: []string{"-locality", "x"}, code: 2, stderr: "gateway: invalid value \"x\" for flag -locality: expected none or k8s\nRun \"gateway -h\" for flags.\n"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -175,6 +184,22 @@ func TestRunInitFailure(t *testing.T) {
 	}
 }
 
+func TestRunLocalityK8sOutsideCluster(t *testing.T) {
+	t.Setenv("KUBERNETES_SERVICE_HOST", "")
+	// Cancelled, so a gateway that wrongly starts returns at once instead of serving.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	var stdout, stderr bytes.Buffer
+	args := []string{"-listen", "127.0.0.1:0", "-data-dir", t.TempDir(), "-upstream", "http://127.0.0.1:1", "-locality", "k8s"}
+	if code := command.Run(ctx, args, clitest.Getenv(), &stdout, &stderr); code != 1 {
+		t.Fatalf("Run = %d, want 1; stderr %q", code, stderr.String())
+	}
+	want := "gateway: locality k8s: " + rest.ErrNotInCluster.Error() + "\n"
+	if stdout.Len() != 0 || stderr.String() != want {
+		t.Fatalf("stdout %q, stderr %q; want empty, %q", stdout.String(), stderr.String(), want)
+	}
+}
+
 func TestRunGatewayCancelledBeforeServing(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -185,5 +210,36 @@ func TestRunGatewayCancelledBeforeServing(t *testing.T) {
 	}
 	if !strings.HasPrefix(stdout.String(), "gateway listening on 127.0.0.1:") || stderr.Len() != 0 {
 		t.Fatalf("stdout %q, stderr %q", stdout.String(), stderr.String())
+	}
+}
+
+func TestServiceCloseStopsLocalityIndex(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/v1/pods", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Query().Get("watch") == "true" {
+			w.WriteHeader(http.StatusOK)
+			w.(http.Flusher).Flush()
+			<-r.Context().Done()
+			return
+		}
+		_, _ = io.WriteString(w, `{"kind":"PodList","apiVersion":"v1","metadata":{"resourceVersion":"1"},"items":[]}`)
+	})
+	api := httptest.NewServer(mux)
+	t.Cleanup(api.Close)
+	idx, err := podnode.New(t.Context(), &rest.Config{Host: api.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	clustertest.WaitFor(t, clustertest.WaitTimeout, "the pod index to sync", idx.Synced)
+	g, err := gateway.New(gateway.Config{DataDir: t.TempDir(), Upstream: "http://127.0.0.1:1", Locality: idx})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := (service{Gateway: g, locality: idx}).Close(); err != nil {
+		t.Fatal(err)
+	}
+	if idx.Synced() {
+		t.Fatal("pod index still synced after service.Close")
 	}
 }

@@ -3,6 +3,7 @@ package apis
 import (
 	"encoding/json"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
@@ -26,6 +27,9 @@ func TestWireConstants(t *testing.T) {
 	}
 	if MaxXorbBytes != 128<<20 {
 		t.Fatalf("MaxXorbBytes = %d", MaxXorbBytes)
+	}
+	if MaxIDLen != 128 || MaxNodeLen != 253 {
+		t.Fatalf("MaxIDLen, MaxNodeLen = %d, %d", MaxIDLen, MaxNodeLen)
 	}
 }
 
@@ -85,6 +89,59 @@ func TestAnnounceRequestOmitsEmptyDelta(t *testing.T) {
 	}
 	if string(got) != want {
 		t.Fatalf("encoded\n got %s\nwant %s", got, want)
+	}
+}
+
+func TestPeerNodeWire(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		in   Peer
+		want string
+	}{
+		{Peer{ID: "peer-1", URL: "http://peer-1:8080", Node: "node-1"}, `{"id":"peer-1","url":"http://peer-1:8080","node":"node-1"}`},
+		// What a peer that predates Node sends.
+		{Peer{ID: "peer-1", URL: "http://peer-1:8080"}, `{"id":"peer-1","url":"http://peer-1:8080"}`},
+	}
+	for _, c := range cases {
+		got, err := json.Marshal(c.in)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(got) != c.want {
+			t.Fatalf("encoded\n got %s\nwant %s", got, c.want)
+		}
+		var out Peer
+		if err := json.Unmarshal([]byte(c.want), &out); err != nil {
+			t.Fatal(err)
+		}
+		if out != c.in {
+			t.Fatalf("decoded %s\n got %+v\nwant %+v", c.want, out, c.in)
+		}
+	}
+}
+
+func TestValidLabel(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		s      string
+		maxLen int
+		want   bool
+	}{
+		{"", MaxIDLen, false},
+		{"a", MaxIDLen, true},
+		{strings.Repeat("a", MaxIDLen), MaxIDLen, true},
+		{strings.Repeat("a", MaxIDLen+1), MaxIDLen, false},
+		{strings.Repeat("n", MaxNodeLen), MaxNodeLen, true},
+		{strings.Repeat("n", MaxNodeLen+1), MaxNodeLen, false},
+		{"a b", MaxIDLen, false},
+		{"a/b", MaxIDLen, false},
+		{"A-Z_0.9", MaxIDLen, true},
+		{"é", MaxIDLen, false},
+	}
+	for _, c := range cases {
+		if got := ValidLabel(c.s, c.maxLen); got != c.want {
+			t.Errorf("ValidLabel(%q, %d) = %v, want %v", c.s, c.maxLen, got, c.want)
+		}
 	}
 }
 

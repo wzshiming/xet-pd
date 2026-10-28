@@ -1,6 +1,7 @@
 package peer
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"io"
@@ -19,11 +20,44 @@ func (p *Peer) routes() *http.ServeMux {
 	mux.HandleFunc("GET /v1/xorbs/{prefix}/{hash}", p.serveXorb)
 	mux.HandleFunc("POST "+apis.PullPath, p.servePull)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
+	mux.HandleFunc("GET /readyz", p.serveReadyz)
+	mux.Handle("GET /metrics", p.metrics.handler())
 	return mux
 }
 
 func (p *Peer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	p.mux.ServeHTTP(w, r)
+}
+
+func (p *Peer) serveReadyz(w http.ResponseWriter, _ *http.Request) {
+	if !p.ann.ready.Load() {
+		http.Error(w, "not announced yet", http.StatusServiceUnavailable)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+}
+
+// statusWriter records the first status code written through it.
+type statusWriter struct {
+	http.ResponseWriter
+	code int
+}
+
+func (w *statusWriter) WriteHeader(code int) {
+	if w.code == 0 {
+		w.code = code
+	}
+	w.ResponseWriter.WriteHeader(code)
+}
+
+// ReadFrom hands the copy to the wrapped *http.response: that keeps sendfile for stored xorbs and makes net/http flush the
+// response header after the first 512 bytes instead of buffering 2 KiB, which a client of a pull still in flight waits for.
+func (w *statusWriter) ReadFrom(r io.Reader) (int64, error) {
+	return io.Copy(w.ResponseWriter, r)
+}
+
+func (w *statusWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
 }
 
 func serveContent(w http.ResponseWriter, r *http.Request, hash xet.XorbHash, content io.ReadSeeker) {
@@ -49,6 +83,17 @@ func (p *Peer) serveStored(w http.ResponseWriter, r *http.Request, rd *lru.Entry
 
 // serveXorb serves a committed xorb or streams it from a pull; requests carrying apis.PeerHeader are relays and never pull.
 func (p *Peer) serveXorb(w http.ResponseWriter, r *http.Request) {
+	requester := "client"
+	if r.Header.Get(apis.PeerHeader) != "" {
+		requester = "gateway"
+	}
+	sw := &statusWriter{ResponseWriter: w}
+	// The GET pattern routes HEAD here too; only GETs count.
+	if r.Method == http.MethodGet {
+		// A handler that never sets a code answers net/http's implicit 200.
+		defer func() { p.metrics.get(requester, cmp.Or(sw.code, http.StatusOK)) }()
+	}
+	w = sw
 	hash, err := xet.ParseXorbHash(r.PathValue("hash"))
 	if err != nil {
 		http.Error(w, "invalid xorb path", http.StatusBadRequest)

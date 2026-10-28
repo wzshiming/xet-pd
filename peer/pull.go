@@ -195,6 +195,18 @@ func (f *pull) finish(err error) {
 		_ = f.stream.Writer().CloseWithError(err)
 	}
 	f.err = err
+	switch {
+	case err == nil:
+		p.metrics.pull("ok")
+	case errors.Is(err, errNotFound):
+		p.metrics.pull("not_found")
+	case errors.Is(err, context.Canceled):
+		p.metrics.pull("canceled")
+	case errors.Is(err, context.DeadlineExceeded):
+		p.metrics.pull("timeout")
+	default:
+		p.metrics.pull("error")
+	}
 	p.mu.Lock()
 	if p.pulls[f.hash] == f { // release may have dropped it and a newer pull taken the key
 		delete(p.pulls, f.hash)

@@ -1,0 +1,23 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: xet-pd
+resources:
+  - ../../base
+# Loaded into the nodes with kind load docker-image, never pulled.
+images:
+  - name: ghcr.io/wzshiming/xet-pd-gateway
+    newName: xet-pd-gateway
+    newTag: kind
+  - name: ghcr.io/wzshiming/xet-pd-peer
+    newName: xet-pd-peer
+    newTag: kind
+secretGenerator:
+  - name: xet-pd-secret
+    literals:
+      - XET_PD_SECRET=xet-pd-kind-test
+    options:
+      disableNameSuffixHash: true
+patches:
+  - path: gateway-patch.yaml
+  - path: peer-patch.yaml
+  - path: pvc-patch.yaml

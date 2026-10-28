@@ -1,0 +1,20 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: xet-pd-gateway
+  namespace: xet-pd
+spec:
+  template:
+    spec:
+      containers:
+        - name: gateway
+          imagePullPolicy: Never
+          env:
+            - name: XET_PD_PEER_TTL
+              value: 10s
+            - name: XET_PD_XORB_CACHE_SIZE
+              value: 64MiB
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi

@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: xet-pd-gateway
+  namespace: xet-pd
+  labels:
+    app.kubernetes.io/name: xet-pd-gateway
+    app.kubernetes.io/component: gateway
+    app.kubernetes.io/part-of: xet-pd
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: xet-pd-gateway
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http

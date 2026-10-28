@@ -3,9 +3,12 @@ package cli
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"io"
+	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -74,12 +77,32 @@ func TestSizeValueString(t *testing.T) {
 	}
 }
 
+func TestLogFormatSet(t *testing.T) {
+	t.Parallel()
+	for _, tt := range []struct {
+		in   string
+		want LogFormat
+	}{{"text", LogText}, {"json", LogJSON}} {
+		var f LogFormat
+		if err := f.Set(tt.in); err != nil || f != tt.want || f.String() != tt.in {
+			t.Errorf("Set(%q) = %v, leaving %q with String() %q; want nil, %q, %q", tt.in, err, string(f), f.String(), string(tt.want), tt.in)
+		}
+	}
+	for _, in := range []string{"JSON", "", "yaml"} {
+		var f LogFormat
+		if err := f.Set(in); err == nil || err.Error() != "expected text or json" {
+			t.Errorf("Set(%q) = %v, want error %q", in, err, "expected text or json")
+		}
+	}
+}
+
 // testFlags holds one flag of each kind; name falls back to two environment keys.
 type testFlags struct {
 	name    string
 	count   int
 	timeout time.Duration
 	size    int64
+	format  LogFormat
 }
 
 func parseTestFlags(args []string, getenv func(string) string, help io.Writer) (testFlags, error) {
@@ -89,6 +112,7 @@ func parseTestFlags(args []string, getenv func(string) string, help io.Writer) (
 	fs.IntVar(&f.count, "count", 1, "how many", "TEST_COUNT")
 	fs.DurationVar(&f.timeout, "timeout", time.Second, "how long", "TEST_TIMEOUT")
 	fs.SizeVar(&f.size, "size", 1<<20, "how big", "TEST_SIZE")
+	fs.LogFormatVar(&f.format)
 	err := fs.Parse(args, getenv, help)
 	return f, err
 }
@@ -101,13 +125,13 @@ func TestFlagSetSources(t *testing.T) {
 		env  func(string) string
 		want testFlags
 	}{
-		{"defaults", nil, clitest.Getenv(), testFlags{"anon", 1, time.Second, 1 << 20}},
-		{"environment", nil, clitest.Getenv("TEST_NAME", "env", "TEST_COUNT", "2", "TEST_TIMEOUT", "2s", "TEST_SIZE", "2MiB"), testFlags{"env", 2, 2 * time.Second, 2 << 20}},
-		{"later key fills in", nil, clitest.Getenv("TEST_ALIAS", "alias"), testFlags{"alias", 1, time.Second, 1 << 20}},
-		{"earlier key wins", nil, clitest.Getenv("TEST_NAME", "env", "TEST_ALIAS", "alias"), testFlags{"env", 1, time.Second, 1 << 20}},
+		{"defaults", nil, clitest.Getenv(), testFlags{"anon", 1, time.Second, 1 << 20, LogText}},
+		{"environment", nil, clitest.Getenv("TEST_NAME", "env", "TEST_COUNT", "2", "TEST_TIMEOUT", "2s", "TEST_SIZE", "2MiB", "XET_PD_LOG_FORMAT", "json"), testFlags{"env", 2, 2 * time.Second, 2 << 20, LogJSON}},
+		{"later key fills in", nil, clitest.Getenv("TEST_ALIAS", "alias"), testFlags{"alias", 1, time.Second, 1 << 20, LogText}},
+		{"earlier key wins", nil, clitest.Getenv("TEST_NAME", "env", "TEST_ALIAS", "alias"), testFlags{"env", 1, time.Second, 1 << 20, LogText}},
 		// An unparsable environment value is ignored once its flag is given.
-		{"flags win", []string{"-name", "flag", "-count", "3", "-timeout", "3s", "-size", "3KiB"}, clitest.Getenv("TEST_NAME", "env", "TEST_COUNT", "x", "TEST_TIMEOUT", "y", "TEST_SIZE", "z"), testFlags{"flag", 3, 3 * time.Second, 3 << 10}},
-		{"empty flag wins", []string{"-name", ""}, clitest.Getenv("TEST_NAME", "env"), testFlags{"", 1, time.Second, 1 << 20}},
+		{"flags win", []string{"-name", "flag", "-count", "3", "-timeout", "3s", "-size", "3KiB", "-log-format", "json"}, clitest.Getenv("TEST_NAME", "env", "TEST_COUNT", "x", "TEST_TIMEOUT", "y", "TEST_SIZE", "z", "XET_PD_LOG_FORMAT", "bogus"), testFlags{"flag", 3, 3 * time.Second, 3 << 10, LogJSON}},
+		{"empty flag wins", []string{"-name", ""}, clitest.Getenv("TEST_NAME", "env"), testFlags{"", 1, time.Second, 1 << 20, LogText}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -133,6 +157,9 @@ func TestFlagSetErrors(t *testing.T) {
 		{"bad env int", nil, clitest.Getenv("TEST_COUNT", "x"), `TEST_COUNT="x": parse error`},
 		{"bad env duration", nil, clitest.Getenv("TEST_TIMEOUT", "soon"), `TEST_TIMEOUT="soon": parse error`},
 		{"bad env size", nil, clitest.Getenv("TEST_SIZE", "-1"), `TEST_SIZE="-1": expected bytes`},
+		{"bad log format flag", []string{"-log-format", "yaml"}, clitest.Getenv(), `invalid value "yaml" for flag -log-format: expected text or json`},
+		{"empty log format flag", []string{"-log-format", ""}, clitest.Getenv(), `invalid value "" for flag -log-format: expected text or json`},
+		{"bad env log format", nil, clitest.Getenv("XET_PD_LOG_FORMAT", "yaml"), `XET_PD_LOG_FORMAT="yaml": expected text or json`},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -160,10 +187,41 @@ func TestFlagSetHelp(t *testing.T) {
 	if !strings.HasPrefix(help.String(), head) {
 		t.Errorf("help does not start with %q:\n%s", head, help.String())
 	}
-	for _, want := range []string{"who [env TEST_NAME, TEST_ALIAS]", "how big [env TEST_SIZE] (default 1MiB)"} {
+	for _, want := range []string{"who [env TEST_NAME, TEST_ALIAS]", "how big [env TEST_SIZE] (default 1MiB)", "log format, text or json [env XET_PD_LOG_FORMAT] (default text)"} {
 		if !strings.Contains(help.String(), want) {
 			t.Errorf("help lacks %q:\n%s", want, help.String())
 		}
+	}
+}
+
+// choice is a flag.Value that takes only "a" or "b".
+type choice string
+
+func (c *choice) Set(s string) error {
+	if s != "a" && s != "b" {
+		return errors.New("expected a or b")
+	}
+	*c = choice(s)
+	return nil
+}
+
+func (c *choice) String() string { return string(*c) }
+
+func TestFlagSetVarFallsBackToEnvironment(t *testing.T) {
+	t.Parallel()
+	parse := func(getenv func(string) string) (choice, error) {
+		c := choice("a")
+		fs := NewFlagSet("test")
+		fs.Var(&c, "choice", "which one", "TEST_CHOICE")
+		err := fs.Parse(nil, getenv, io.Discard)
+		return c, err
+	}
+	if c, err := parse(clitest.Getenv("TEST_CHOICE", "b")); err != nil || c != "b" {
+		t.Fatalf("Parse with TEST_CHOICE=b = %q, %v; want b", c, err)
+	}
+	const want = `TEST_CHOICE="c": expected a or b`
+	if _, err := parse(clitest.Getenv("TEST_CHOICE", "c")); err == nil || err.Error() != want {
+		t.Fatalf("Parse with TEST_CHOICE=c = %v; want %q", err, want)
 	}
 }
 
@@ -256,11 +314,11 @@ func (s *fakeService) Close() error {
 func fakeCommand(listen string, parseErr error, svc *fakeService, newErr error) Command[struct{}] {
 	return Command[struct{}]{
 		Name: "fake",
-		Parse: func(_ []string, _ func(string) string, help io.Writer) (string, struct{}, error) {
+		Parse: func(_ []string, _ func(string) string, help io.Writer) (Settings, struct{}, error) {
 			if errors.Is(parseErr, flag.ErrHelp) {
 				_, _ = io.WriteString(help, "Usage: fake [flags]\n")
 			}
-			return listen, struct{}{}, parseErr
+			return Settings{Listen: listen}, struct{}{}, parseErr
 		},
 		New: func(struct{}) (Service, error) {
 			if newErr != nil {
@@ -357,6 +415,65 @@ func TestRunCancelledBeforeServing(t *testing.T) {
 	}
 	if !strings.HasPrefix(stdout.String(), "fake listening on 127.0.0.1:") || stderr.Len() != 0 || svc.closes.Load() != 1 {
 		t.Fatalf("stdout %q, stderr %q, %d closes", stdout.String(), stderr.String(), svc.closes.Load())
+	}
+}
+
+func TestRunInstallsJSONLogger(t *testing.T) {
+	// Not parallel: Run replaces the process-wide slog default, which also redirects the log package.
+	defer log.SetOutput(log.Writer())
+	defer log.SetFlags(log.Flags())
+	defer slog.SetDefault(slog.Default())
+	c := Command[struct{}]{
+		Name: "fake",
+		Parse: func([]string, func(string) string, io.Writer) (Settings, struct{}, error) {
+			return Settings{Listen: "127.0.0.1:0", LogFormat: LogJSON}, struct{}{}, nil
+		},
+		New: func(struct{}) (Service, error) {
+			slog.Warn("fake: init", "k", "v")
+			return nil, errors.New("boom")
+		},
+	}
+	var stdout, stderr bytes.Buffer
+	if code := c.Run(context.Background(), nil, clitest.Getenv(), &stdout, &stderr); code != 1 {
+		t.Fatalf("Run = %d, want 1; stderr %q", code, stderr.String())
+	}
+	line, rest, _ := strings.Cut(stderr.String(), "\n")
+	var record map[string]any
+	if err := json.Unmarshal([]byte(line), &record); err != nil {
+		t.Fatalf("first stderr line %q is not a JSON record: %v", line, err)
+	}
+	stamp, _ := record["time"].(string)
+	if _, err := time.Parse(time.RFC3339Nano, stamp); err != nil || record["level"] != "WARN" || record["msg"] != "fake: init" || record["k"] != "v" {
+		t.Fatalf("record %v; want an RFC 3339 time, level WARN, msg %q and k v", record, "fake: init")
+	}
+	if rest != "fake: boom\n" {
+		t.Fatalf("stderr after the record = %q, want %q", rest, "fake: boom\n")
+	}
+}
+
+func TestRunKeepsDefaultLoggerForText(t *testing.T) {
+	// Not parallel: it compares the process-wide slog default across Run.
+	for _, tt := range []struct {
+		name   string
+		format LogFormat
+	}{{"text", LogText}, {"zero value", ""}} {
+		t.Run(tt.name, func(t *testing.T) {
+			before := slog.Default()
+			c := Command[struct{}]{
+				Name: "fake",
+				Parse: func([]string, func(string) string, io.Writer) (Settings, struct{}, error) {
+					return Settings{Listen: "127.0.0.1:0", LogFormat: tt.format}, struct{}{}, nil
+				},
+				New: func(struct{}) (Service, error) { return nil, errors.New("boom") },
+			}
+			var stdout, stderr bytes.Buffer
+			if code := c.Run(context.Background(), nil, clitest.Getenv(), &stdout, &stderr); code != 1 {
+				t.Fatalf("Run = %d, want 1; stderr %q", code, stderr.String())
+			}
+			if slog.Default() != before {
+				t.Fatal("Run replaced the slog default logger")
+			}
+		})
 	}
 }
 

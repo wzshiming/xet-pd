@@ -17,17 +17,25 @@ const maxAnnounceBytes = 32 << 20
 // serveAnnounce registers a peer inventory; the registry changes only once the whole request validated.
 func (g *Gateway) serveAnnounce(w http.ResponseWriter, r *http.Request) {
 	if !apis.Authorize(w, r, g.secret) {
+		g.metrics.announce("rejected")
 		return
 	}
 	var req apis.AnnounceRequest
 	if !apis.ReadJSON(w, r, maxAnnounceBytes, &req) {
+		g.metrics.announce("rejected")
 		return
 	}
 	if err := canonicalAnnounce(&req); err != nil {
+		g.metrics.announce("rejected")
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 	resp := g.reg.announce(req)
+	if resp.Resync {
+		g.metrics.announce("resync")
+	} else {
+		g.metrics.announce("ok")
+	}
 	g.staging.kick()
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(resp)
@@ -35,8 +43,11 @@ func (g *Gateway) serveAnnounce(w http.ResponseWriter, r *http.Request) {
 
 // canonicalAnnounce rewrites req to the form the registry keys: origin-only URL, lowercase hashes.
 func canonicalAnnounce(req *apis.AnnounceRequest) error {
-	if !validID(req.Peer.ID) || !validID(req.Epoch) {
+	if !apis.ValidLabel(req.Peer.ID, apis.MaxIDLen) || !apis.ValidLabel(req.Epoch, apis.MaxIDLen) {
 		return errors.New("invalid peer id or epoch")
+	}
+	if req.Peer.Node != "" && !apis.ValidLabel(req.Peer.Node, apis.MaxNodeLen) {
+		return errors.New("invalid peer node")
 	}
 	u, err := apis.Origin(req.Peer.URL)
 	if err != nil {
@@ -53,19 +64,4 @@ func canonicalAnnounce(req *apis.AnnounceRequest) error {
 		}
 	}
 	return nil
-}
-
-// validID is the apis.Peer ID and Epoch rule; it keeps them safe in headers and logs.
-func validID(s string) bool {
-	if s == "" || len(s) > 128 {
-		return false
-	}
-	for _, c := range []byte(s) {
-		switch {
-		case c == '-', c == '_', c == '.', c >= '0' && c <= '9', c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z':
-		default:
-			return false
-		}
-	}
-	return true
 }

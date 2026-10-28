@@ -30,6 +30,7 @@ func (p *Peer) restore() error {
 			if err := p.store.DeleteXorb(context.Background(), x.Hash); err != nil {
 				return err
 			}
+			p.metrics.restoreDropped.Inc()
 			continue
 		}
 		valid = append(valid, x)

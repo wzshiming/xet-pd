@@ -49,3 +49,32 @@ jobs:
       - uses: golangci/golangci-lint-action@v9
         with:
           version: v2.13.2
+
+  kind:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      # Three kind nodes exhaust the runner's default inotify limits.
+      - run: sudo sysctl -w fs.inotify.max_user_instances=512 fs.inotify.max_user_watches=524288
+      - run: |
+          go install sigs.k8s.io/kind@v0.33.0
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+      - run: go test -count=1 -v -timeout 25m ./e2e/kind
+        env:
+          XET_PD_E2E_KIND: "1"
+          # Kept for the log export below; the runner is discarded anyway.
+          XET_PD_E2E_KIND_KEEP: "1"
+      - if: failure()
+        run: kind export logs --name xet-pd-e2e kind-logs
+        # There is no cluster when the test failed before creating it.
+        continue-on-error: true
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kind-logs
+          path: kind-logs
+          if-no-files-found: ignore

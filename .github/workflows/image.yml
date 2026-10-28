@@ -1,0 +1,60 @@
+name: image
+
+on:
+  push:
+    branches: [master]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+  # The first push creates the package, which may be private; GITHUB_TOKEN cannot change that, so set its visibility to public in the package settings.
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      matrix:
+        component: [gateway, peer]
+    steps:
+      - uses: actions/checkout@v7
+      # Go cross-compiles, but the runtime stage's apk and adduser still run as arm64.
+      - uses: docker/setup-qemu-action@v4
+      - uses: docker/setup-buildx-action@v4
+      - if: github.event_name != 'pull_request'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      # The default flavor latest=auto adds latest only on v* tag pushes that are not pre-releases.
+      - id: meta
+        uses: docker/metadata-action@v6
+        with:
+          # metadata-action lowercases the image name, so an owner with capitals still yields a valid reference.
+          images: ghcr.io/${{ github.repository_owner }}/xet-pd-${{ matrix.component }}
+          tags: |
+            type=ref,event=branch
+            type=sha
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+        env:
+          DOCKER_METADATA_ANNOTATIONS_LEVELS: manifest,index
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          target: ${{ matrix.component }}
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          annotations: ${{ steps.meta.outputs.annotations }}
+          cache-from: type=gha,scope=${{ matrix.component }}
+          cache-to: type=gha,scope=${{ matrix.component }},mode=max

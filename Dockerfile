@@ -1,5 +1,5 @@
 # The builder tag must satisfy the go directive in go.mod; GOTOOLCHAIN=local fails fast instead of downloading one.
-FROM golang:1.27-alpine AS builder
+FROM --platform=$BUILDPLATFORM golang:1.27-alpine AS builder
 WORKDIR /src
 ENV CGO_ENABLED=0 GOFLAGS=-trimpath GOTOOLCHAIN=local
 COPY go.mod go.sum ./
@@ -11,8 +11,9 @@ COPY peer/ peer/
 COPY internal/ internal/
 
 FROM builder AS build
+ARG TARGETOS TARGETARCH
 RUN --mount=type=cache,target=/root/.cache/go-build \
-    go build -ldflags='-s -w' -o /out/ ./cmd/gateway ./cmd/peer
+    GOOS=$TARGETOS GOARCH=$TARGETARCH go build -ldflags='-s -w' -o /out/ ./cmd/gateway ./cmd/peer
 
 FROM alpine:3.22 AS runtime
 RUN apk add --no-cache ca-certificates \

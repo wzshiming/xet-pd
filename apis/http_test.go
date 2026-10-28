@@ -59,6 +59,16 @@ func TestReadJSON(t *testing.T) {
 	}
 }
 
+// Mixed versions rely on it: a gateway accepts announces carrying fields it predates.
+func TestReadJSONIgnoresUnknownFields(t *testing.T) {
+	t.Parallel()
+	w := httptest.NewRecorder()
+	var v struct{ N int }
+	if !ReadJSON(w, httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{"N":1,"node":"n1"}`)), 64, &v) || w.Code != http.StatusOK || v.N != 1 {
+		t.Fatalf("ReadJSON with an unknown field = %d %q, N %d; want accepted with N 1", w.Code, w.Body, v.N)
+	}
+}
+
 func TestAuthorize(t *testing.T) {
 	t.Parallel()
 	tests := []struct {

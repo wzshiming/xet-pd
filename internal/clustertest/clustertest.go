@@ -10,6 +10,8 @@ import (
 	"io"
 	"math/rand/v2"
 	"net/http"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -78,6 +80,48 @@ func Diag(t testing.TB, origin string) apis.PeersResponse {
 		t.Fatalf("GET %s = %d %q", apis.PeersPath, resp.StatusCode, body)
 	}
 	return d
+}
+
+// Scrape returns the samples the Prometheus text exposition at origin+"/metrics" carries, keyed by name{labels} as written.
+func Scrape(t testing.TB, origin string) map[string]float64 {
+	t.Helper()
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, origin+"/metrics", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /metrics = %d %q", resp.StatusCode, body)
+	}
+	return ParseMetrics(t, string(body))
+}
+
+// ParseMetrics returns the samples of a Prometheus text exposition, keyed by name{labels} as written.
+func ParseMetrics(t testing.TB, text string) map[string]float64 {
+	t.Helper()
+	samples := map[string]float64{}
+	for line := range strings.Lines(text) {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		// The value follows the last space; label values may hold spaces themselves.
+		i := strings.LastIndexByte(line, ' ')
+		v, err := strconv.ParseFloat(line[i+1:], 64)
+		if i < 0 || err != nil {
+			t.Fatalf("GET /metrics: unparsable sample %q", line)
+		}
+		samples[line[:i]] = v
+	}
+	return samples
 }
 
 // HasXorb reports whether s stores h and fails the test when the lookup fails.

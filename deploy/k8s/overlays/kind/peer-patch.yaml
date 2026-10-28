@@ -1,0 +1,23 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: xet-pd-peer
+  namespace: xet-pd
+spec:
+  template:
+    spec:
+      initContainers:
+        - name: chown-data
+          imagePullPolicy: Never
+      containers:
+        - name: peer
+          imagePullPolicy: Never
+          env:
+            - name: XET_PD_HEARTBEAT
+              value: 2s
+            - name: XET_PD_XORB_CACHE_SIZE
+              value: 64MiB
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi

@@ -24,6 +24,7 @@ import (
 // Config configures New; zero MaxPulls, PullTimeout and Heartbeat take the defaults below.
 type Config struct {
 	Advertise     string        // public origin of this peer, scheme://host[:port]
+	Node          string        // node this peer runs on, as the gateway's locality resolver names it; empty announces none
 	Gateway       string        // upstream gateway origin
 	DataDir       string        // data directory: xorbs/ committed objects, spool/ in-flight pulls
 	XorbCacheSize int64         // bytes of committed xorbs to keep, 0 unlimited; spools are extra
@@ -40,7 +41,7 @@ const (
 	DefaultHeartbeat   = 10 * time.Second
 )
 
-// normalize canonicalizes both origins, rejects a missing data dir or negative values and fills in the defaults.
+// normalize canonicalizes both origins, rejects an invalid node, a missing data dir or negative values and fills in the defaults.
 func (c *Config) normalize() error {
 	var err error
 	if c.Advertise, err = apis.Origin(c.Advertise); err != nil {
@@ -48,6 +49,9 @@ func (c *Config) normalize() error {
 	}
 	if c.Gateway, err = apis.Origin(c.Gateway); err != nil {
 		return fmt.Errorf("gateway: %w", err)
+	}
+	if c.Node != "" && !apis.ValidLabel(c.Node, apis.MaxNodeLen) {
+		return fmt.Errorf("node %q: expected 1 to %d of [A-Za-z0-9._-]", c.Node, apis.MaxNodeLen)
 	}
 	if c.DataDir == "" {
 		return errors.New("data dir is required")
@@ -71,6 +75,7 @@ type Peer struct {
 	client   *http.Client // data fetches, no secret
 	mux      *http.ServeMux
 	ann      *announcer
+	metrics  *peerMetrics
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -116,7 +121,9 @@ func New(cfg Config) (*Peer, error) {
 		sem:      make(chan struct{}, cfg.MaxPulls),
 		pulls:    map[xet.XorbHash]*pull{},
 		cooldown: map[xet.XorbHash]cooled{},
+		metrics:  newPeerMetrics(),
 	}
+	p.metrics.reg.MustRegister(peerState{p})
 	p.ann = &announcer{p: p, control: apis.NewClient(transport), wake: make(chan struct{}, 1), full: true}
 	p.mux = p.routes()
 	if err := p.restore(); err != nil {
@@ -141,4 +148,23 @@ func (p *Peer) Close() error {
 		p.client.CloseIdleConnections()
 	})
 	return nil
+}
+
+type peerStats struct {
+	bytes                     int64
+	entries, pulls, cooldowns int
+}
+
+// stats leaves out cooldowns past their end that acquire has yet to sweep.
+func (p *Peer) stats() peerStats {
+	now := time.Now()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	s := peerStats{bytes: p.xorbs.Usage(), entries: p.xorbs.Len(), pulls: len(p.pulls)}
+	for _, c := range p.cooldown {
+		if now.Before(c.until) {
+			s.cooldowns++
+		}
+	}
+	return s
 }

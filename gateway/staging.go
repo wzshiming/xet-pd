@@ -28,6 +28,7 @@ type stagingConfig struct {
 	secret    string        // bearer token of control requests; never sent on data requests
 	retry     time.Duration // pause per (xorb, seed) after a pull request, default 1m
 	tick      time.Duration // maintenance period besides wakes, default 1s
+	metrics   *gatewayMetrics
 }
 
 // maxPulls bounds parallel pull requests.
@@ -190,6 +191,7 @@ func (m *staging) pull(p apis.Peer, hash xet.XorbHash) {
 		}
 	}
 	cancel()
+	m.cfg.metrics.pullRequest(err == nil)
 	if err != nil && m.ctx.Err() == nil {
 		slog.Warn("gateway: pull request", "peer", p.ID, "hash", hash, "err", err)
 	}
@@ -229,6 +231,18 @@ func (m *staging) snapshot() int64 {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.xorbs.Usage()
+}
+
+type stagingStats struct {
+	bytes             int64
+	entries, inflight int
+}
+
+// stats reports the tracked local xorbs and the pull requests in flight.
+func (m *staging) stats() stagingStats {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return stagingStats{bytes: m.xorbs.Usage(), entries: m.xorbs.Len(), inflight: len(m.sem)}
 }
 
 // Close stops maintenance, cancels in-flight pull requests and waits for them.

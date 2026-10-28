@@ -1,0 +1,105 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: xet-pd-gateway
+  namespace: xet-pd
+  labels:
+    app.kubernetes.io/name: xet-pd-gateway
+    app.kubernetes.io/component: gateway
+    app.kubernetes.io/part-of: xet-pd
+spec:
+  replicas: 1
+  # Never two gateways on the volume, not even during a rollout.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: xet-pd-gateway
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: xet-pd-gateway
+        app.kubernetes.io/component: gateway
+        app.kubernetes.io/part-of: xet-pd
+    spec:
+      serviceAccountName: xet-pd-gateway
+      automountServiceAccountToken: true
+      nodeSelector:
+        kubernetes.io/os: linux
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: gateway
+          image: ghcr.io/wzshiming/xet-pd-gateway:master
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: XET_PD_LOCALITY
+              value: k8s
+            - name: XET_PD_LOG_FORMAT
+              value: json
+            - name: XET_PD_DATA_DIR
+              value: /data
+            - name: HF_ENDPOINT
+              valueFrom:
+                configMapKeyRef:
+                  name: xet-pd-gateway
+                  key: HF_ENDPOINT
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: xet-pd-hf-token
+                  key: HF_TOKEN
+                  optional: true
+            - name: XET_PD_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: xet-pd-secret
+                  key: XET_PD_SECRET
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              memory: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: xet-pd-gateway

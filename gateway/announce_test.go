@@ -67,6 +67,30 @@ func TestAnnounceRegistersCanonicalInventory(t *testing.T) {
 	}
 }
 
+func TestAnnounceCarriesNode(t *testing.T) {
+	_, srv := newTestGateway(t, clustertest.NewHub(t), func(cfg *Config, _ string) { cfg.PeerTTL = time.Hour })
+	peer := apis.Peer{ID: "p1", URL: "http://127.0.0.1:1", Node: "worker-1"}
+	if status, body, resp := post(t, srv, announceJSON(t, apis.AnnounceRequest{Peer: peer, Epoch: "e", Full: true})); status != http.StatusOK || resp.Resync {
+		t.Fatalf("full announce from worker-1 = %d %q %+v", status, body, resp)
+	}
+	_, text := request(t, http.MethodGet, srv.URL+apis.PeersPath, "")
+	if d := clustertest.Diag(t, srv.URL); len(d.Peers) != 1 || d.Peers[0].Node != "worker-1" || !strings.Contains(text, `"node":"worker-1"`) {
+		t.Fatalf("registry = %s, want p1 on worker-1", text)
+	}
+	moved := peer
+	moved.Node = strings.Repeat("n", 253) // the longest node accepted
+	if status, _, resp := post(t, srv, announceJSON(t, apis.AnnounceRequest{Peer: moved, Epoch: "e"})); status != http.StatusOK || !resp.Resync || len(clustertest.Diag(t, srv.URL).Peers) != 0 {
+		t.Fatalf("delta from another node = %d %+v, want resync and the peer dropped", status, resp)
+	}
+	peer.Node = ""
+	if status, body, _ := post(t, srv, announceJSON(t, apis.AnnounceRequest{Peer: peer, Epoch: "e", Full: true})); status != http.StatusOK {
+		t.Fatalf("full announce without a node = %d %q", status, body)
+	}
+	if _, text := request(t, http.MethodGet, srv.URL+apis.PeersPath, ""); !strings.Contains(text, `"id":"p1"`) || strings.Contains(text, `"node"`) {
+		t.Fatalf("registry = %s, want p1 without a node key", text)
+	}
+}
+
 func TestAnnounceRejectsInvalidRequestsAtomically(t *testing.T) {
 	g, srv := newTestGateway(t, clustertest.NewHub(t), nil)
 	reg := gatewayRegistry(g)
@@ -84,6 +108,8 @@ func TestAnnounceRejectsInvalidRequestsAtomically(t *testing.T) {
 		{"empty id", announceJSON(t, apis.AnnounceRequest{Peer: apis.Peer{URL: peer.URL}, Epoch: "e", Full: true}), http.StatusBadRequest},
 		{"id with space", announceJSON(t, apis.AnnounceRequest{Peer: apis.Peer{ID: "p 1", URL: peer.URL}, Epoch: "e", Full: true}), http.StatusBadRequest},
 		{"long id", announceJSON(t, apis.AnnounceRequest{Peer: apis.Peer{ID: strings.Repeat("p", 129), URL: peer.URL}, Epoch: "e", Full: true}), http.StatusBadRequest},
+		{"node with space", announceJSON(t, apis.AnnounceRequest{Peer: apis.Peer{ID: "p1", URL: peer.URL, Node: "worker 1"}, Epoch: "e", Full: true}), http.StatusBadRequest},
+		{"long node", announceJSON(t, apis.AnnounceRequest{Peer: apis.Peer{ID: "p1", URL: peer.URL, Node: strings.Repeat("n", 254)}, Epoch: "e", Full: true}), http.StatusBadRequest},
 		{"empty epoch", announceJSON(t, apis.AnnounceRequest{Peer: peer, Full: true}), http.StatusBadRequest},
 		{"epoch with newline", announceJSON(t, apis.AnnounceRequest{Peer: peer, Epoch: "e\n", Full: true}), http.StatusBadRequest},
 		{"missing url", announceJSON(t, apis.AnnounceRequest{Peer: apis.Peer{ID: "p1"}, Epoch: "e", Full: true}), http.StatusBadRequest},

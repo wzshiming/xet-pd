@@ -96,7 +96,7 @@ func TestStartupDropsCorruptObject(t *testing.T) {
 		t.Fatal(err)
 	}
 	g := clustertest.NewFakeGateway(t, clustertest.ServeByHash(nil))
-	p, _ := newTestPeer(t, g.URL, func(c *Config) { c.DataDir, c.Heartbeat = dir, time.Hour })
+	p, srv := newTestPeer(t, g.URL, func(c *Config) { c.DataDir, c.Heartbeat = dir, time.Hour })
 	if got := g.Announce(t, 0).Req; !got.Full || !slices.Equal(got.Add, hashes(a)) {
 		t.Fatalf("startup announce = %+v, want only %s", got, a)
 	}
@@ -105,6 +105,9 @@ func TestStartupDropsCorruptObject(t *testing.T) {
 	}
 	if u := usage(p); u != int64(len(bodyA)) {
 		t.Fatalf("usage = %d, want %d", u, len(bodyA))
+	}
+	if n := clustertest.Scrape(t, srv.URL)["xetpd_peer_restore_dropped_total"]; n != 1 {
+		t.Fatalf("restore dropped = %v, want 1", n)
 	}
 }
 
@@ -329,6 +332,7 @@ func TestResyncSendsFullWithCurrentInventory(t *testing.T) {
 	if stored(t, p, a) || !stored(t, p, b) || !stored(t, p, c) {
 		t.Fatal("store does not match the announced inventory")
 	}
+	awaitSamples(t, srv, map[string]float64{`xetpd_peer_announces_total{result="error"}`: 1, `xetpd_peer_announces_total{result="resync"}`: 1})
 }
 
 func TestAnnounceNeverFollowsRedirects(t *testing.T) {
@@ -379,6 +383,44 @@ func TestAnnounceRejectsMalformedReply(t *testing.T) {
 	clustertest.WaitFor(t, clustertest.WaitTimeout, "heartbeat after the ack", func() bool { return reqs.Load() >= int32(len(replies))+1 })
 	if n := fulls.Load(); n != int32(len(replies)) {
 		t.Fatalf("Full announces = %d, want %d", n, len(replies))
+	}
+}
+
+func TestReadyzAfterFirstAnnounce(t *testing.T) {
+	g := clustertest.NewFakeGateway(t, clustertest.ServeByHash(nil))
+	hold := make(chan struct{})
+	g.SetReply(func(_ http.ResponseWriter, r *http.Request, _ apis.AnnounceRequest) (int, apis.AnnounceResponse) {
+		select {
+		case <-hold:
+		case <-r.Context().Done():
+		}
+		return http.StatusOK, apis.AnnounceResponse{TTL: 30}
+	})
+	p, srv := newTestPeer(t, g.URL, func(c *Config) { c.Heartbeat = time.Hour })
+	g.Announce(t, 0)
+	for method, want := range map[string]string{http.MethodGet: "not announced yet\n", http.MethodHead: ""} {
+		if resp, body, _ := do(t, method, srv.URL+"/readyz"); resp.StatusCode != http.StatusServiceUnavailable || string(body) != want {
+			t.Fatalf("%s /readyz while the first announce is pending = %d %q, want 503 %q", method, resp.StatusCode, body, want)
+		}
+	}
+	if resp, _, _ := do(t, http.MethodPost, srv.URL+"/readyz"); resp.StatusCode != http.StatusMethodNotAllowed {
+		t.Fatalf("POST /readyz = %d, want 405", resp.StatusCode)
+	}
+	close(hold)
+	clustertest.WaitFor(t, clustertest.WaitTimeout, "readiness once the gateway accepted the first announce", func() bool {
+		resp, body, _ := do(t, http.MethodGet, srv.URL+"/readyz")
+		return resp.StatusCode == http.StatusOK && len(body) == 0
+	})
+	// Readiness is sticky: a gateway failing later announces leaves the peer in service.
+	g.SetReply(func(http.ResponseWriter, *http.Request, apis.AnnounceRequest) (int, apis.AnnounceResponse) {
+		return http.StatusInternalServerError, apis.AnnounceResponse{}
+	})
+	wakeAnnouncer(p)
+	g.Announce(t, 1)
+	wakeAnnouncer(p)
+	g.Announce(t, 2) // sent only once the announcer handled the 500 to announce 1
+	if resp, _, _ := do(t, http.MethodGet, srv.URL+"/readyz"); resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /readyz after a failed announce = %d, want 200", resp.StatusCode)
 	}
 }
 

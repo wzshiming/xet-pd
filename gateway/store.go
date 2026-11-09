@@ -15,7 +15,6 @@ import (
 	"github.com/wzshiming/xet/shard"
 	"github.com/wzshiming/xet/storage"
 	"github.com/wzshiming/xet/storage/local"
-	"github.com/wzshiming/xet/xorb"
 
 	"github.com/wzshiming/xet-pd/apis"
 )
@@ -225,28 +224,13 @@ func (s *store) GetXorbReadSeekCloser(ctx context.Context, hash xet.XorbHash) (i
 	return s.relay.open(ctx, hash, 0, -1)
 }
 
-func (s *store) GetXorbRangeReadCloser(ctx context.Context, hash xet.XorbHash, start, end int64) (io.ReadCloser, error) {
-	rc, err := s.Storage.GetXorbRangeReadCloser(ctx, hash, start, end)
-	if err == nil || !errors.Is(err, fs.ErrNotExist) {
-		if err == nil && s.onRead != nil {
-			s.onRead(hash)
-		}
-		return rc, err
-	}
-	return s.relay.open(ctx, hash, start, end)
-}
-
-// GetReconstructedFile reads through this store, so remote-only xorbs are relayed.
-func (s *store) GetReconstructedFile(ctx context.Context, digest [32]byte) (io.ReadSeekCloser, error) {
+// GetShardBySHA256 goes through GetShard, so a file whose xorbs have no copy left is fs.ErrNotExist.
+func (s *store) GetShardBySHA256(ctx context.Context, digest [32]byte) (*shard.Shard, error) {
 	fh, err := s.Storage.GetFileHashBySHA256(ctx, digest)
 	if err != nil {
 		return nil, err
 	}
-	sh, err := s.GetShard(ctx, fh)
-	if err != nil {
-		return nil, err
-	}
-	return storage.NewReconstructedFile(ctx, s, sh, digest)
+	return s.GetShard(ctx, fh)
 }
 
 var errPinned = errors.New("xorb pinned by an in-flight shard verification")
@@ -328,14 +312,6 @@ func (s *store) PutShard(ctx context.Context, sh *shard.Shard) (bool, error) {
 		}
 	}
 	return s.Storage.PutShard(ctx, sh)
-}
-
-func (s *store) GetXorbDataRange(ctx context.Context, hash xet.XorbHash, chunkStart, chunkEnd uint32) (int64, int64, error) {
-	offsets, err := s.GetXorbChunkOffsets(ctx, hash)
-	if err != nil {
-		return 0, 0, err
-	}
-	return xorb.ChunkDataRangeFromOffsets(offsets, chunkStart, chunkEnd)
 }
 
 // GetShardByChunkHash always misses: cross-file dedup would bind new files to xorbs no peer may hold anymore.

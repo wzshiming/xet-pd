@@ -151,6 +151,21 @@ func ingest(t *testing.T, st *store, x *fixture, sh *shard.Shard) {
 	}
 }
 
+// reconstruct opens the file with SHA-256 digest as the server's xet bridge does.
+func reconstruct(t *testing.T, st *store, digest [32]byte) io.ReadSeekCloser {
+	t.Helper()
+	ctx := context.Background()
+	sh, err := st.GetShardBySHA256(ctx, digest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	file := sh.FindFileBySHA256(digest)
+	if file == nil {
+		t.Fatal("shard lacks the file's SHA-256")
+	}
+	return storage.NewReconstructedFile(ctx, st, file.Entries)
+}
+
 type seen struct{ method, rng, peer, auth string }
 
 // holder is a fake peer that serves the xorbs it is given and records every request.
@@ -377,10 +392,6 @@ func TestOffsetsSidecarSurvivesDeleteAndRestart(t *testing.T) {
 	if got, err := st.GetXorbChunkOffsets(ctx, x.hash); err != nil || !slices.Equal(got, want) {
 		t.Fatalf("GetXorbChunkOffsets after delete+restart = %v, %v, want %v", got, err, want)
 	}
-	ws, we, _ := xorb.ChunkDataRangeFromOffsets(want, 1, 3)
-	if start, end, err := st.GetXorbDataRange(ctx, x.hash, 1, 3); err != nil || start != ws || end != we {
-		t.Fatalf("GetXorbDataRange = %d, %d, %v, want %d, %d", start, end, err, ws, we)
-	}
 	if inserted, err := st.PutXorb(ctx, x.hash, bytes.NewReader(x.body)); err != nil || !inserted {
 		t.Fatalf("PutXorb after delete = %v, %v, want inserted", inserted, err)
 	}
@@ -426,23 +437,23 @@ func TestOffsetsFollowReplacedEncoding(t *testing.T) {
 	if got, err := st.GetXorbChunkOffsets(ctx, x.hash); err != nil || !slices.Equal(got, want) {
 		t.Fatalf("GetXorbChunkOffsets after restart = %v, %v, want %v", got, err, want)
 	}
-	start, end, err := st.GetXorbDataRange(ctx, x.hash, 1, 3)
+	start, end, err := xorb.ChunkDataRangeFromOffsets(want, 1, 3)
 	if err != nil {
 		t.Fatal(err)
 	}
-	rc, err := st.GetXorbRangeReadCloser(ctx, x.hash, start, end)
+	rs, err := st.GetXorbReadSeekCloser(ctx, x.hash)
 	if err != nil {
 		t.Fatal(err)
 	}
-	plain := decodeAll(t, rc)
-	_ = rc.Close()
+	if _, err := rs.Seek(start, io.SeekStart); err != nil {
+		t.Fatal(err)
+	}
+	plain := decodeAll(t, io.LimitReader(rs, end-start+1))
+	_ = rs.Close()
 	if !bytes.Equal(plain, x.content(1, 3)) {
 		t.Fatal("relayed range does not decode to chunks 1..3 of the held encoding")
 	}
-	f, err := st.GetReconstructedFile(ctx, fi.SHA256)
-	if err != nil {
-		t.Fatal(err)
-	}
+	f := reconstruct(t, st, fi.SHA256)
 	defer func() { _ = f.Close() }()
 	if got, err := io.ReadAll(f); err != nil || !bytes.Equal(got, x.content(0, 3)) {
 		t.Fatalf("reconstruction over the held encoding differs (%d bytes, %v)", len(got), err)
@@ -553,9 +564,6 @@ func TestMalformedSidecarIsRejected(t *testing.T) {
 		if _, err := st.GetXorbChunkOffsets(ctx, x.hash); err == nil || errors.Is(err, fs.ErrNotExist) {
 			t.Errorf("GetXorbChunkOffsets with sidecar %v... = %v, want validation error", offsets[:1], err)
 		}
-		if start, end, err := st.GetXorbDataRange(ctx, x.hash, 0, 1); err == nil || start < 0 || end < 0 {
-			t.Errorf("GetXorbDataRange with sidecar %v... = %d, %d, %v, want an error and no negative bound", offsets[:1], start, end, err)
-		}
 	}
 	malformed := []string{"[8,16]x", "[8,16][24]", "[8,16]" + strings.Repeat(" ", maxSidecarBytes), `{"a":8}`, "[-8]", "[8.5]", "[1e3]"}
 	for _, raw := range malformed {
@@ -596,7 +604,11 @@ func TestRelayReadsFromLiveHolder(t *testing.T) {
 	if got, err := io.ReadAll(rs); err != nil || !bytes.Equal(got, x.body) {
 		t.Fatalf("relayed whole xorb differs (%d bytes, %v)", len(got), err)
 	}
-	start, end, err := st.GetXorbDataRange(ctx, x.hash, 1, 3)
+	offsets, err := st.GetXorbChunkOffsets(ctx, x.hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	start, end, err := xorb.ChunkDataRangeFromOffsets(offsets, 1, 3)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -608,22 +620,12 @@ func TestRelayReadsFromLiveHolder(t *testing.T) {
 		t.Fatalf("relayed seek+read differs: %v", err)
 	}
 	_ = rs.Close()
-	rc, err := st.GetXorbRangeReadCloser(ctx, x.hash, start, end)
-	if err != nil {
-		t.Fatal(err)
-	}
-	plain := decodeAll(t, rc)
-	_ = rc.Close()
-	if !bytes.Equal(plain, x.content(1, 3)) {
+	if !bytes.Equal(decodeAll(t, bytes.NewReader(part)), x.content(1, 3)) {
 		t.Fatal("relayed range does not decode to chunks 1..3")
 	}
 	h.assertRelayed(t, 3)
-	reqs := h.requests()
-	if reqs[0].method != http.MethodHead {
+	if reqs := h.requests(); reqs[0].method != http.MethodHead {
 		t.Fatalf("first relay request %+v, want HEAD size probe before handing out the handle", reqs[0])
-	}
-	if last := reqs[len(reqs)-1]; last.rng != fmt.Sprintf("bytes=%d-%d", start, end) {
-		t.Fatalf("range relay request %+v, want bounded Range", last)
 	}
 	want, _ := storage.ReadXorbChunkOffsets(bytes.NewReader(x.body))
 	if got, err := sidecarOffsets(st, x.hash); err != nil || !slices.Equal(got, want) {
@@ -652,23 +654,11 @@ func TestRelaySkipsStaleHolder(t *testing.T) {
 	if err != nil || !bytes.Equal(got, x.body) {
 		t.Fatalf("relay past stale holder differs: %v", err)
 	}
-	rc, err := st.GetXorbRangeReadCloser(ctx, x.hash, 0, 15)
-	if err != nil {
-		t.Fatal(err)
-	}
-	head, err := io.ReadAll(rc)
-	_ = rc.Close()
-	if err != nil || !bytes.Equal(head, x.body[:16]) {
-		t.Fatalf("range relay past stale holder differs: %v", err)
-	}
-	stale.assertRelayed(t, 2)
+	stale.assertRelayed(t, 1)
 	live.assertRelayed(t, 2)
 	live.drop(x.hash)
 	if _, err := st.GetXorbReadSeekCloser(ctx, x.hash); err == nil {
 		t.Fatal("GetXorbReadSeekCloser with every holder stale must fail")
-	}
-	if _, err := st.GetXorbRangeReadCloser(ctx, x.hash, 0, 15); err == nil {
-		t.Fatal("GetXorbRangeReadCloser with every holder stale must fail")
 	}
 	if ok, _ := st.Storage.HasXorb(ctx, x.hash); ok {
 		t.Fatal("relay staged the xorb locally")
@@ -724,14 +714,11 @@ func TestReconstructedFileFromRemoteOnlyXorb(t *testing.T) {
 	if err := st.DeleteXorb(ctx, x.hash); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.GetReconstructedFile(ctx, fi.SHA256); !errors.Is(err, fs.ErrNotExist) {
-		t.Fatalf("GetReconstructedFile with all copies lost = %v, want fs.ErrNotExist", err)
+	if _, err := st.GetShardBySHA256(ctx, fi.SHA256); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("GetShardBySHA256 with all copies lost = %v, want fs.ErrNotExist", err)
 	}
 	h := newHolder(t, reg, "h1", x)
-	f, err := st.GetReconstructedFile(ctx, fi.SHA256)
-	if err != nil {
-		t.Fatal(err)
-	}
+	f := reconstruct(t, st, fi.SHA256)
 	defer func() { _ = f.Close() }()
 	want := x.content(1, 4)
 	if got, err := io.ReadAll(f); err != nil || !bytes.Equal(got, want) {

@@ -50,8 +50,8 @@ func (w *statusWriter) WriteHeader(code int) {
 	w.ResponseWriter.WriteHeader(code)
 }
 
-// ReadFrom hands the copy to the wrapped *http.response: that keeps sendfile for stored xorbs and makes net/http flush the
-// response header after the first 512 bytes instead of buffering 2 KiB, which a client of a pull still in flight waits for.
+// ReadFrom hands the copy to the wrapped *http.response: that makes net/http flush the response header after the first
+// 512 bytes instead of buffering 2 KiB, which a client of a pull still in flight waits for.
 func (w *statusWriter) ReadFrom(r io.Reader) (int64, error) {
 	return io.Copy(w.ResponseWriter, r)
 }

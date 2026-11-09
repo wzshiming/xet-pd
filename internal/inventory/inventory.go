@@ -1,4 +1,4 @@
-// Package inventory lists the xorbs already in xet's local storage so the gateway and peer can seed their indexes.
+// Package inventory lists the xorbs already in xet's local storage so the peer can seed its indexes.
 package inventory
 
 import (

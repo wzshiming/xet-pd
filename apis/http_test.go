@@ -59,7 +59,7 @@ func TestReadJSON(t *testing.T) {
 	}
 }
 
-// Mixed versions rely on it: a gateway accepts announces carrying fields it predates.
+// Mixed versions rely on it: a tracker accepts announces carrying fields it predates.
 func TestReadJSONIgnoresUnknownFields(t *testing.T) {
 	t.Parallel()
 	w := httptest.NewRecorder()

@@ -1,4 +1,4 @@
-// Package clustertest holds the fixtures and helpers the gateway, peer, cmd and e2e tests share.
+// Package clustertest holds the fixtures and helpers the tracker, peer, cmd and e2e tests share.
 package clustertest
 
 import (
@@ -59,7 +59,7 @@ func WaitFor(t testing.TB, timeout time.Duration, what string, cond func() bool)
 	}
 }
 
-// Diag returns the peer diagnostics of the gateway at origin.
+// Diag returns the peer registry of the tracker at origin.
 func Diag(t testing.TB, origin string) apis.PeersResponse {
 	t.Helper()
 	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, origin+apis.PeersPath, nil)

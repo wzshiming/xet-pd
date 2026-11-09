@@ -71,25 +71,6 @@ func TestAnnounceRegistersCanonicalInventory(t *testing.T) {
 	}
 }
 
-// The node a peer names is dropped before any compare or store.
-func TestAnnounceIgnoresNode(t *testing.T) {
-	_, srv := newTestTracker(t, func(cfg *Config) { cfg.PeerTTL = time.Hour })
-	peer := apis.Peer{ID: "p1", URL: "http://127.0.0.1:1", Node: "worker-1"}
-	if status, body, resp := post(t, srv, announceJSON(t, apis.AnnounceRequest{Peer: peer, Epoch: "e", Full: true})); status != http.StatusOK || resp.Resync {
-		t.Fatalf("full announce from worker-1 = %d %q %+v", status, body, resp)
-	}
-	for _, node := range []string{"worker-2", "worker 1", strings.Repeat("n", 254), ""} {
-		moved := peer
-		moved.Node = node
-		if status, body, resp := post(t, srv, announceJSON(t, apis.AnnounceRequest{Peer: moved, Epoch: "e"})); status != http.StatusOK || resp.Resync {
-			t.Fatalf("delta naming node %q = %d %q %+v, want it accepted without resync", node, status, body, resp)
-		}
-	}
-	if _, text := request(t, http.MethodGet, srv.URL+apis.PeersPath, ""); !strings.Contains(text, `"id":"p1"`) || strings.Contains(text, `"node"`) {
-		t.Fatalf("registry = %s, want p1 without a node key", text)
-	}
-}
-
 func TestAnnounceReplyCarriesMinSeeds(t *testing.T) {
 	_, srv := newTestTracker(t, func(cfg *Config) { cfg.MinSeeds = 2 })
 	req := apis.AnnounceRequest{Peer: apis.Peer{ID: "p1", URL: "http://127.0.0.1:1"}, Epoch: "e", Full: true}

@@ -14,6 +14,13 @@ import (
 	"github.com/wzshiming/xet-pd/apis"
 )
 
+// Announce is one announce a FakeTracker recorded; Code is 0 while its reply is pending.
+type Announce struct {
+	Req    apis.AnnounceRequest
+	Header http.Header
+	Code   int
+}
+
 // Lookup is one lookup a FakeTracker accepted.
 type Lookup struct {
 	Req    apis.LookupRequest

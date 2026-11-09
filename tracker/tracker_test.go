@@ -110,7 +110,7 @@ func TestControlRoutes(t *testing.T) {
 		t.Fatalf("GET /metrics Content-Type = %q, want text/plain", resp.Header.Get("Content-Type"))
 	}
 	resp, body := request(t, http.MethodGet, srv.URL+apis.PeersPath, "")
-	want := `{"peers":[],"xorb_bytes":0,"xorb_gets":{"peer":0,"direct":0}}` + "\n"
+	want := `{"peers":[]}` + "\n"
 	if resp.StatusCode != http.StatusOK || resp.Header.Get("Content-Type") != "application/json" || body != want {
 		t.Fatalf("GET %s = %d %q %q, want %q", apis.PeersPath, resp.StatusCode, resp.Header.Get("Content-Type"), body, want)
 	}

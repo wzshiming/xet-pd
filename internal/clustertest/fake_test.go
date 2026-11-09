@@ -313,10 +313,10 @@ func TestFakePeerRecordsPulls(t *testing.T) {
 		t.Fatalf("Pull(0) = %+v, want %+v with its header", got, req)
 	}
 	p.SetPullStatus(http.StatusServiceUnavailable)
-	if err := apis.Pull(t.Context(), p.Client(), p.URL, "", apis.PullRequest{Hash: "aa"}); err == nil || !strings.Contains(err.Error(), "503") {
+	if err := apis.Pull(t.Context(), p.Client(), p.URL, "", apis.PullRequest{File: "aa"}); err == nil || !strings.Contains(err.Error(), "503") {
 		t.Fatalf("Pull after SetPullStatus(503) = %v, want an error naming the status", err)
 	}
-	if got := p.Pulls(); len(got) != 2 || got[1].Req.Hash != "aa" {
+	if got := p.Pulls(); len(got) != 2 || got[1].Req.File != "aa" {
 		t.Fatalf("Pulls = %+v, want both pulls in order", got)
 	}
 }
@@ -354,7 +354,7 @@ func TestFakePeerRecordsRequests(t *testing.T) {
 	x := xorbHash(t, "1")
 	fetch(t, http.MethodGet, apis.XorbURL(p.URL, x.String()), "p2")
 	_, _ = apis.GetShard(t.Context(), p.Client(), p.URL, "", "p3", file1.Hash)
-	_ = apis.Pull(t.Context(), p.Client(), p.URL, "", apis.PullRequest{Hash: x.String()})
+	_ = apis.Pull(t.Context(), p.Client(), p.URL, "", apis.PullRequest{File: file1.Hash})
 	got := p.Requests()
 	want := []struct{ method, path, peer string }{
 		{http.MethodGet, apis.XorbPathPrefix + x.String(), "p2"},

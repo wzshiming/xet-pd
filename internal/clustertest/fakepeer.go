@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"slices"
+	"strconv"
 	"sync"
 	"testing"
 
@@ -18,6 +19,12 @@ import (
 type Pull struct {
 	Req    apis.PullRequest
 	Header http.Header
+}
+
+// Request is one request a FakePeer received other than a pull.
+type Request struct {
+	Method, Path string
+	Header       http.Header
 }
 
 // FakePeer serves the xorbs and shards it is given as a peer does and records the pulls it accepts; it records every other request too.
@@ -61,14 +68,27 @@ func (f *FakePeer) Peer() apis.Peer { return apis.Peer{ID: f.id, URL: f.URL} }
 // ServeXorb answers GETs and HEADs of hash with the whole body under its Content-Length, ignoring Range.
 func (f *FakePeer) ServeXorb(hash xet.XorbHash, body []byte) {
 	f.mu.Lock()
-	f.xorbs[hash] = ServeBody(body)
+	f.xorbs[hash] = func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+		_, _ = w.Write(body)
+	}
 	f.mu.Unlock()
 }
 
-// GateXorb answers GETs of hash as GatedBody does.
+// GateXorb answers GETs of hash by flushing body[:prefix] under the full Content-Length, then holding the rest until release or client disconnect.
 func (f *FakePeer) GateXorb(hash xet.XorbHash, body []byte, prefix int, release <-chan struct{}) {
 	f.mu.Lock()
-	f.xorbs[hash] = GatedBody(body, prefix, release)
+	f.xorbs[hash] = func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+		_, _ = w.Write(body[:prefix])
+		w.(http.Flusher).Flush()
+		select {
+		case <-release:
+		case <-r.Context().Done():
+			return
+		}
+		_, _ = w.Write(body[prefix:])
+	}
 	f.mu.Unlock()
 }
 

@@ -40,9 +40,8 @@ func (tr *Tracker) serveAnnounce(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(resp)
 }
 
-// canonicalAnnounce rewrites req to the form the registry keys: no node, origin-only URL, lowercase hashes.
+// canonicalAnnounce rewrites req to the form the registry keys: origin-only URL, lowercase hashes.
 func canonicalAnnounce(req *apis.AnnounceRequest) error {
-	req.Peer.Node = "" // ignored until the field leaves apis
 	if !apis.ValidLabel(req.Peer.ID, apis.MaxIDLen) || !apis.ValidLabel(req.Epoch, apis.MaxIDLen) {
 		return errors.New("invalid peer id or epoch")
 	}

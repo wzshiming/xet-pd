@@ -101,11 +101,6 @@ func TestParsePeerHelp(t *testing.T) {
 			t.Errorf("help lacks %q:\n%s", want, help.String())
 		}
 	}
-	for _, unwanted := range []string{"-node", "-gateway", "XET_PD_NODE", "XET_PD_GATEWAY"} {
-		if strings.Contains(help.String(), unwanted) {
-			t.Errorf("peer help mentions %q:\n%s", unwanted, help.String())
-		}
-	}
 }
 
 func TestParsePeerSecretFile(t *testing.T) {

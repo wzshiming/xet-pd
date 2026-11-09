@@ -15,16 +15,16 @@ import (
 
 const announceTimeout = 5 * time.Second
 
-// announcer reconciles the gateway's view with the inventory.
+// announcer reconciles the tracker's view with the inventory.
 type announcer struct {
 	p        *Peer
 	control  *http.Client  // carries the secret and never follows redirects
 	wake     chan struct{} // coalesced inventory change signal
-	ready    atomic.Bool   // the gateway took an announce without asking to resync; never cleared
+	ready    atomic.Bool   // the tracker took an announce without asking to resync; never cleared
 	minSeeds atomic.Int64  // MinSeeds of the last successful reply, 1 until the first
 
 	// Only run touches these.
-	acked                holdings // inventory the gateway confirmed
+	acked                holdings // inventory the tracker confirmed
 	full, failed, warned bool     // full: the next request carries the whole inventory
 }
 
@@ -48,7 +48,7 @@ func (a *announcer) run() {
 			if !a.failed {
 				slog.Warn("peer: announce", "err", err)
 			}
-			// The gateway may have applied this request, so only a Full can resync it.
+			// The tracker may have applied this request, so only a Full can resync it.
 			a.failed, a.full = true, true
 		} else {
 			a.failed = false
@@ -63,7 +63,7 @@ func (a *announcer) run() {
 				a.ready.Store(true)
 			}
 			if !a.warned && out.TTL > 0 && p.cfg.Heartbeat >= time.Duration(out.TTL)*time.Second {
-				slog.Warn("peer: heartbeat not shorter than gateway TTL", "heartbeat", p.cfg.Heartbeat, "ttl", out.TTL)
+				slog.Warn("peer: heartbeat not shorter than tracker TTL", "heartbeat", p.cfg.Heartbeat, "ttl", out.TTL)
 				a.warned = true
 			}
 			// A resync to a delta is answered at once; a resync to a Full waits for the heartbeat.
@@ -104,7 +104,7 @@ func (a *announcer) snapshot() holdings {
 // request announces snap whole when full, else as its delta from acked.
 func (a *announcer) request(snap holdings) apis.AnnounceRequest {
 	p := a.p
-	req := apis.AnnounceRequest{Peer: apis.Peer{ID: p.id, URL: p.cfg.Advertise, Node: p.cfg.Node}, Epoch: p.epoch, Full: a.full}
+	req := apis.AnnounceRequest{Peer: apis.Peer{ID: p.id, URL: p.cfg.Advertise}, Epoch: p.epoch, Full: a.full}
 	req.Add, req.Remove = delta(snap.xorbs, a.acked.xorbs, a.full)
 	var added []string
 	added, req.RemoveFiles = delta(snap.files, a.acked.files, a.full)
@@ -131,11 +131,11 @@ func delta[V any](snap, acked map[string]V, full bool) (add, remove []string) {
 	return add, remove
 }
 
-// post sends req to the gateway and decodes its reply.
+// post sends req to the tracker and decodes its reply.
 func (a *announcer) post(req apis.AnnounceRequest) (apis.AnnounceResponse, error) {
 	ctx, cancel := context.WithTimeout(a.p.ctx, announceTimeout)
 	defer cancel()
-	return apis.Announce(ctx, a.control, a.p.cfg.Gateway, a.p.cfg.Secret, req)
+	return apis.Announce(ctx, a.control, a.p.cfg.Tracker, a.p.cfg.Secret, req)
 }
 
 // kick wakes the announcer without blocking; safe under p.mu and after Close.

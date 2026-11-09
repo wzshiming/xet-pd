@@ -138,6 +138,18 @@ func pullStatus(p *Peer, h xet.XorbHash) (f *pull, refs int, queued, keep bool) 
 // pullDone takes no lock: done is set when the pull is made and only closed after.
 func pullDone(f *pull) <-chan struct{} { return f.done }
 
+// forcePull starts or joins a kept pull of hash, as a file pull does for each of its xorbs, and lets go of it.
+func forcePull(t testing.TB, p *Peer, hash xet.XorbHash) {
+	t.Helper()
+	f, err := p.st.acquire(hash, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f != nil {
+		f.release()
+	}
+}
+
 // plantPull lists a bare pull for h, which nothing runs or releases, until the test ends.
 func plantPull(t testing.TB, p *Peer, h xet.XorbHash) *pull {
 	t.Helper()

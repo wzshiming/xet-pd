@@ -190,7 +190,7 @@ func TestAnnounceFailureRetriesAsFull(t *testing.T) {
 	}
 }
 
-// The gateway applies an announce but loses the reply; the inventory changes back before the retry, so only a Full can correct its view.
+// The tracker applies an announce but loses the reply; the inventory changes back before the retry, so only a Full can correct its view.
 func TestAmbiguousAnnounceReplyForcesFullReconciliation(t *testing.T) {
 	a, bodyA := clustertest.MakeXorb(t, 44, 2, 8<<10)
 	b, bodyB := clustertest.MakeXorb(t, 45, 2, 8<<10)
@@ -256,7 +256,7 @@ func TestAmbiguousAnnounceReplyForcesFullReconciliation(t *testing.T) {
 				mu.Lock()
 				defer mu.Unlock()
 				if got := slices.Sorted(maps.Keys(holdings)); !reqs[i].Full || !slices.Equal(got, hashes(want)) {
-					t.Fatalf("retry = %+v, gateway holdings = %v, want Full with %v", reqs[i], got, hashes(want))
+					t.Fatalf("retry = %+v, tracker holdings = %v, want Full with %v", reqs[i], got, hashes(want))
 				}
 			}
 			clustertest.WaitFor(t, clustertest.WaitTimeout, "startup ack", func() bool { return count() == 1 })
@@ -419,15 +419,15 @@ func TestReadyzAfterFirstAnnounce(t *testing.T) {
 			t.Fatalf("%s /readyz while the first announce is pending = %d %q, want 503 %q", method, resp.StatusCode, body, want)
 		}
 	}
-	if resp, _, _ := do(t, http.MethodPost, srv.URL+"/readyz"); resp.StatusCode != http.StatusMethodNotAllowed {
-		t.Fatalf("POST /readyz = %d, want 405", resp.StatusCode)
+	if resp, _, _ := do(t, http.MethodPost, srv.URL+"/readyz"); resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("POST /readyz = %d, want the read-only 403", resp.StatusCode)
 	}
 	close(hold)
-	clustertest.WaitFor(t, clustertest.WaitTimeout, "readiness once the gateway accepted the first announce", func() bool {
+	clustertest.WaitFor(t, clustertest.WaitTimeout, "readiness once the tracker accepted the first announce", func() bool {
 		resp, body, _ := do(t, http.MethodGet, srv.URL+"/readyz")
 		return resp.StatusCode == http.StatusOK && len(body) == 0
 	})
-	// Readiness is sticky: a gateway failing later announces leaves the peer in service.
+	// Readiness is sticky: a tracker failing later announces leaves the peer in service.
 	tracker.SetReply(func(http.ResponseWriter, *http.Request, apis.AnnounceRequest) (int, apis.AnnounceResponse) {
 		return http.StatusInternalServerError, apis.AnnounceResponse{}
 	})
@@ -460,23 +460,20 @@ func TestMissingStoredObjectIsPulledAgain(t *testing.T) {
 	}
 }
 
-func TestPullRestoresMissingStoredObject(t *testing.T) {
-	hash, body := clustertest.MakeXorb(t, 49, 2, 8<<10)
-	tracker, holder := cluster(t, map[xet.XorbHash][]byte{hash: body})
-	seed, _ := newTestPeer(t, tracker.URL, nil)
-	commitDirect(t, seed, hash, body)
-	deleteStored(t, seed, hash)
-	payload := `{"hash":"` + hash.String() + `"}`
-	request := httptest.NewRequest(http.MethodPost, apis.PullPath, strings.NewReader(payload))
-	response := httptest.NewRecorder()
-	seed.ServeHTTP(response, request)
-	if response.Code != http.StatusAccepted {
-		t.Fatalf("pull status = %d, want %d", response.Code, http.StatusAccepted)
+func TestPullRestoresMissingStoredFile(t *testing.T) {
+	tf := makeFile(t, 49)
+	h := tf.xorbHashes()[0]
+	tracker, holder := cluster(t, tf.xorbs)
+	seed, srv := newTestPeer(t, tracker.URL, nil)
+	ingest(t, storeOf(seed), tf)
+	deleteStored(t, seed, h)
+	if resp, body := send(t, http.MethodPost, srv.URL+apis.PullPath, `{"file":"`+tf.file.Hash+`"}`); resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("pull status = %d %q, want %d", resp.StatusCode, body, http.StatusAccepted)
 	}
-	clustertest.WaitFor(t, clustertest.WaitTimeout, "pull of the missing object", func() bool { return len(holder.Requests()) == 1 })
+	clustertest.WaitFor(t, clustertest.WaitTimeout, "pull of the missing xorb", func() bool { return len(holder.Requests()) == 1 })
 	settled(t, seed)
-	if !stored(t, seed, hash) {
-		t.Fatal("accepted pull did not restore the missing object")
+	if !stored(t, seed, h) {
+		t.Fatal("accepted pull did not restore the missing xorb")
 	}
 }
 
@@ -496,8 +493,8 @@ func TestUnreadableStoredObjectIsNotDropped(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = os.Chmod(path, 0o644) })
 	// A transient read failure is not absence: no pull, the inventory stands.
-	if resp, _, _ := do(t, http.MethodGet, xorbURL(srv, hash)); resp.StatusCode != http.StatusInternalServerError {
-		t.Fatalf("GET of an unreadable object = %d", resp.StatusCode)
+	if resp, _, _ := do(t, http.MethodGet, xorbURL(srv, hash)); resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("GET of an unreadable object = %d, want 502", resp.StatusCode)
 	}
 	if usage(p) != int64(len(body)) || len(holder.Requests()) != 0 || len(tracker.Lookups()) != 0 {
 		t.Fatalf("usage = %d, holder GETs = %d, lookups = %d", usage(p), len(holder.Requests()), len(tracker.Lookups()))
@@ -692,9 +689,9 @@ func TestCloseCancelsHungAnnounceAndPull(t *testing.T) {
 	select {
 	case <-unblocked:
 	case <-time.After(5 * time.Second):
-		t.Fatal("gateway never saw the announce canceled")
+		t.Fatal("tracker never saw the announce canceled")
 	}
-	// Close may cancel the pull before the gateway's headers arrive; the reader then gets a complete 502.
+	// Close may cancel the pull before the holder's headers arrive; the reader then gets a complete 502.
 	if r := <-late; r.err == nil && r.resp.StatusCode == http.StatusOK {
 		t.Fatal("reader completed after Close")
 	}

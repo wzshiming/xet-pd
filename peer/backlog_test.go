@@ -4,13 +4,11 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"testing"
 	"time"
 
 	"github.com/wzshiming/xet"
 
-	"github.com/wzshiming/xet-pd/apis"
 	"github.com/wzshiming/xet-pd/internal/clustertest"
 )
 
@@ -47,16 +45,6 @@ func clientGet(t *testing.T, p *Peer, hash xet.XorbHash) (leave func()) {
 	return leave
 }
 
-func postPull(t *testing.T, srv *httptest.Server, hash xet.XorbHash) int {
-	t.Helper()
-	resp, err := http.Post(srv.URL+apis.PullPath, "application/json", strings.NewReader(`{"hash":"`+hash.String()+`"}`))
-	if err != nil {
-		t.Fatal(err)
-	}
-	_ = resp.Body.Close()
-	return resp.StatusCode
-}
-
 func TestQueuedPullDroppedWhenClientLeaves(t *testing.T) {
 	p, srv, holder, b, release := backlogged(t)
 	leave := clientGet(t, p, b)
@@ -88,18 +76,16 @@ func TestQueuedPullDroppedWhenClientLeaves(t *testing.T) {
 	clustertest.WaitFor(t, clustertest.WaitTimeout, "b committed", admitted(p, b))
 }
 
-// The gateway counts on an accepted pull, so it waits out the queue with no client attached.
-func TestQueuedGatewayPullKeptWithoutClients(t *testing.T) {
-	p, srv, holder, b, release := backlogged(t)
-	if code := postPull(t, srv, b); code != http.StatusAccepted {
-		t.Fatalf("pull b = %d, want 202", code)
-	}
-	// The handler's release, which settles any drop under p.mu, ran before the 202.
+// A file pull counts on its xorbs' pulls, so a forced one waits out the queue with no client attached.
+func TestQueuedForcedPullKeptWithoutClients(t *testing.T) {
+	p, _, holder, b, release := backlogged(t)
+	forcePull(t, p, b)
+	// forcePull's release settled any drop under the store's lock.
 	fb, _, queued, keep := pullStatus(p, b)
 	kept := fb != nil && queued && keep
 	_, cooling := cooldownOf(p, b)
 	if !kept || cooling {
-		t.Fatalf("gateway pull of b after the 202: queued and kept %v, cooling %v, want true and false", kept, cooling)
+		t.Fatalf("forced pull of b: queued and kept %v, cooling %v, want true and false", kept, cooling)
 	}
 	release()
 	clustertest.WaitFor(t, clustertest.WaitTimeout, "b committed", admitted(p, b))
@@ -108,11 +94,9 @@ func TestQueuedGatewayPullKeptWithoutClients(t *testing.T) {
 	}
 }
 
-func TestQueuedGatewayPullKeptWhenJoinedClientLeaves(t *testing.T) {
-	p, srv, holder, b, release := backlogged(t)
-	if code := postPull(t, srv, b); code != http.StatusAccepted {
-		t.Fatalf("pull b = %d, want 202", code)
-	}
+func TestQueuedForcedPullKeptWhenJoinedClientLeaves(t *testing.T) {
+	p, _, holder, b, release := backlogged(t)
+	forcePull(t, p, b)
 	leave := clientGet(t, p, b)
 	// The pull goroutine holds one reference, the joined client the other.
 	var fb *pull
@@ -126,7 +110,7 @@ func TestQueuedGatewayPullKeptWhenJoinedClientLeaves(t *testing.T) {
 	f, _, queued, keep := pullStatus(p, b)
 	kept := f == fb && queued && keep
 	if !kept {
-		t.Fatal("gateway pull of b dropped when a joined client left")
+		t.Fatal("forced pull of b dropped when a joined client left")
 	}
 	release()
 	clustertest.WaitFor(t, clustertest.WaitTimeout, "b committed", admitted(p, b))
@@ -135,23 +119,21 @@ func TestQueuedGatewayPullKeptWhenJoinedClientLeaves(t *testing.T) {
 	}
 }
 
-func TestQueuedPullKeptOnceGatewayJoins(t *testing.T) {
-	p, srv, holder, b, release := backlogged(t)
+func TestQueuedPullKeptOnceForced(t *testing.T) {
+	p, _, holder, b, release := backlogged(t)
 	leave := clientGet(t, p, b)
 	var fb *pull
 	clustertest.WaitFor(t, clustertest.WaitTimeout, "b queued behind a", func() bool {
 		fb = pullOf(p, b)
 		return fb != nil
 	})
-	if code := postPull(t, srv, b); code != http.StatusAccepted {
-		t.Fatalf("pull b = %d, want 202", code)
-	}
+	forcePull(t, p, b)
 	leave()
 	// leave returns after the handler's release, which settles any drop under p.mu.
 	f, _, queued, keep := pullStatus(p, b)
 	kept := f == fb && queued && keep
 	if !kept {
-		t.Fatal("pull of b dropped when its client left after the gateway joined it")
+		t.Fatal("pull of b dropped when its client left after it was forced")
 	}
 	release()
 	clustertest.WaitFor(t, clustertest.WaitTimeout, "b committed", admitted(p, b))

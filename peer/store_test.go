@@ -233,6 +233,32 @@ func TestPutShardReportsItsFiles(t *testing.T) {
 	}
 }
 
+// The tracker refuses a file without SHA-256, so announcing one would fail every announce.
+func TestFetchedFileWithoutSHA256IsNotReported(t *testing.T) {
+	tracker, holder := newTracker(t), newHolder(t, "holder")
+	intact, bare := makeFile(t, 33), makeFile(t, 34)
+	sh, bareShard := intact.shard(t), bare.shard(t)
+	f := bareShard.Files[0]
+	f.MetadataExt, f.Flags = nil, f.Flags&^shard.FileWithMetadataExt
+	sh.Files, sh.CASInfos = append(sh.Files, f), append(sh.CASInfos, bareShard.CASInfos...)
+	data, _, err := storage.EncodeShard(sh)
+	if err != nil {
+		t.Fatal(err)
+	}
+	offsets := maps.Clone(intact.resp.Offsets)
+	maps.Copy(offsets, bare.resp.Offsets)
+	holder.ServeShard(intact.file, apis.ShardResponse{Shard: data, Offsets: offsets})
+	tracker.HoldFile(holder.Peer(), intact.file)
+	st := newTestStore(t, t.TempDir(), tracker.URL)
+	ev := watch(st)
+	if _, err := st.GetFileHashBySHA256(context.Background(), digestOf(t, intact.file)); err != nil {
+		t.Fatal(err)
+	}
+	if files := ev.knownFiles(); len(files) != 1 || files[0].file != intact.file {
+		t.Fatalf("onFile calls = %+v, want only %+v", files, intact.file)
+	}
+}
+
 func TestLocalReadReportsReadThenIdleOnClose(t *testing.T) {
 	st := newTestStore(t, t.TempDir(), "http://tracker.test")
 	hash, body := clustertest.MakeXorb(t, 7, 2, 8<<10)

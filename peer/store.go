@@ -326,13 +326,15 @@ func (s *store) fetchShard(ctx context.Context, file apis.File, holders []apis.P
 	return nil, fmt.Errorf("no holder served the shard of file %s: %w", file.Hash, fs.ErrNotExist)
 }
 
-// report hands every file sh describes to onFile.
+// report hands onFile every file sh describes with a SHA-256; the tracker refuses announces of the others.
 func (s *store) report(sh *shard.Shard) {
 	if s.onFile == nil {
 		return
 	}
 	for i := range sh.Files {
-		s.onFile(fileOf(&sh.Files[i]), xorbsOf(&sh.Files[i]))
+		if sh.Files[i].MetadataExt != nil {
+			s.onFile(fileOf(&sh.Files[i]), xorbsOf(&sh.Files[i]))
+		}
 	}
 }
 
@@ -506,6 +508,23 @@ func (r releaser) Close() error {
 	err := r.ReadSeekCloser.Close()
 	r.release()
 	return err
+}
+
+// openLocal opens the local copy of hash, pinned until Close, without any lookup or pull; fs.ErrNotExist when there is none.
+func (s *store) openLocal(ctx context.Context, hash xet.XorbHash) (io.ReadSeekCloser, error) {
+	s.pin(hash)
+	rs, err := s.Storage.GetXorbReadSeekCloser(ctx, hash)
+	if errors.Is(err, fs.ErrNotExist) {
+		err = fmt.Errorf("no local copy of xorb %s: %w", hash, fs.ErrNotExist) // the local error names the file's path
+	}
+	if err != nil {
+		s.unpin(hash)
+		return nil, err
+	}
+	if s.onRead != nil {
+		s.onRead(hash)
+	}
+	return releaser{rs, func() { s.unpin(hash) }}, nil
 }
 
 // GetXorbReadSeekCloser opens the local copy, else streams the shared pull of hash as it lands; hash stays pinned until Close.

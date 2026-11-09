@@ -2,10 +2,14 @@ package peer
 
 import (
 	"cmp"
+	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"io/fs"
+	"log/slog"
 	"net/http"
+	"regexp"
 	"time"
 
 	"github.com/wzshiming/xet"
@@ -15,16 +19,39 @@ import (
 
 func (p *Peer) routes() *http.ServeMux {
 	mux := http.NewServeMux()
+	// Shadows the CAS xorb route: relays stay local and requesters are counted.
 	mux.HandleFunc("GET /v1/xorbs/{prefix}/{hash}", p.serveXorb)
 	mux.HandleFunc("POST "+apis.PullPath, p.servePull)
+	mux.HandleFunc("GET "+apis.ShardPathPrefix+"{hash}", p.serveShard)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
 	mux.HandleFunc("GET /readyz", p.serveReadyz)
 	mux.Handle("GET /metrics", p.metrics.handler())
+	mux.Handle("/xet-pd/", http.NotFoundHandler()) // unknown control paths never reach the upstream
+	mux.HandleFunc("/", p.servePublic)
 	return mux
 }
 
 func (p *Peer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	p.mux.ServeHTTP(w, r)
+}
+
+// pathsInfoRe admits the one hub POST that only reads: /api/{type}s/{repo}/paths-info/{rev}.
+var pathsInfoRe = regexp.MustCompile(`^/api/(models|datasets|spaces)/.+/paths-info/[^/]+$`)
+
+// telemetryPath takes xet-core >= 1.7.0's per-transfer summary; the CAS handler validates and discards it.
+const telemetryPath = "/v1/telemetry"
+
+// servePublic keeps the CAS and hub surface read-only: GET and HEAD plus two POSTs that write nothing, paths-info reading the hub and telemetry being discarded.
+func (p *Peer) servePublic(w http.ResponseWriter, r *http.Request) {
+	switch {
+	case r.Method == http.MethodGet, r.Method == http.MethodHead:
+	case r.Method == http.MethodPost && pathsInfoRe.MatchString(r.URL.EscapedPath()):
+	case r.Method == http.MethodPost && r.URL.Path == telemetryPath:
+	default:
+		http.Error(w, "read-only peer", http.StatusForbidden)
+		return
+	}
+	p.cas.ServeHTTP(w, r)
 }
 
 func (p *Peer) serveReadyz(w http.ResponseWriter, _ *http.Request) {
@@ -64,11 +91,12 @@ func serveContent(w http.ResponseWriter, r *http.Request, hash xet.XorbHash, con
 	http.ServeContent(w, r, "", time.Time{}, content)
 }
 
-// serveXorb serves a committed xorb or streams it from a pull; requests carrying apis.PeerHeader are relays and never pull.
+// serveXorb serves a xorb with ranges: a relay (apis.PeerHeader) and a HEAD only from the local copy, any other GET streaming the pull of a missing one.
 func (p *Peer) serveXorb(w http.ResponseWriter, r *http.Request) {
+	relay := r.Header.Get(apis.PeerHeader) != ""
 	requester := "client"
-	if r.Header.Get(apis.PeerHeader) != "" {
-		requester = "gateway"
+	if relay {
+		requester = "peer"
 	}
 	sw := &statusWriter{ResponseWriter: w}
 	// The GET pattern routes HEAD here too; only GETs count.
@@ -82,29 +110,31 @@ func (p *Peer) serveXorb(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid xorb path", http.StatusBadRequest)
 		return
 	}
-	local, err := p.st.Storage.HasXorb(r.Context(), hash)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
+	open := p.st.GetXorbReadSeekCloser
+	if relay || r.Method == http.MethodHead {
+		open = p.st.openLocal
 	}
-	if !local && r.Header.Get(apis.PeerHeader) != "" {
-		http.NotFound(w, r)
-		return
-	}
-	rs, err := p.st.GetXorbReadSeekCloser(r.Context(), hash)
-	if err != nil {
-		code := statusOf(err)
-		if local { // a stored copy that fails to open is no holder's fault
-			code = http.StatusInternalServerError
+	rs, err := open(r.Context(), hash)
+	if errors.Is(err, fs.ErrNotExist) && r.Method == http.MethodHead {
+		var held bool
+		switch held, err = p.st.HasXorb(r.Context(), hash); {
+		case err == nil && held:
+			w.WriteHeader(http.StatusOK) // held by a live peer: no pull, so no length
+			return
+		case err == nil:
+			http.NotFound(w, r)
+			return
 		}
-		http.Error(w, err.Error(), code)
+	}
+	if err != nil {
+		http.Error(w, err.Error(), statusOf(err))
 		return
 	}
 	defer func() { _ = rs.Close() }()
 	serveContent(w, r, hash, rs)
 }
 
-// servePull starts (or joins) a pull on behalf of the gateway and answers 202 at once.
+// servePull marks the file a seed copy when asked, answers 202 and pulls the file complete in the background.
 func (p *Peer) servePull(w http.ResponseWriter, r *http.Request) {
 	if !apis.Authorize(w, r, p.cfg.Secret) {
 		return
@@ -113,20 +143,64 @@ func (p *Peer) servePull(w http.ResponseWriter, r *http.Request) {
 	if !apis.ReadJSON(w, r, apis.MaxReplyBytes, &req) {
 		return
 	}
-	hash, err := xet.ParseXorbHash(req.Hash)
+	hash, err := xet.ParseFileHash(req.File)
 	if err != nil {
-		http.Error(w, "invalid pull request", http.StatusBadRequest)
+		http.Error(w, "invalid file hash", http.StatusBadRequest)
 		return
 	}
-	f, err := p.st.acquire(hash, true)
-	if err != nil {
-		http.Error(w, err.Error(), statusOf(err))
+	p.mu.Lock()
+	closed := p.ctx.Err() != nil
+	if !closed {
+		p.wg.Add(1)
+	}
+	p.mu.Unlock()
+	if closed {
+		http.Error(w, errClosed.Error(), http.StatusServiceUnavailable)
 		return
 	}
-	if f != nil {
-		f.release()
+	if req.Seed {
+		p.markSeed(hash.String())
 	}
 	w.WriteHeader(http.StatusAccepted)
+	go func() {
+		defer p.wg.Done()
+		p.pullFile(hash.String())
+	}()
+}
+
+// pullFile makes the file complete here within PullTimeout; a failure is logged unless the peer is closing.
+func (p *Peer) pullFile(hash string) {
+	ctx, cancel := context.WithTimeout(p.ctx, p.cfg.PullTimeout)
+	defer cancel()
+	if err := p.st.pullFile(ctx, hash); err != nil && p.ctx.Err() == nil {
+		slog.Warn("peer: pull file", "hash", hash, "err", err)
+	}
+}
+
+// serveShard answers a peer fetching the shard of a file this peer knows, with the offsets of every xorb it references.
+func (p *Peer) serveShard(w http.ResponseWriter, r *http.Request) {
+	sw := &statusWriter{ResponseWriter: w}
+	defer func() { p.metrics.shardGet(cmp.Or(sw.code, http.StatusOK)) }()
+	w = sw
+	if !apis.Authorize(w, r, p.cfg.Secret) {
+		return
+	}
+	hash, err := xet.ParseFileHash(r.PathValue("hash"))
+	if err != nil {
+		http.Error(w, "invalid file hash", http.StatusBadRequest)
+		return
+	}
+	resp, err := p.st.shardResponse(r.Context(), hash)
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		http.NotFound(w, r)
+		return
+	case err != nil:
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(resp)
 }
 
 func statusOf(err error) int {

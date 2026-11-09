@@ -107,3 +107,11 @@ func TestXorbURL(t *testing.T) {
 		t.Errorf("XorbURL(%q, %q) = %q, want %q", "http://g:1", "abc", got, want)
 	}
 }
+
+func TestShardURL(t *testing.T) {
+	t.Parallel()
+	got := ShardURL("http://p:1", "abc")
+	if want := "http://p:1/xet-pd/v1/shards/abc"; got != want || got != "http://p:1"+ShardPathPrefix+"abc" {
+		t.Errorf("ShardURL(%q, %q) = %q, want %q", "http://p:1", "abc", got, want)
+	}
+}

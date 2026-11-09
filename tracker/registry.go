@@ -46,10 +46,23 @@ func (r *registry) announce(req apis.AnnounceRequest) (apis.AnnounceResponse, []
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	changed := map[string]struct{}{}
+	// forget drops sha's entry for file once no live peer holds file.
+	forget := func(file, sha string) {
+		if r.sha256s[sha] != file {
+			return
+		}
+		for _, q := range r.peers {
+			if _, ok := q.files[file]; ok && now.Before(q.expiry) {
+				return
+			}
+		}
+		delete(r.sha256s, sha)
+	}
 	drop := func(p *peerState) {
 		delete(r.peers, p.ID)
-		for f := range p.files {
+		for f, sha := range p.files {
 			changed[f] = struct{}{}
+			forget(f, sha)
 		}
 	}
 	for _, p := range r.peers {
@@ -88,7 +101,9 @@ func (r *registry) announce(req apis.AnnounceRequest) (apis.AnnounceResponse, []
 		p.files[f.Hash] = f.SHA256
 	}
 	for _, h := range req.RemoveFiles {
+		sha := p.files[h]
 		delete(p.files, h)
+		forget(h, sha)
 	}
 	for _, f := range req.AddFiles {
 		if p.files[f.Hash] == f.SHA256 {

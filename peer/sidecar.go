@@ -50,26 +50,31 @@ func (c sidecar) read(hash xet.XorbHash) ([]uint64, error) {
 	if err == nil {
 		err = json.Unmarshal(data, &offsets)
 	}
-	// Accept what a footer read would: a bounded count, each end within the packed cap and at least a header past the previous.
-	if err == nil && len(offsets) > xet.MaxChunksPerXorb {
-		err = fmt.Errorf("%d chunk offsets exceed %d", len(offsets), xet.MaxChunksPerXorb)
-	}
-	prev := uint64(0)
-	for _, off := range offsets {
-		if err != nil {
-			break
-		}
-		if off > apis.MaxXorbBytes {
-			err = fmt.Errorf("chunk offset %d exceeds %d", off, apis.MaxXorbBytes)
-		} else if off < prev || off-prev < minChunkBytes {
-			err = fmt.Errorf("chunk offset %d does not follow %d", off, prev)
-		}
-		prev = off
+	if err == nil {
+		err = checkOffsets(offsets)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("offsets sidecar of xorb %s: %w", hash, err)
 	}
 	return offsets, nil
+}
+
+// checkOffsets accepts what a footer read would: a bounded, non-empty count, each end within the packed cap and at least a header past the previous.
+func checkOffsets(offsets []uint64) error {
+	if len(offsets) == 0 || len(offsets) > xet.MaxChunksPerXorb {
+		return fmt.Errorf("%d chunk offsets, want 1 to %d", len(offsets), xet.MaxChunksPerXorb)
+	}
+	prev := uint64(0)
+	for _, off := range offsets {
+		if off > apis.MaxXorbBytes {
+			return fmt.Errorf("chunk offset %d exceeds %d", off, apis.MaxXorbBytes)
+		}
+		if off < prev || off-prev < minChunkBytes {
+			return fmt.Errorf("chunk offset %d does not follow %d", off, prev)
+		}
+		prev = off
+	}
+	return nil
 }
 
 func (c sidecar) write(hash xet.XorbHash, offsets []uint64) error {

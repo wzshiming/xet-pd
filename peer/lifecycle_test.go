@@ -110,6 +110,21 @@ func TestStartupDropsCorruptObject(t *testing.T) {
 	}
 }
 
+func TestStartupSkipsUndecodableShard(t *testing.T) {
+	dir := t.TempDir()
+	tf := makeFile(t, 54)
+	st := newTestStore(t, dir, "http://tracker.test")
+	ingest(t, st, tf)
+	if err := os.WriteFile(localShardPath(t, st, tf.hash), []byte("garbage"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	tracker := clustertest.NewFakeTracker(t)
+	newTestPeer(t, tracker.URL, func(c *Config) { c.DataDir, c.Heartbeat = dir, time.Hour })
+	if got := tracker.Announce(t, 0).Req; !got.Full || !slices.Equal(got.Add, hashes(tf.xorbHashes()...)) {
+		t.Fatalf("startup announce = %+v, want the stored %v", got, tf.xorbHashes())
+	}
+}
+
 func TestPullEntersInventoryOnlyAfterValidation(t *testing.T) {
 	hash, body := clustertest.MakeXorb(t, 24, 4, 16<<10)
 	release := make(chan struct{})
@@ -359,7 +374,7 @@ func TestAnnounceNeverFollowsRedirects(t *testing.T) {
 }
 
 func TestAnnounceRejectsMalformedReply(t *testing.T) {
-	pad := strings.Repeat(" ", maxReplyBytes-len(`{"ttl":30}`))
+	pad := strings.Repeat(" ", apis.MaxReplyBytes-len(`{"ttl":30}`))
 	replies := []string{
 		`{"ttl":30}{}`,                    // trailing value
 		`{"ttl":`,                         // truncated

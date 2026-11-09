@@ -104,16 +104,13 @@ func (p *Peer) serveXorb(w http.ResponseWriter, r *http.Request) {
 	serveContent(w, r, hash, rs)
 }
 
-// maxPullBytes bounds one pull body, which names a single xorb.
-const maxPullBytes = 4096
-
 // servePull starts (or joins) a pull on behalf of the gateway and answers 202 at once.
 func (p *Peer) servePull(w http.ResponseWriter, r *http.Request) {
 	if !apis.Authorize(w, r, p.cfg.Secret) {
 		return
 	}
 	var req apis.PullRequest
-	if !apis.ReadJSON(w, r, maxPullBytes, &req) {
+	if !apis.ReadJSON(w, r, apis.MaxReplyBytes, &req) {
 		return
 	}
 	hash, err := xet.ParseXorbHash(req.Hash)

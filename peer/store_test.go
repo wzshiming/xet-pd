@@ -6,13 +6,16 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"io/fs"
 	"maps"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -322,6 +325,15 @@ func TestShardOfAnotherSHA256IsRefused(t *testing.T) {
 	}
 }
 
+func TestGetFileHashBySHA256WithoutHolderNamesTheSHA256(t *testing.T) {
+	st := newTestStore(t, t.TempDir(), newTracker(t).URL)
+	digest := sha256.Sum256([]byte("held by nobody"))
+	_, err := st.GetFileHashBySHA256(context.Background(), digest)
+	if sha := hex.EncodeToString(digest[:]); !errors.Is(err, fs.ErrNotExist) || !strings.Contains(err.Error(), sha) {
+		t.Fatalf("GetFileHashBySHA256 of a SHA-256 nobody holds = %v, want fs.ErrNotExist naming %s", err, sha)
+	}
+}
+
 func TestGetShardNeedsEveryXorbLocalOrHeld(t *testing.T) {
 	tracker := newTracker(t)
 	st := newTestStore(t, t.TempDir(), tracker.URL)
@@ -415,6 +427,30 @@ func TestInventoryListsLocalXorbsAndKnownFilesAcrossReopen(t *testing.T) {
 		if !maps.EqualFunc(gotFiles, wantFiles, slices.Equal[[]xet.XorbHash]) {
 			t.Fatalf("open %d: inventory files = %v, want %v", i, gotFiles, wantFiles)
 		}
+	}
+}
+
+func TestInventorySkipsUndecodableLocalShard(t *testing.T) {
+	st := newTestStore(t, t.TempDir(), "http://tracker.test")
+	intact, broken := makeFile(t, 52), makeFile(t, 53)
+	ingest(t, st, intact)
+	ingest(t, st, broken)
+	if err := os.WriteFile(localShardPath(t, st, broken.hash), []byte("garbage"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	warned := captureWarnings(t)
+	xorbs, files, err := st.inventory(context.Background())
+	if err != nil {
+		t.Fatalf("inventory with an undecodable local shard = %v", err)
+	}
+	if len(files) != 1 || files[0].File != intact.file {
+		t.Fatalf("inventory files = %+v, want only %+v", files, intact.file)
+	}
+	if len(xorbs) != len(intact.xorbs)+len(broken.xorbs) {
+		t.Fatalf("inventory lists %d xorbs, want all %d local ones", len(xorbs), len(intact.xorbs)+len(broken.xorbs))
+	}
+	if lines := warned.lines(); len(lines) != 1 {
+		t.Fatalf("warnings = %q, want one", lines)
 	}
 }
 
@@ -521,6 +557,49 @@ func TestPullWithEveryHolderFailingCoolsDown(t *testing.T) {
 	}
 }
 
+func TestPullSkipsHolderStalledBeforeFirstByte(t *testing.T) {
+	tracker := newTracker(t)
+	hash, body := clustertest.MakeXorb(t, 50, 2, 8<<10)
+	stalled, serving := newHolder(t, "stalled"), newHolder(t, "serving")
+	stalled.GateXorb(hash, body, 0, make(chan struct{}))
+	serving.ServeXorb(hash, body)
+	tracker.Hold(stalled.Peer(), hash)
+	tracker.Hold(serving.Peer(), hash)
+	st := newTestStore(t, t.TempDir(), tracker.URL)
+	st.cfg.PullTimeout, st.cfg.FirstByteTimeout = 5*time.Second, 500*time.Millisecond
+	rs, err := st.GetXorbReadSeekCloser(context.Background(), hash)
+	if err != nil {
+		t.Fatalf("read past a holder sending no byte = %v", err)
+	}
+	got, err := io.ReadAll(rs)
+	_ = rs.Close()
+	if err != nil || !bytes.Equal(got, body) {
+		t.Fatalf("read past a holder sending no byte = %d bytes, %v, want %d", len(got), err, len(body))
+	}
+	if a, b := len(stalled.Requests()), len(serving.Requests()); a != 1 || b != 1 {
+		t.Fatalf("xorb GETs: stalled %d, serving %d, want 1 each", a, b)
+	}
+}
+
+func TestPullWithEveryHolderStallingCoolsDown(t *testing.T) {
+	tracker := newTracker(t)
+	hash, body := clustertest.MakeXorb(t, 51, 2, 8<<10)
+	for _, id := range []string{"stalled1", "stalled2"} {
+		h := newHolder(t, id)
+		h.GateXorb(hash, body, 0, make(chan struct{}))
+		tracker.Hold(h.Peer(), hash)
+	}
+	st := newTestStore(t, t.TempDir(), tracker.URL)
+	st.cfg.PullTimeout, st.cfg.FirstByteTimeout = 5*time.Second, 500*time.Millisecond
+	ctx := context.Background()
+	if _, err := st.GetXorbReadSeekCloser(ctx, hash); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("read with every holder sending no byte = %v, want fs.ErrNotExist", err)
+	}
+	if _, err := st.GetXorbReadSeekCloser(ctx, hash); err == nil || len(tracker.Lookups()) != 1 {
+		t.Fatalf("read in the cooldown = %v after %d lookups, want an error and still 1 lookup", err, len(tracker.Lookups()))
+	}
+}
+
 func TestPullTriesAtMostThreeHolders(t *testing.T) {
 	tracker := newTracker(t)
 	hash, _ := clustertest.MakeXorb(t, 24, 2, 8<<10)
@@ -570,6 +649,46 @@ func TestConcurrentRemoteReadersShareOneGet(t *testing.T) {
 	}
 }
 
+func TestSidecarReadAcceptsOnlyFooterLikeOffsets(t *testing.T) {
+	st := newTestStore(t, t.TempDir(), "http://tracker.test")
+	hash, _ := clustertest.MakeXorb(t, 32, 1, 4<<10)
+	if err := os.MkdirAll(filepath.Dir(sidecarPath(st, hash)), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	many := make([]string, xet.MaxChunksPerXorb+1)
+	for i := range many {
+		many[i] = strconv.Itoa(8 * (i + 1))
+	}
+	for name, tc := range map[string]struct {
+		data string
+		want []uint64 // what read returns; nil when it must fail
+	}{
+		"valid":                 {"[8,16,4096]", []uint64{8, 16, 4096}},
+		"empty":                 {"[]", nil},
+		"not JSON":              {"garbage", nil},
+		"two values":            {"[8] [16]", nil},
+		"first within a header": {"[7]", nil},
+		"step within a header":  {"[8,15]", nil},
+		"decreasing":            {"[16,8]", nil},
+		"beyond the xorb cap":   {fmt.Sprintf("[%d]", apis.MaxXorbBytes+1), nil},
+		"too many":              {"[" + strings.Join(many, ",") + "]", nil},
+		"too long":              {"[8]" + strings.Repeat(" ", maxSidecarBytes), nil},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := os.WriteFile(sidecarPath(st, hash), []byte(tc.data), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			got, err := sidecarOffsets(st, hash)
+			if tc.want == nil && err == nil {
+				t.Fatalf("read of %.40q = %v, want an error", tc.data, got)
+			}
+			if tc.want != nil && (err != nil || !slices.Equal(got, tc.want)) {
+				t.Fatalf("read of %.40q = %v, %v, want %v", tc.data, got, err, tc.want)
+			}
+		})
+	}
+}
+
 func TestChunkOffsetsComeFromSidecarBeforeAnyPull(t *testing.T) {
 	tracker, holder := newTracker(t), newHolder(t, "holder")
 	tf := makeFile(t, 26)
@@ -601,6 +720,143 @@ func TestChunkOffsetsOfUnknownXorbPullIt(t *testing.T) {
 	}
 	if !bytes.Equal(localBytes(t, st, hash), body) || len(holder.Requests()) != 1 {
 		t.Fatalf("after GetXorbChunkOffsets: %d holder GETs, want 1 and the xorb local", len(holder.Requests()))
+	}
+}
+
+func TestInvalidHolderOffsetsAreNotPersisted(t *testing.T) {
+	for name, bad := range map[string][]uint64{"decreasing": {16, 8}, "empty": {}} {
+		t.Run(name, func(t *testing.T) {
+			tracker, holder := newTracker(t), newHolder(t, "holder")
+			tf := makeFile(t, 41)
+			h := tf.xorbHashes()[0]
+			holder.ServeShard(tf.file, apis.ShardResponse{Shard: tf.resp.Shard, Offsets: map[string][]uint64{h.String(): bad}})
+			holder.ServeXorb(h, tf.xorbs[h])
+			tracker.HoldFile(holder.Peer(), tf.file)
+			tracker.Hold(holder.Peer(), h)
+			st := newTestStore(t, t.TempDir(), tracker.URL)
+			ctx := context.Background()
+			if _, err := st.GetFileHashBySHA256(ctx, digestOf(t, tf.file)); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := os.Stat(sidecarPath(st, h)); !errors.Is(err, fs.ErrNotExist) {
+				t.Fatalf("sidecar after a shard offering offsets %v: %v, want none", bad, err)
+			}
+			if got, err := st.GetXorbChunkOffsets(ctx, h); err != nil || !slices.Equal(got, tf.resp.Offsets[h.String()]) {
+				t.Fatalf("GetXorbChunkOffsets = %v, %v, want the pulled xorb's %v", got, err, tf.resp.Offsets[h.String()])
+			}
+			if n := len(holder.Requests()); n != 2 {
+				t.Fatalf("holder requests = %d, want the shard GET and one xorb GET", n)
+			}
+		})
+	}
+}
+
+func TestFetchedShardWritesOffsetsOnlyForItsXorbs(t *testing.T) {
+	tracker, holder := newTracker(t), newHolder(t, "holder")
+	own, remote := makeFile(t, 45), makeFile(t, 46)
+	ownX := own.xorbHashes()[0]
+	stray, _ := clustertest.MakeXorb(t, 47, 1, 4<<10)
+	resp := apis.ShardResponse{Shard: remote.resp.Shard, Offsets: maps.Clone(remote.resp.Offsets)}
+	resp.Offsets[ownX.String()], resp.Offsets[stray.String()] = []uint64{100, 200, 300}, []uint64{100, 200, 300}
+	holder.ServeShard(remote.file, resp)
+	tracker.HoldFile(holder.Peer(), remote.file)
+	st := newTestStore(t, t.TempDir(), tracker.URL)
+	ingest(t, st, own)
+	if _, err := st.GetFileHashBySHA256(context.Background(), digestOf(t, remote.file)); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := sidecarOffsets(st, ownX); err != nil || !slices.Equal(got, own.resp.Offsets[ownX.String()]) {
+		t.Fatalf("sidecar of the stored %s = %v, %v, want its own %v", ownX, got, err, own.resp.Offsets[ownX.String()])
+	}
+	if _, err := os.Stat(sidecarPath(st, stray)); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("sidecar of %s, which the shard does not reference: %v, want none", stray, err)
+	}
+}
+
+func TestFetchedShardKeepsLocalOffsetsOfItsXorbs(t *testing.T) {
+	for name, evict := range map[string]bool{"local bytes": false, "sidecar only": true} {
+		t.Run(name, func(t *testing.T) {
+			tracker, holder := newTracker(t), newHolder(t, "holder")
+			tf := makeFile(t, 48)
+			h := tf.xorbHashes()[0]
+			holder.ServeShard(tf.file, apis.ShardResponse{Shard: tf.resp.Shard, Offsets: map[string][]uint64{h.String(): {100, 200, 300}}})
+			tracker.HoldFile(holder.Peer(), tf.file)
+			st := newTestStore(t, t.TempDir(), tracker.URL)
+			ctx := context.Background()
+			if _, err := st.PutXorb(ctx, h, bytes.NewReader(tf.xorbs[h])); err != nil {
+				t.Fatal(err)
+			}
+			if evict {
+				if err := st.DeleteXorb(ctx, h); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := st.GetFileHashBySHA256(ctx, digestOf(t, tf.file)); err != nil {
+				t.Fatal(err)
+			}
+			if got, err := sidecarOffsets(st, h); err != nil || !slices.Equal(got, tf.resp.Offsets[h.String()]) {
+				t.Fatalf("sidecar = %v, %v, want the offsets recorded here %v", got, err, tf.resp.Offsets[h.String()])
+			}
+		})
+	}
+}
+
+func TestFetchedShardWritesOffsetsUnderWriterLock(t *testing.T) {
+	tracker, holder := newTracker(t), newHolder(t, "holder")
+	tf := makeFile(t, 49)
+	h := tf.xorbHashes()[0]
+	holder.ServeShard(tf.file, tf.resp)
+	tracker.HoldFile(holder.Peer(), tf.file)
+	st := newTestStore(t, t.TempDir(), tracker.URL)
+	unlock := st.lockWriter(h)
+	done := make(chan error, 1)
+	go func() {
+		_, err := st.GetFileHashBySHA256(context.Background(), digestOf(t, tf.file))
+		done <- err
+	}()
+	clustertest.WaitFor(t, clustertest.WaitTimeout, "the fetch to wait for the writer of "+h.String(), func() bool {
+		st.mu.Lock()
+		defer st.mu.Unlock()
+		return st.writers[h] != nil && st.writers[h].users == 2
+	})
+	if _, err := os.Stat(sidecarPath(st, h)); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("sidecar while another writer holds %s: %v, want none yet", h, err)
+	}
+	unlock()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if got, err := sidecarOffsets(st, h); err != nil || !slices.Equal(got, tf.resp.Offsets[h.String()]) {
+		t.Fatalf("sidecar after the writer left = %v, %v, want the holder's %v", got, err, tf.resp.Offsets[h.String()])
+	}
+}
+
+func TestChunkOffsetsPullPastUnusableSidecar(t *testing.T) {
+	for name, data := range map[string]string{"not JSON": "garbage", "decreasing": "[16,8]", "empty": "[]"} {
+		t.Run(name, func(t *testing.T) {
+			tracker, holder := newTracker(t), newHolder(t, "holder")
+			hash, body := clustertest.MakeXorb(t, 42, 3, 8<<10)
+			holder.ServeXorb(hash, body)
+			tracker.Hold(holder.Peer(), hash)
+			st := newTestStore(t, t.TempDir(), tracker.URL)
+			if err := os.MkdirAll(filepath.Dir(sidecarPath(st, hash)), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(sidecarPath(st, hash), []byte(data), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			warned := captureWarnings(t)
+			want, _ := storage.ReadXorbChunkOffsets(bytes.NewReader(body))
+			if got, err := st.GetXorbChunkOffsets(context.Background(), hash); err != nil || !slices.Equal(got, want) {
+				t.Fatalf("GetXorbChunkOffsets past a sidecar of %q = %v, %v, want the pulled xorb's %v", data, got, err, want)
+			}
+			if n := len(holder.Requests()); n != 1 {
+				t.Fatalf("holder requests = %d, want one xorb GET", n)
+			}
+			if lines := warned.lines(); len(lines) != 1 || !strings.Contains(lines[0], hash.String()) {
+				t.Fatalf("warnings = %q, want one naming %s", lines, hash)
+			}
+		})
 	}
 }
 

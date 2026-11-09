@@ -2,12 +2,14 @@ package peer
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"io/fs"
+	"log/slog"
 	"net/http"
 	"path/filepath"
 	"slices"
@@ -33,6 +35,8 @@ type storeConfig struct {
 	MaxPulls    int
 	PullTimeout time.Duration
 	Metrics     *peerMetrics
+
+	FirstByteTimeout time.Duration // per holder of a pull, the wait for its response and first byte; zero takes firstByteTimeout
 }
 
 // store is the peer's storage.Storage: local bytes first, then shards and xorbs of the holders the tracker names.
@@ -89,6 +93,7 @@ func newStore(cfg storeConfig) (*store, error) {
 	if err != nil {
 		return nil, err
 	}
+	cfg.FirstByteTimeout = cmp.Or(cfg.FirstByteTimeout, firstByteTimeout)
 	ctx, cancel := context.WithCancel(context.Background())
 	return &store{
 		Storage: st, cfg: cfg, fetch: fetcher{client: cfg.Client, self: cfg.Self.ID}, sidecar: sc, shards: shards,
@@ -259,6 +264,9 @@ func (s *store) GetFileHashBySHA256(ctx context.Context, digest [32]byte) (xet.F
 		return xet.FileHash{}, err
 	}
 	loc := resp.SHA256s[sha]
+	if len(loc.Peers) == 0 {
+		return xet.FileHash{}, fmt.Errorf("no holder of a file with sha256 %s: %w", sha, fs.ErrNotExist)
+	}
 	if _, err := s.fetchShard(ctx, apis.File{Hash: loc.Hash, SHA256: sha}, loc.Peers); err != nil {
 		return xet.FileHash{}, err
 	}
@@ -279,7 +287,7 @@ func (s *store) GetShardByChunkHash(context.Context, xet.ChunkHash) (*shard.Shar
 	return nil, fmt.Errorf("chunk dedup disabled: %w", fs.ErrNotExist)
 }
 
-// fetchShard keeps the first shard describing file that one of its best holders serves: cached, its offsets in the sidecar, its files reported.
+// fetchShard keeps the first shard describing file that one of its best holders serves: cached, the valid offsets of its xorbs lacking local ones in the sidecar, its files reported.
 func (s *store) fetchShard(ctx context.Context, file apis.File, holders []apis.Peer) (*shard.Shard, error) {
 	for _, p := range holders[:min(len(holders), holderAttempts)] {
 		resp, err := s.fetch.shard(ctx, p, s.cfg.Secret, file.Hash)
@@ -293,13 +301,22 @@ func (s *store) fetchShard(ctx context.Context, file apis.File, holders []apis.P
 		if err := s.shards.add(resp.Shard, sh); err != nil {
 			return nil, err
 		}
-		for h, offsets := range resp.Offsets {
-			hash, err := xet.ParseXorbHash(h)
-			if err != nil {
-				continue
-			}
-			if err := s.sidecar.write(hash, offsets); err != nil {
-				return nil, err
+		for i := range sh.Files {
+			for _, h := range xorbsOf(&sh.Files[i]) {
+				offsets := resp.Offsets[h.String()]
+				if checkOffsets(offsets) != nil {
+					continue
+				}
+				unlock := s.lockWriter(h)
+				// Offsets recorded from bytes this peer stored outrank a holder's.
+				_, err := s.localOffsets(ctx, h)
+				if err != nil {
+					err = s.sidecar.write(h, offsets)
+				}
+				unlock()
+				if err != nil {
+					return nil, err
+				}
 			}
 		}
 		s.report(sh)
@@ -327,11 +344,17 @@ func (s *store) localOffsets(ctx context.Context, hash xet.XorbHash) ([]uint64, 
 	return s.sidecar.read(hash)
 }
 
-// GetXorbChunkOffsets answers from the local bytes or the sidecar, else pulls the xorb and answers from what the pull recorded.
+// GetXorbChunkOffsets answers from the local bytes or a valid sidecar, else pulls the xorb and answers from what the pull recorded.
 func (s *store) GetXorbChunkOffsets(ctx context.Context, hash xet.XorbHash) ([]uint64, error) {
-	offsets, err := s.localOffsets(ctx, hash)
+	offsets, err := s.Storage.GetXorbChunkOffsets(ctx, hash)
 	if err == nil || !errors.Is(err, fs.ErrNotExist) {
 		return offsets, err
+	}
+	if offsets, err = s.sidecar.read(hash); err == nil {
+		return offsets, nil
+	}
+	if !errors.Is(err, fs.ErrNotExist) {
+		slog.Warn("peer: ignoring unusable offsets sidecar", "hash", hash, "err", err)
 	}
 	f, err := s.acquire(hash, false)
 	if f != nil {
@@ -393,7 +416,7 @@ type fileEntry struct {
 	Xorbs []xet.XorbHash
 }
 
-// inventory lists the local xorbs oldest first and, once each, the files a local or cached shard describes.
+// inventory lists the local xorbs oldest first and, once each, the files a local or cached shard describes; a local shard that fails to load is skipped.
 func (s *store) inventory(ctx context.Context) ([]inventory.Xorb, []fileEntry, error) {
 	xorbs, err := inventory.Scan(ctx, s.Storage)
 	if err != nil {
@@ -421,11 +444,11 @@ func (s *store) inventory(ctx context.Context) ([]inventory.Xorb, []fileEntry, e
 	}
 	for shardHash, hashes := range indexed {
 		sh, err := s.LoadShard(ctx, shardHash)
-		if errors.Is(err, fs.ErrNotExist) {
-			continue
-		}
 		if err != nil {
-			return nil, nil, err
+			if !errors.Is(err, fs.ErrNotExist) {
+				slog.Warn("peer: skipping unusable local shard", "shard", shardHash, "err", err)
+			}
+			continue
 		}
 		add(sh, hashes)
 	}

@@ -3,12 +3,16 @@ package peer
 import (
 	"bytes"
 	"context"
+	"log"
+	"log/slog"
 	"path/filepath"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 
 	"github.com/wzshiming/xet"
+	"github.com/wzshiming/xet/storage"
 
 	"github.com/wzshiming/xet-pd/apis"
 	"github.com/wzshiming/xet-pd/internal/clustertest"
@@ -213,3 +217,51 @@ func (ev *storeEvents) idleCount() int {
 func sidecarPath(st *store, hash xet.XorbHash) string { return st.sidecar.path(hash) }
 
 func sidecarOffsets(st *store, hash xet.XorbHash) ([]uint64, error) { return st.sidecar.read(hash) }
+
+// localShardPath is where st keeps the shard its file index names for fileHash.
+func localShardPath(t *testing.T, st *store, fileHash xet.FileHash) string {
+	t.Helper()
+	var name string
+	err := st.WalkFileIndex(context.Background(), func(f, shardHash string) error {
+		if f == fileHash.String() {
+			name = shardHash
+		}
+		return nil
+	})
+	if err != nil || name == "" {
+		t.Fatalf("no indexed shard of file %s: %v", fileHash, err)
+	}
+	return filepath.Join(st.cfg.Dir, "data", filepath.FromSlash(storage.ObjectKey("shards", name)))
+}
+
+// warnings collects what slog logs at warning level and above.
+type warnings struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (w *warnings) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.buf.Write(p)
+}
+
+func (w *warnings) lines() []string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return slices.Collect(strings.Lines(w.buf.String()))
+}
+
+// captureWarnings routes slog, and the log package output it takes over, to the result until the test ends.
+func captureWarnings(t *testing.T) *warnings {
+	t.Helper()
+	w := &warnings{}
+	prev, out, flags := slog.Default(), log.Writer(), log.Flags()
+	slog.SetDefault(slog.New(slog.NewTextHandler(w, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	t.Cleanup(func() {
+		slog.SetDefault(prev)
+		log.SetOutput(out)
+		log.SetFlags(flags)
+	})
+	return w
+}

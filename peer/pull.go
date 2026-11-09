@@ -20,10 +20,14 @@ import (
 
 const failedCooldown = 15 * time.Second
 
+// firstByteTimeout bounds a holder's response and first xorb byte as apis.NewTransport bounds response headers.
+const firstByteTimeout = 30 * time.Second
+
 var (
 	errNotFound = fmt.Errorf("no holder served the xorb: %w", fs.ErrNotExist)
 	errClosed   = errors.New("peer closed")
 	errEmpty    = errors.New("empty xorb")
+	errStalled  = errors.New("no xorb byte within the first-byte timeout")
 )
 
 // pull downloads one xorb from a holder into a spool, validates it into the store and serves attached readers meanwhile.
@@ -143,8 +147,12 @@ func (f *pull) download(ctx context.Context) error {
 	return failed
 }
 
-// spool streams the copy of holder p into the spool, opened on its first byte, and returns how many bytes it took.
+// spool streams the copy of holder p into the spool, opened on its first byte, and returns how many bytes it took; p fails with errStalled unless that byte arrives within FirstByteTimeout.
 func (f *pull) spool(ctx context.Context, p apis.Peer) (int64, error) {
+	ctx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+	stall := time.AfterFunc(f.s.cfg.FirstByteTimeout, func() { cancel(errStalled) })
+	defer stall.Stop()
 	body, length, err := f.s.fetch.xorb(ctx, p, f.hash)
 	if err != nil {
 		return 0, err
@@ -159,6 +167,9 @@ func (f *pull) spool(ctx context.Context, p apis.Peer) (int64, error) {
 			err = errEmpty
 		}
 		return 0, err
+	}
+	if !stall.Stop() {
+		return 0, errStalled
 	}
 	f.open(length)
 	n, err := io.Copy(f.stream.Writer(), io.LimitReader(br, apis.MaxXorbBytes+1))

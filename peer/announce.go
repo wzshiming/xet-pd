@@ -12,10 +12,7 @@ import (
 	"github.com/wzshiming/xet-pd/apis"
 )
 
-const (
-	announceTimeout = 5 * time.Second
-	maxReplyBytes   = 4096
-)
+const announceTimeout = 5 * time.Second
 
 // announcer reconciles the gateway's view with the inventory.
 type announcer struct {
@@ -121,7 +118,7 @@ func (a *announcer) post(req apis.AnnounceRequest) (apis.AnnounceResponse, error
 	if resp.StatusCode/100 != 2 {
 		return out, fmt.Errorf("gateway status %s", resp.Status)
 	}
-	if derr := apis.DecodeJSON(resp.Body, maxReplyBytes, &out); derr != nil {
+	if derr := apis.DecodeJSON(resp.Body, apis.MaxReplyBytes, &out); derr != nil {
 		return out, fmt.Errorf("gateway reply: %w", derr)
 	}
 	return out, nil

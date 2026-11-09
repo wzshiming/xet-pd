@@ -768,7 +768,7 @@ func TestPullAndLocalOnlyRelay(t *testing.T) {
 	if code := pull("Bearer s3cret", payload+`{}`); code != http.StatusBadRequest {
 		t.Fatalf("pull with trailing data = %d", code)
 	}
-	if code := pull("Bearer s3cret", payload+strings.Repeat(" ", maxPullBytes+1-len(payload))); code != http.StatusRequestEntityTooLarge {
+	if code := pull("Bearer s3cret", payload+strings.Repeat(" ", apis.MaxReplyBytes+1-len(payload))); code != http.StatusRequestEntityTooLarge {
 		t.Fatalf("pull over the body limit = %d, want 413", code)
 	}
 	if n, m := len(holder.Requests()), len(tracker.Lookups()); n != 0 || m != 0 {

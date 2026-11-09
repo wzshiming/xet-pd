@@ -339,6 +339,30 @@ func TestSHA256MapsToFile(t *testing.T) {
 	}
 }
 
+// A SHA-256 stops naming a file once no live peer holds the file, so the file announced again under another one is not found by it.
+func TestSHA256OfUnheldFileIsForgotten(t *testing.T) {
+	f := testFile(1)
+	for name, unhold := range map[string]func(r *registry, now *time.Time){
+		"RemoveFiles": func(r *registry, _ *time.Time) {
+			r.announce(apis.AnnounceRequest{Peer: testPeer(1), Epoch: "e", RemoveFiles: []string{f.Hash}})
+		},
+		"expiry": func(r *registry, now *time.Time) {
+			*now = now.Add(time.Minute)
+			r.announce(filesReq(testPeer(2), "e"))
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			r, now := clockedRegistry(time.Minute)
+			r.announce(filesReq(testPeer(1), "e", f))
+			unhold(r, now)
+			r.announce(filesReq(testPeer(2), "e", apis.File{Hash: f.Hash, SHA256: "s9"}))
+			if got := r.lookup(apis.LookupRequest{SHA256s: []string{f.SHA256}}); len(got.SHA256s) != 0 {
+				t.Fatalf("lookup by the SHA-256 of a file no live peer held since = %+v, want it omitted", got)
+			}
+		})
+	}
+}
+
 func TestExpiryRemovesFiles(t *testing.T) {
 	r, now := clockedRegistry(time.Minute)
 	f := testFile(1)

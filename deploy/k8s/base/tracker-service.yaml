@@ -1,16 +1,16 @@
 apiVersion: v1
 kind: Service
 metadata:
-  name: xet-pd-gateway
+  name: xet-pd-tracker
   namespace: xet-pd
   labels:
-    app.kubernetes.io/name: xet-pd-gateway
-    app.kubernetes.io/component: gateway
+    app.kubernetes.io/name: xet-pd-tracker
+    app.kubernetes.io/component: tracker
     app.kubernetes.io/part-of: xet-pd
 spec:
   type: ClusterIP
   selector:
-    app.kubernetes.io/name: xet-pd-gateway
+    app.kubernetes.io/name: xet-pd-tracker
   ports:
     - name: http
       port: 8080

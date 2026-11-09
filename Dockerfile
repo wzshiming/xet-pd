@@ -6,14 +6,14 @@ COPY go.mod go.sum ./
 RUN go mod download
 COPY cmd/ cmd/
 COPY apis/ apis/
-COPY gateway/ gateway/
+COPY tracker/ tracker/
 COPY peer/ peer/
 COPY internal/ internal/
 
 FROM builder AS build
 ARG TARGETOS TARGETARCH
 RUN --mount=type=cache,target=/root/.cache/go-build \
-    GOOS=$TARGETOS GOARCH=$TARGETARCH go build -ldflags='-s -w' -o /out/ ./cmd/gateway ./cmd/peer
+    GOOS=$TARGETOS GOARCH=$TARGETARCH go build -ldflags='-s -w' -o /out/ ./cmd/tracker ./cmd/peer
 
 FROM alpine:3.22 AS runtime
 RUN apk add --no-cache ca-certificates \
@@ -23,9 +23,9 @@ USER xet-pd
 WORKDIR /data
 VOLUME /data
 
-FROM runtime AS gateway
-COPY --from=build /out/gateway /usr/local/bin/gateway
-ENTRYPOINT ["/usr/local/bin/gateway"]
+FROM runtime AS tracker
+COPY --from=build /out/tracker /usr/local/bin/tracker
+ENTRYPOINT ["/usr/local/bin/tracker"]
 
 FROM runtime AS peer
 COPY --from=build /out/peer /usr/local/bin/peer

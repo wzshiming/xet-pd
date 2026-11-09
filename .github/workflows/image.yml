@@ -22,7 +22,7 @@ jobs:
     timeout-minutes: 30
     strategy:
       matrix:
-        component: [gateway, peer]
+        component: [tracker, peer]
     steps:
       - uses: actions/checkout@v7
       # Go cross-compiles, but the runtime stage's apk and adduser still run as arm64.

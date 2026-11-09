@@ -400,7 +400,7 @@ func (s *store) inventory(ctx context.Context) ([]inventory.Xorb, []fileEntry, e
 		return nil, nil, err
 	}
 	indexed := map[string][]xet.FileHash{}
-	err = s.Storage.WalkFileIndex(ctx, func(fileHash, shardHash string) error {
+	err = s.WalkFileIndex(ctx, func(fileHash, shardHash string) error {
 		if fh, err := xet.ParseFileHash(fileHash); err == nil {
 			indexed[shardHash] = append(indexed[shardHash], fh)
 		}
@@ -420,7 +420,7 @@ func (s *store) inventory(ctx context.Context) ([]inventory.Xorb, []fileEntry, e
 		}
 	}
 	for shardHash, hashes := range indexed {
-		sh, err := s.Storage.LoadShard(ctx, shardHash)
+		sh, err := s.LoadShard(ctx, shardHash)
 		if errors.Is(err, fs.ErrNotExist) {
 			continue
 		}

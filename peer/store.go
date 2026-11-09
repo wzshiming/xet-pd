@@ -64,6 +64,7 @@ type store struct {
 	onRead   func(hash xet.XorbHash)                            // a local copy was opened
 	onFile   func(file apis.File, xorbs []xet.XorbHash)         // a shard describing file was stored
 	onIdle   func()                                             // some xorb lost its last pin
+	onLost   func(hash xet.XorbHash)                            // a read of hash found no local bytes
 }
 
 // writerLock serializes the writers of one xorb's local bytes and sidecar.
@@ -513,6 +514,9 @@ func (s *store) GetXorbReadSeekCloser(ctx context.Context, hash xet.XorbHash) (i
 	rs, err := s.Storage.GetXorbReadSeekCloser(ctx, hash)
 	var f *pull
 	if errors.Is(err, fs.ErrNotExist) {
+		if s.onLost != nil {
+			s.onLost(hash)
+		}
 		if f, err = s.acquire(hash, false); err == nil && f == nil {
 			rs, err = s.Storage.GetXorbReadSeekCloser(ctx, hash) // committed meanwhile
 		}

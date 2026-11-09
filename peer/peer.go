@@ -74,13 +74,19 @@ type Peer struct {
 	ann     *announcer
 	metrics *peerMetrics
 
+	evictions chan struct{} // coalesced eviction wake signal
+
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 	once   sync.Once
 
-	mu    sync.Mutex                     // guards xorbs
-	xorbs lru.Index[xet.XorbHash, ready] // committed xorbs
+	mu        sync.Mutex                           // guards xorbs, files, xorbFiles, seeds and warned
+	xorbs     lru.Index[xet.XorbHash, ready]       // committed xorbs
+	files     map[string]fileEntry                 // known files by hash
+	xorbFiles map[xet.XorbHash]map[string]struct{} // hashes of the known files referencing each xorb
+	seeds     map[string]struct{}                  // hashes of the files whose xorbs are seed copies
+	warned    bool                                 // over the cap with nothing evictable, logged once until it fits
 }
 
 // New normalizes cfg, restores the xorbs already in DataDir and starts announcing them to the tracker.
@@ -112,30 +118,35 @@ func New(cfg Config) (*Peer, error) {
 		ctx:     ctx,
 		cancel:  cancel,
 		metrics: metrics,
+
+		evictions: make(chan struct{}, 1),
+		files:     map[string]fileEntry{},
+		xorbFiles: map[xet.XorbHash]map[string]struct{}{},
+		seeds:     map[string]struct{}{},
 	}
 	p.metrics.reg.MustRegister(peerState{p})
 	p.ann = &announcer{p: p, control: client, wake: make(chan struct{}, 1), full: true}
-	st.onStored, st.onRead = p.admit, p.touch
-	st.onIdle = func() {
-		p.mu.Lock()
-		defer p.mu.Unlock()
-		p.evict()
-	}
+	p.ann.minSeeds.Store(1)
+	st.onStored, st.onRead, st.onIdle, st.onFile, st.onLost = p.admit, p.touch, p.retryEviction, p.learn, p.lost
 	p.mux = p.routes()
 	if err := p.restore(); err != nil {
 		cancel()
 		_ = st.Close()
 		return nil, err
 	}
-	p.wg.Add(1)
+	p.wg.Add(2)
 	go func() {
 		defer p.wg.Done()
 		p.ann.run()
 	}()
+	go func() {
+		defer p.wg.Done()
+		p.evictor()
+	}()
 	return p, nil
 }
 
-// Close stops the announcer, cancels in-flight pulls, waits for them and drops idle connections.
+// Close stops the announcer and the evictor, cancels in-flight pulls, waits for them and drops idle connections.
 func (p *Peer) Close() error {
 	p.once.Do(func() {
 		p.cancel()

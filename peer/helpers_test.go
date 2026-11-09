@@ -70,6 +70,30 @@ func admitted(p *Peer, hash xet.XorbHash) func() bool {
 	}
 }
 
+// cachedXorbs lists the xorbs in p's cache, sorted.
+func cachedXorbs(p *Peer) []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	var out []string
+	for e := range p.xorbs.Oldest() {
+		out = append(out, e.Key.String())
+	}
+	slices.Sort(out)
+	return out
+}
+
+// admitStored stores body underneath p without the store's hooks, then admits it as restore does, so no pin is left to release.
+func admitStored(t *testing.T, p *Peer, hash xet.XorbHash, body []byte) {
+	t.Helper()
+	if _, err := p.st.Storage.PutXorb(context.Background(), hash, bytes.NewReader(body)); err != nil {
+		t.Fatal(err)
+	}
+	p.admit(hash, int64(len(body)), true)
+}
+
+// minSeedsOf reads the MinSeeds the announcer took from the tracker's last reply.
+func minSeedsOf(p *Peer) int64 { return p.ann.minSeeds.Load() }
+
 func pinsOf(p *Peer, hash xet.XorbHash) int {
 	p.st.mu.Lock()
 	defer p.st.mu.Unlock()
@@ -250,6 +274,17 @@ func (w *warnings) lines() []string {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return slices.Collect(strings.Lines(w.buf.String()))
+}
+
+// count reports how many collected lines contain substr.
+func (w *warnings) count(substr string) int {
+	n := 0
+	for _, line := range w.lines() {
+		if strings.Contains(line, substr) {
+			n++
+		}
+	}
+	return n
 }
 
 // captureWarnings routes slog, and the log package output it takes over, to the result until the test ends.

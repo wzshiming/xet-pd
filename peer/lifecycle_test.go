@@ -709,3 +709,370 @@ func TestCloseCancelsHungAnnounceAndPull(t *testing.T) {
 		t.Fatalf("cold GET after Close = %d", resp.StatusCode)
 	}
 }
+
+// replyMinSeeds answers every announce with 200, a 30s TTL and n as MinSeeds.
+func replyMinSeeds(n int) func(http.ResponseWriter, *http.Request, apis.AnnounceRequest) (int, apis.AnnounceResponse) {
+	return func(http.ResponseWriter, *http.Request, apis.AnnounceRequest) (int, apis.AnnounceResponse) {
+		return http.StatusOK, apis.AnnounceResponse{TTL: 30, MinSeeds: n}
+	}
+}
+
+// sortedFiles sorts files by hash, as announces list them.
+func sortedFiles(files ...apis.File) []apis.File {
+	return slices.SortedFunc(slices.Values(files), func(a, b apis.File) int { return strings.Compare(a.Hash, b.Hash) })
+}
+
+// seedsOverCap admits both xorbs of a seed file to a peer whose cap fits one, under tracker answering minSeeds, and returns once the pass this wakes logged nothing evictable and the tracker took the file.
+func seedsOverCap(t *testing.T, tracker *clustertest.FakeTracker, minSeeds int) (*Peer, testFile, *warnings) {
+	t.Helper()
+	tf := makeFile(t, 60, 61)
+	xs := tf.xorbHashes()
+	tracker.SetReply(replyMinSeeds(minSeeds))
+	warned := captureWarnings(t)
+	p, _ := newTestPeer(t, tracker.URL, func(c *Config) {
+		c.Heartbeat, c.XorbCacheSize = time.Hour, int64(2*len(tf.xorbs[xs[0]])-1)
+	})
+	clustertest.WaitFor(t, clustertest.WaitTimeout, "the tracker's MinSeeds", func() bool { return minSeedsOf(p) == int64(minSeeds) })
+	p.markSeed(tf.file.Hash)
+	p.learn(tf.file, xs)
+	for _, h := range xs {
+		admitStored(t, p, h, tf.xorbs[h])
+	}
+	clustertest.WaitFor(t, clustertest.WaitTimeout, "a pass finding nothing evictable", func() bool { return warned.count("nothing evictable") == 1 })
+	tracker.FindAnnounce(t, 0, func(a clustertest.Announce) bool { return len(a.Req.AddFiles) == 1 && a.Code == http.StatusOK })
+	return p, tf, warned
+}
+
+func TestSeedCopiesStayUntilEnoughOtherHolders(t *testing.T) {
+	tracker := clustertest.NewFakeTracker(t)
+	p, tf, warned := seedsOverCap(t, tracker, 1)
+	xs := tf.xorbHashes()
+	over := func() bool { return usage(p) > configOf(p).XorbCacheSize }
+	lookups := tracker.Lookups()
+	if len(lookups) != 1 || !slices.Equal(slices.Sorted(slices.Values(lookups[0].Req.Xorbs)), hashes(xs...)) {
+		t.Fatalf("lookups = %+v, want one carrying both seed copies", lookups)
+	}
+	if !stored(t, p, xs[0]) || !stored(t, p, xs[1]) || !over() {
+		t.Fatalf("seed copies without other holders evicted: usage %d", usage(p))
+	}
+	p.evictPass()
+	if n, logs := len(tracker.Lookups()), warned.count("nothing evictable"); n != 2 || logs != 1 || !stored(t, p, xs[0]) || !stored(t, p, xs[1]) {
+		t.Fatalf("another pass: %d lookups and %d logs, want 2 and 1 with both seed copies kept", n, logs)
+	}
+	tracker.Hold(apis.Peer{ID: "other", URL: "http://other.test"}, xs...)
+	n := len(tracker.Announces())
+	p.evictPass()
+	if len(tracker.Lookups()) != 3 || stored(t, p, xs[0]) || !stored(t, p, xs[1]) || over() {
+		t.Fatalf("pass with another holder: %d lookups, usage %d, want 3 and the oldest seed copy evicted to fit", len(tracker.Lookups()), usage(p))
+	}
+	removed, _ := tracker.FindAnnounce(t, n, func(a clustertest.Announce) bool { return hasRemove(a, xs[0]) })
+	if removed.Req.Full || !slices.Equal(removed.Req.Remove, hashes(xs[0])) || !slices.Equal(removed.Req.RemoveFiles, []string{tf.file.Hash}) {
+		t.Fatalf("delta after the seed eviction = %+v, want %s and its file removed", removed.Req, xs[0])
+	}
+}
+
+func TestSeedCopiesNeedMinSeedsOtherHolders(t *testing.T) {
+	tracker := clustertest.NewFakeTracker(t)
+	p, tf, _ := seedsOverCap(t, tracker, 2)
+	xs := tf.xorbHashes()
+	tracker.Hold(apis.Peer{ID: "one", URL: "http://one.test"}, xs...)
+	p.evictPass()
+	if !stored(t, p, xs[0]) || !stored(t, p, xs[1]) {
+		t.Fatal("seed copy evicted with one other holder under MinSeeds 2")
+	}
+	tracker.Hold(apis.Peer{ID: "two", URL: "http://two.test"}, xs...)
+	p.evictPass()
+	if stored(t, p, xs[0]) || !stored(t, p, xs[1]) {
+		t.Fatal("with two other holders under MinSeeds 2, want the oldest seed copy evicted and the other kept")
+	}
+}
+
+func TestMinSeedsChangeWakesEviction(t *testing.T) {
+	tracker := clustertest.NewFakeTracker(t)
+	p, tf, _ := seedsOverCap(t, tracker, 2)
+	xs := tf.xorbHashes()
+	tracker.Hold(apis.Peer{ID: "one", URL: "http://one.test"}, xs...)
+	tracker.SetReply(replyMinSeeds(1))
+	wakeAnnouncer(p)
+	clustertest.WaitFor(t, clustertest.WaitTimeout, "the oldest seed copy evicted once MinSeeds dropped to 1", func() bool { return !stored(t, p, xs[0]) })
+	if !stored(t, p, xs[1]) {
+		t.Fatal("eviction went past the cap")
+	}
+}
+
+func TestSeedMarkedBeforeItsFileIsKnown(t *testing.T) {
+	tf := makeFile(t, 62, 63)
+	xs := tf.xorbHashes()
+	other, otherBody := clustertest.MakeXorb(t, 64, 2, 8<<10)
+	tracker := clustertest.NewFakeTracker(t)
+	tracker.SetReply(replyMinSeeds(1))
+	p, _ := newTestPeer(t, tracker.URL, func(c *Config) {
+		c.Heartbeat, c.XorbCacheSize = time.Hour, int64(2*len(tf.xorbs[xs[0]]))
+	})
+	p.markSeed(tf.file.Hash)
+	ingest(t, storeOf(p), tf)
+	commitDirect(t, p, other, otherBody)
+	clustertest.WaitFor(t, clustertest.WaitTimeout, "the cache back under its cap", func() bool { return usage(p) <= configOf(p).XorbCacheSize })
+	if !stored(t, p, xs[0]) || !stored(t, p, xs[1]) || stored(t, p, other) {
+		t.Fatal("want the seed file's xorbs kept and the younger xorb evicted")
+	}
+}
+
+func TestFileReportedAgainFollowsItsNewXorbs(t *testing.T) {
+	tf := makeFile(t, 65, 66)
+	xs := tf.xorbHashes()
+	other, otherBody := clustertest.MakeXorb(t, 67, 2, 8<<10)
+	tracker := clustertest.NewFakeTracker(t)
+	tracker.SetReply(replyMinSeeds(1))
+	p, _ := newTestPeer(t, tracker.URL, func(c *Config) {
+		c.Heartbeat, c.XorbCacheSize = time.Hour, int64(2*len(tf.xorbs[xs[0]]))
+	})
+	for _, h := range xs {
+		commitDirect(t, p, h, tf.xorbs[h])
+	}
+	p.markSeed(tf.file.Hash)
+	p.learn(tf.file, xs[:1])
+	// A later shard describes the file over its other xorb only.
+	p.learn(tf.file, xs[1:])
+	commitDirect(t, p, other, otherBody)
+	if stored(t, p, xs[0]) || !stored(t, p, xs[1]) || !stored(t, p, other) {
+		t.Fatal("want the xorb the seed file no longer references evicted as the oldest and the one it does kept")
+	}
+}
+
+func TestCompleteFileAnnouncedWhileAllItsXorbsAreCached(t *testing.T) {
+	tf := makeFile(t, 68, 69)
+	xs := tf.xorbHashes()
+	other, otherBody := clustertest.MakeXorb(t, 70, 2, 8<<10)
+	tracker := clustertest.NewFakeTracker(t)
+	p, srv := newTestPeer(t, tracker.URL, func(c *Config) {
+		c.Heartbeat, c.XorbCacheSize = time.Hour, int64(2*len(tf.xorbs[xs[0]]))
+	})
+	for _, h := range xs {
+		commitDirect(t, p, h, tf.xorbs[h])
+	}
+	if _, err := storeOf(p).PutShard(context.Background(), tf.shard(t)); err != nil {
+		t.Fatal(err)
+	}
+	added, i := tracker.FindAnnounce(t, 0, func(a clustertest.Announce) bool { return len(a.Req.AddFiles) > 0 })
+	if added.Req.Full || !slices.Equal(added.Req.AddFiles, []apis.File{tf.file}) || len(added.Req.RemoveFiles) != 0 {
+		t.Fatalf("announce once the file is complete = %+v, want a delta adding %+v", added.Req, tf.file)
+	}
+	// Admitting another xorb evicts the file's oldest one.
+	commitDirect(t, p, other, otherBody)
+	removed, j := tracker.FindAnnounce(t, i+1, func(a clustertest.Announce) bool { return len(a.Req.RemoveFiles) > 0 })
+	if removed.Req.Full || !slices.Equal(removed.Req.Remove, hashes(xs[0])) || !slices.Equal(removed.Req.RemoveFiles, []string{tf.file.Hash}) || len(removed.Req.AddFiles) != 0 {
+		t.Fatalf("delta after evicting %s = %+v, want it removed with its file", xs[0], removed.Req)
+	}
+	// Reading the file's other xorb leaves other the oldest, so re-admitting the evicted one evicts other.
+	if resp, _, err := do(t, http.MethodGet, xorbURL(srv, xs[1])); err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET %s = %d, %v", xs[1], resp.StatusCode, err)
+	}
+	commitDirect(t, p, xs[0], tf.xorbs[xs[0]])
+	back, _ := tracker.FindAnnounce(t, j+1, func(a clustertest.Announce) bool { return len(a.Req.AddFiles) > 0 })
+	if back.Req.Full || !slices.Equal(back.Req.AddFiles, []apis.File{tf.file}) || !slices.Equal(back.Req.Add, hashes(xs[0])) || !slices.Equal(back.Req.Remove, hashes(other)) {
+		t.Fatalf("delta after re-admitting %s = %+v, want it and its file added back", xs[0], back.Req)
+	}
+}
+
+func TestResyncFullCarriesEveryXorbAndCompleteFile(t *testing.T) {
+	complete, dropped, partial := makeFile(t, 71, 72), makeFile(t, 73), makeFile(t, 74, 75)
+	gone, kept := dropped.xorbHashes()[0], partial.xorbHashes()[0]
+	tracker := clustertest.NewFakeTracker(t)
+	var refused atomic.Bool
+	tracker.SetReply(func(_ http.ResponseWriter, _ *http.Request, req apis.AnnounceRequest) (int, apis.AnnounceResponse) {
+		resync := !req.Full && slices.Contains(req.Remove, gone.String()) && refused.CompareAndSwap(false, true)
+		return http.StatusOK, apis.AnnounceResponse{Resync: resync, TTL: 30}
+	})
+	p, srv := newTestPeer(t, tracker.URL, func(c *Config) { c.Heartbeat = time.Hour })
+	ingest(t, storeOf(p), complete)
+	ingest(t, storeOf(p), dropped)
+	commitDirect(t, p, kept, partial.xorbs[kept])
+	p.learn(partial.file, partial.xorbHashes())
+	tracker.FindAnnounce(t, 0, func(a clustertest.Announce) bool {
+		return a.Code == http.StatusOK && slices.Contains(a.Req.AddFiles, dropped.file)
+	})
+	// The only xorb of a complete file is lost underneath; the tracker refuses the delta removing both.
+	deleteStored(t, p, gone)
+	if resp, _, _ := do(t, http.MethodGet, xorbURL(srv, gone)); resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("GET of the lost xorb = %d, want 404", resp.StatusCode)
+	}
+	delta, i := tracker.FindAnnounce(t, 0, func(a clustertest.Announce) bool { return hasRemove(a, gone) })
+	if delta.Req.Full || !slices.Equal(delta.Req.RemoveFiles, []string{dropped.file.Hash}) {
+		t.Fatalf("delta after the loss = %+v, want it to remove %s", delta.Req, dropped.file.Hash)
+	}
+	full := tracker.Announce(t, i+1)
+	want := hashes(append(complete.xorbHashes(), kept)...)
+	if !full.Req.Full || !slices.Equal(full.Req.Add, want) || !slices.Equal(full.Req.AddFiles, []apis.File{complete.file}) || len(full.Req.Remove)+len(full.Req.RemoveFiles) != 0 {
+		t.Fatalf("Full after the resync = %+v, want every cached xorb %v and only %+v", full.Req, want, complete.file)
+	}
+}
+
+func TestRestartAnnouncesOnlyCompleteFiles(t *testing.T) {
+	tracker, holder := newTracker(t), newHolder(t, "holder")
+	ingested, broken := makeFile(t, 76, 77), makeFile(t, 78, 79)
+	fetched, missing := makeFile(t, 80), makeFile(t, 81)
+	for _, tf := range []testFile{fetched, missing} {
+		holder.ServeShard(tf.file, tf.resp)
+		tracker.HoldFile(holder.Peer(), tf.file)
+	}
+	dir := t.TempDir()
+	st := newTestStore(t, dir, tracker.URL)
+	ctx := context.Background()
+	ingest(t, st, ingested)
+	ingest(t, st, broken)
+	if err := st.DeleteXorb(ctx, broken.xorbHashes()[0]); err != nil {
+		t.Fatal(err)
+	}
+	for _, tf := range []testFile{fetched, missing} {
+		if _, err := st.GetFileHashBySHA256(ctx, digestOf(t, tf.file)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for h, body := range fetched.xorbs {
+		if _, err := st.PutXorb(ctx, h, bytes.NewReader(body)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_ = st.Close()
+	newTestPeer(t, tracker.URL, func(c *Config) { c.DataDir, c.Heartbeat, c.Secret = dir, time.Hour, testSecret })
+	got := tracker.Announce(t, 0).Req
+	wantXorbs := hashes(append(append(ingested.xorbHashes(), broken.xorbHashes()[1]), fetched.xorbHashes()...)...)
+	if wantFiles := sortedFiles(ingested.file, fetched.file); !got.Full || !slices.Equal(got.Add, wantXorbs) || !slices.Equal(got.AddFiles, wantFiles) {
+		t.Fatalf("startup announce = %+v, want Full with %v and only the complete %+v", got, wantXorbs, wantFiles)
+	}
+}
+
+func TestLostXorbLeavesCacheAndAnnounce(t *testing.T) {
+	hash, body := clustertest.MakeXorb(t, 82, 2, 8<<10)
+	tracker := clustertest.NewFakeTracker(t)
+	p, srv := newTestPeer(t, tracker.URL, func(c *Config) { c.Heartbeat = time.Hour })
+	commitDirect(t, p, hash, body)
+	_, i := tracker.FindAnnounce(t, 0, func(a clustertest.Announce) bool { return hasAdd(a, hash) && a.Code == http.StatusOK })
+	deleteStored(t, p, hash)
+	if resp, _, _ := do(t, http.MethodGet, xorbURL(srv, hash)); resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("GET of the lost xorb = %d, want 404", resp.StatusCode)
+	}
+	removed, _ := tracker.FindAnnounce(t, i+1, func(a clustertest.Announce) bool { return hasRemove(a, hash) })
+	if removed.Req.Full || !slices.Equal(removed.Req.Remove, hashes(hash)) || len(removed.Req.Add) != 0 {
+		t.Fatalf("delta after the loss = %+v, want %s removed", removed.Req, hash)
+	}
+	if u := usage(p); u != 0 || admitted(p, hash)() {
+		t.Fatalf("after the loss: usage %d, cached %v, want 0 and false", u, admitted(p, hash)())
+	}
+}
+
+func TestLateLostReportKeepsStoredXorb(t *testing.T) {
+	hash, body := clustertest.MakeXorb(t, 83, 2, 8<<10)
+	p, _ := newTestPeer(t, clustertest.NewFakeTracker(t).URL, func(c *Config) { c.Heartbeat = time.Hour })
+	commitDirect(t, p, hash, body)
+	// A reader that missed hash just before the commit reports it lost only now.
+	p.lost(hash)
+	if u := usage(p); u != int64(len(body)) || !admitted(p, hash)() {
+		t.Fatalf("after a late lost report: usage %d, cached %v, want %d and true", u, admitted(p, hash)(), len(body))
+	}
+}
+
+func TestConcurrentAdmitsSeedsEvictionsAndAnnouncesStayConsistent(t *testing.T) {
+	var files []testFile
+	for i := range 6 {
+		files = append(files, makeFile(t, byte(100+2*i), byte(101+2*i)))
+	}
+	tracker, holder := clustertest.NewFakeTracker(t), clustertest.NewFakePeer(t, "holder")
+	var replies atomic.Int32
+	tracker.SetReply(func(http.ResponseWriter, *http.Request, apis.AnnounceRequest) (int, apis.AnnounceResponse) {
+		// MinSeeds alternates between 1 and 2, so every reply wakes eviction.
+		return http.StatusOK, apis.AnnounceResponse{TTL: 30, MinSeeds: 1 + int(replies.Add(1)%2)}
+	})
+	for i, tf := range files {
+		for h, body := range tf.xorbs {
+			holder.ServeXorb(h, body)
+			if i%2 == 0 {
+				tracker.Hold(holder.Peer(), h)
+			}
+		}
+	}
+	size := int64(len(files[0].xorbs[files[0].xorbHashes()[0]]))
+	p, _ := newTestPeer(t, tracker.URL, func(c *Config) { c.Heartbeat, c.XorbCacheSize = 2*time.Millisecond, 3*size })
+	ctx := context.Background()
+	var wg sync.WaitGroup
+	for i, tf := range files {
+		wg.Go(func() {
+			for h, body := range tf.xorbs {
+				if _, err := storeOf(p).PutXorb(ctx, h, bytes.NewReader(body)); err != nil {
+					t.Error(err)
+				}
+			}
+			p.learn(tf.file, tf.xorbHashes())
+		})
+		wg.Go(func() {
+			if i%3 != 2 {
+				p.markSeed(tf.file.Hash)
+			}
+		})
+		wg.Go(func() {
+			for h := range tf.xorbs {
+				if rs, err := storeOf(p).GetXorbReadSeekCloser(ctx, h); err == nil {
+					_ = rs.Close()
+				}
+			}
+		})
+		wg.Go(p.evictPass)
+	}
+	wg.Wait()
+	// A seed file no other peer holds stays complete once its xorbs are back.
+	tracker.SetReply(replyMinSeeds(1))
+	for h, body := range files[1].xorbs {
+		commitDirect(t, p, h, body)
+	}
+	settled(t, p)
+	var announced []apis.File
+	clustertest.WaitFor(t, clustertest.WaitTimeout, "the tracker's view to match the cache and the disk", func() bool {
+		cached := cachedXorbs(p)
+		n := len(tracker.Announces())
+		wakeAnnouncer(p)
+		tracker.Replied(t, n)
+		xorbView, fileView := map[string]bool{}, map[string]apis.File{}
+		for _, a := range tracker.Announces() {
+			if a.Code != http.StatusOK {
+				continue
+			}
+			if a.Req.Full {
+				clear(xorbView)
+				clear(fileView)
+			}
+			for _, h := range a.Req.Add {
+				xorbView[h] = true
+			}
+			for _, h := range a.Req.Remove {
+				delete(xorbView, h)
+			}
+			for _, f := range a.Req.AddFiles {
+				fileView[f.Hash] = f
+			}
+			for _, h := range a.Req.RemoveFiles {
+				delete(fileView, h)
+			}
+		}
+		local, _, err := storeOf(p).inventory(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var disk []xet.XorbHash
+		for _, x := range local {
+			disk = append(disk, x.Hash)
+		}
+		var complete []apis.File
+		for _, tf := range files {
+			if !slices.ContainsFunc(tf.xorbHashes(), func(h xet.XorbHash) bool { return !slices.Contains(cached, h.String()) }) {
+				complete = append(complete, tf.file)
+			}
+		}
+		announced = sortedFiles(slices.Collect(maps.Values(fileView))...)
+		return slices.Equal(cached, cachedXorbs(p)) && slices.Equal(cached, slices.Sorted(maps.Keys(xorbView))) &&
+			slices.Equal(cached, hashes(disk...)) && slices.Equal(announced, sortedFiles(complete...))
+	})
+	if !slices.Contains(announced, files[1].file) {
+		t.Fatalf("tracker's files = %+v, want the protected seed file %+v among them", announced, files[1].file)
+	}
+}

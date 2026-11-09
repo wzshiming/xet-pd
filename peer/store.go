@@ -419,7 +419,7 @@ type fileEntry struct {
 	Xorbs []xet.XorbHash
 }
 
-// inventory lists the local xorbs oldest first and, once each, the files a local or cached shard describes; a local shard that fails to load is skipped.
+// inventory lists the local xorbs oldest first and, once each, the files a local or cached shard describes with a SHA-256, as report does; a local shard that fails to load is skipped.
 func (s *store) inventory(ctx context.Context) ([]inventory.Xorb, []fileEntry, error) {
 	xorbs, err := inventory.Scan(ctx, s.Storage)
 	if err != nil {
@@ -439,7 +439,7 @@ func (s *store) inventory(ctx context.Context) ([]inventory.Xorb, []fileEntry, e
 	seen := map[xet.FileHash]bool{}
 	add := func(sh *shard.Shard, hashes []xet.FileHash) {
 		for _, fh := range hashes {
-			if f := sh.File(fh); f != nil && !seen[fh] {
+			if f := sh.File(fh); f != nil && f.MetadataExt != nil && !seen[fh] {
 				seen[fh] = true
 				files = append(files, fileEntry{fileOf(f), xorbsOf(f)})
 			}

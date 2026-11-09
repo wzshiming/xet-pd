@@ -48,10 +48,13 @@ services:
       - -tracker=http://tracker:8080
       - -heartbeat=1s
       - -data-dir=/data
+      - -xorb-cache-size=1GiB
     environment:
       <<: *secret
       HF_ENDPOINT: ${HF_ENDPOINT:-https://huggingface.co}
       HF_TOKEN: ${HF_TOKEN:-}
+    extra_hosts:
+      - host.docker.internal:host-gateway
     depends_on:
       tracker:
         condition: service_healthy
@@ -71,10 +74,13 @@ services:
       - -tracker=http://tracker:8080
       - -heartbeat=1s
       - -data-dir=/data
+      - -xorb-cache-size=1GiB
     environment:
       <<: *secret
       HF_ENDPOINT: ${HF_ENDPOINT:-https://huggingface.co}
       HF_TOKEN: ${HF_TOKEN:-}
+    extra_hosts:
+      - host.docker.internal:host-gateway
     depends_on:
       tracker:
         condition: service_healthy

@@ -480,6 +480,48 @@ func TestInventorySkipsUndecodableLocalShard(t *testing.T) {
 	}
 }
 
+func TestRestartSkipsCachedFileWithoutSHA256(t *testing.T) {
+	tracker, holder := newTracker(t), newHolder(t, "holder")
+	intact, bare := makeFile(t, 56), makeFile(t, 57)
+	sh, bareShard := intact.shard(t), bare.shard(t)
+	f := bareShard.Files[0]
+	f.MetadataExt, f.Flags = nil, f.Flags&^shard.FileWithMetadataExt
+	sh.Files, sh.CASInfos = append(sh.Files, f), append(sh.CASInfos, bareShard.CASInfos...)
+	data, _, err := storage.EncodeShard(sh)
+	if err != nil {
+		t.Fatal(err)
+	}
+	offsets := maps.Clone(intact.resp.Offsets)
+	maps.Copy(offsets, bare.resp.Offsets)
+	holder.ServeShard(intact.file, apis.ShardResponse{Shard: data, Offsets: offsets})
+	tracker.HoldFile(holder.Peer(), intact.file)
+	dir := t.TempDir()
+	st := newTestStore(t, dir, tracker.URL)
+	ctx := context.Background()
+	if _, err := st.GetFileHashBySHA256(ctx, digestOf(t, intact.file)); err != nil {
+		t.Fatal(err)
+	}
+	for _, tf := range []testFile{intact, bare} {
+		for h, body := range tf.xorbs {
+			if _, err := st.PutXorb(ctx, h, bytes.NewReader(body)); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	_ = st.Close()
+	_, files, err := newTestStore(t, dir, tracker.URL).inventory(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(files) != 1 || files[0].File != intact.file {
+		t.Errorf("inventory files after reopen = %+v, want only %+v", files, intact.file)
+	}
+	newTestPeer(t, tracker.URL, func(c *Config) { c.DataDir, c.Heartbeat, c.Secret = dir, time.Hour, testSecret })
+	if got := tracker.Announce(t, 0).Req; !got.Full || !slices.Equal(got.AddFiles, []apis.File{intact.file}) {
+		t.Fatalf("startup announce = %+v, want Full with only %+v", got, intact.file)
+	}
+}
+
 // rawHolder names a server answering through serve, counting the requests, to tracker as the holder id of hash.
 func rawHolder(t *testing.T, tracker *clustertest.FakeTracker, id string, hash xet.XorbHash, serve http.HandlerFunc) *atomic.Int32 {
 	t.Helper()

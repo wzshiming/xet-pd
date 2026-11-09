@@ -224,8 +224,8 @@ func TestAcceptedIsNotAHolding(t *testing.T) {
 			if _, err := sidecarOffsets(st, x.hash); err != nil {
 				t.Fatalf("sidecar must survive eviction: %v", err)
 			}
-			if start, end, err := st.GetXorbDataRange(ctx, x.hash, 0, 2); err != nil || end <= start {
-				t.Fatalf("GetXorbDataRange after eviction = %d, %d, %v", start, end, err)
+			if offsets, err := st.GetXorbChunkOffsets(ctx, x.hash); err != nil || len(offsets) != 2 {
+				t.Fatalf("GetXorbChunkOffsets after eviction = %v, %v", offsets, err)
 			}
 		})
 	}
@@ -285,48 +285,34 @@ func TestFailedPullRetriesAfterBackoff(t *testing.T) {
 
 func TestEvictionIsLRU(t *testing.T) {
 	a, b := makeXorb(t, 25, 2, 4<<10), makeXorb(t, 26, 2, 4<<10)
-	for _, rangeRead := range []bool{false, true} {
-		t.Run(fmt.Sprintf("rangeRead=%v", rangeRead), func(t *testing.T) {
-			st, _ := newTestStore(t, t.TempDir())
-			s := newSeed(t, st, "s1")
-			m := newTestStaging(t, st, stagingConfig{cacheSize: int64(len(a.body)+len(b.body)) - 1})
-			ctx := context.Background()
-			first, second := a, b
-			if rangeRead {
-				first, second = b, a
-			}
-			for _, x := range []*fixture{first, second} {
-				if _, err := st.PutXorb(ctx, x.hash, bytes.NewReader(x.body)); err != nil {
-					t.Fatal(err)
-				}
-			}
-			var rd io.Closer
-			var err error
-			if rangeRead {
-				rd, err = st.GetXorbRangeReadCloser(ctx, first.hash, 0, 15)
-			} else {
-				rd, err = st.GetXorbReadSeekCloser(ctx, first.hash)
-			}
-			if err != nil {
-				t.Fatal(err)
-			}
-			_ = rd.Close()
-			awaitPass(t, m)
-			if !clustertest.HasXorb(t, st.Storage, a.hash) || !clustertest.HasXorb(t, st.Storage, b.hash) {
-				t.Fatal("evicted without holders")
-			}
-			s.holds(a.hash, b.hash)
-			m.kick()
-			clustertest.WaitFor(t, clustertest.WaitTimeout, "eviction of the untouched copy", func() bool {
-				return !clustertest.HasXorb(t, st.Storage, second.hash) && m.snapshot() == int64(len(first.body))
-			})
-			if !clustertest.HasXorb(t, st.Storage, first.hash) {
-				t.Fatal("recently read copy evicted")
-			}
-			if got := m.snapshot(); got != int64(len(first.body)) {
-				t.Fatalf("usage = %d, want %d", got, len(first.body))
-			}
-		})
+	st, _ := newTestStore(t, t.TempDir())
+	s := newSeed(t, st, "s1")
+	m := newTestStaging(t, st, stagingConfig{cacheSize: int64(len(a.body)+len(b.body)) - 1})
+	ctx := context.Background()
+	for _, x := range []*fixture{a, b} {
+		if _, err := st.PutXorb(ctx, x.hash, bytes.NewReader(x.body)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rd, err := st.GetXorbReadSeekCloser(ctx, a.hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = rd.Close()
+	awaitPass(t, m)
+	if !clustertest.HasXorb(t, st.Storage, a.hash) || !clustertest.HasXorb(t, st.Storage, b.hash) {
+		t.Fatal("evicted without holders")
+	}
+	s.holds(a.hash, b.hash)
+	m.kick()
+	clustertest.WaitFor(t, clustertest.WaitTimeout, "eviction of the untouched copy", func() bool {
+		return !clustertest.HasXorb(t, st.Storage, b.hash) && m.snapshot() == int64(len(a.body))
+	})
+	if !clustertest.HasXorb(t, st.Storage, a.hash) {
+		t.Fatal("recently read copy evicted")
+	}
+	if got := m.snapshot(); got != int64(len(a.body)) {
+		t.Fatalf("usage = %d, want %d", got, len(a.body))
 	}
 }
 

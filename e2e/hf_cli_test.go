@@ -14,12 +14,10 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
-	"net/http/httputil"
 	"net/textproto"
 	"net/url"
 	"os"
 	"os/exec"
-	"path"
 	"path/filepath"
 	"slices"
 	"strconv"
@@ -44,67 +42,45 @@ const (
 	hfTimeout  = 3 * time.Minute // one hf download
 )
 
-// TestHFCLI runs the real hf CLI through the gateway: cold tunnels the origin; warm (fresh cache, bridge refused) can only come from the seeds.
+// TestHFCLI runs the real hf CLI against two peers mirroring huggingface.co: cold through peer-1 tunnels the origin, warm through peer-2 with a fresh cache pulls the bytes from peer-1.
 func TestHFCLI(t *testing.T) {
 	hfPath := hfBinary(t)
 	preflight(t)
 	origin := newOriginProxy(t)
+	guard := newRefuser(t)
 	secret := testSecret(t)
-	gw := startGateway(t, hfUpstream, secret, []string{"-xorb-cache-size", "1", "-replicas", "2", "-min-seeds", "2"},
-		"HTTPS_PROXY="+origin.URL, "HTTP_PROXY="+origin.URL, "https_proxy="+origin.URL, "http_proxy="+origin.URL)
+	// One replica keeps the tracker from seeding, so peer-2 pulls on demand during the warm run.
+	tr := startTracker(t, secret, []string{"-replicas", "1"})
 	var peers []*peerProc
 	for range 2 {
-		peers = append(peers, startPeer(t, gw.URL, secret, []string{"-heartbeat", "100ms"}))
+		peers = append(peers, startPeer(t, tr.URL, hfUpstream, secret, []string{"-heartbeat", "100ms"},
+			"HTTPS_PROXY="+origin.URL, "HTTP_PROXY="+origin.URL, "https_proxy="+origin.URL, "http_proxy="+origin.URL))
 	}
-	clustertest.WaitFor(t, readyTimeout, "both seeds to register", func() bool { return len(clustertest.Diag(t, gw.URL).Peers) == 2 })
-	front := newFront(t, gw.URL)
-	guard := newRefuser(t)
-	resolveURL := gw.URL + "/" + hfRepo + "/resolve/" + hfRevision + "/" + hfFile
+	clustertest.WaitFor(t, readyTimeout, "both peers to register", func() bool { return len(clustertest.Diag(t, tr.URL).Peers) == 2 })
 
-	coldPath, coldLog := runHF(t, hfPath, front.URL, guard.URL)
+	coldPath, coldLog := runHF(t, hfPath, peers[0].URL, guard.URL)
 	if d, n := fileDigest(t, coldPath); d != hfFileSHA || n != hfFileSize {
 		t.Fatalf("cold download: sha256 %s, %d bytes; want %s, %d", d, n, hfFileSHA, hfFileSize)
 	}
-	fileHash := headReady(t, resolveURL).Get("X-Xet-Hash")
-	xorbs := hashesOf(reconstructionURLs(t, gw.URL, fileHash))
-	clustertest.WaitFor(t, seedTimeout, "both seeds to hold every xorb and the gateway to evict them", func() bool {
-		return seeded(clustertest.Diag(t, gw.URL), 2, len(xorbs))
-	})
-	for _, p := range peers {
-		if got := xorbHashes(t, p.DataDir); !slices.Equal(got, xorbs) {
-			t.Fatalf("seed %s stores %v, want %v", p.URL, got, xorbs)
-		}
-	}
-	if left := xorbHashes(t, filepath.Join(gw.DataDir, "data")); len(left) != 0 {
-		t.Fatalf("gateway still stores %v after seeding", left)
-	}
-	if urls := reconstructionURLs(t, gw.URL, fileHash); !fromSeeds(peers, urls) {
-		t.Fatalf("reconstruction URLs %v do not all point at seeds", urls)
-	}
+	clustertest.WaitFor(t, ingestTimeout, "peer-1 to announce the ingested file", holds(t, tr.URL, peers[0].URL, 1))
 	coldBytes := origin.bytes.Load()
 	if coldBytes < hfFileSize/2 {
 		t.Errorf("cold run tunneled %d origin bytes, want at least %d", coldBytes, hfFileSize/2)
 	}
-	coldHits := front.reset()
-	before := clustertest.Diag(t, gw.URL)
-	front.noBridge.Store(true)
 
-	warmPath, warmLog := runHF(t, hfPath, front.URL, guard.URL)
+	warmPath, warmLog := runHF(t, hfPath, peers[1].URL, guard.URL)
 	if d, n := fileDigest(t, warmPath); d != hfFileSHA || n != hfFileSize {
 		t.Fatalf("warm download: sha256 %s, %d bytes; want %s, %d", d, n, hfFileSHA, hfFileSize)
 	}
 	warmBytes := origin.bytes.Load() - coldBytes
-	warmHits := front.reset()
-	after := clustertest.Diag(t, gw.URL)
-	if after.XorbGets != before.XorbGets || after.XorbBytes != 0 {
-		t.Errorf("gateway xorb gets %+v -> %+v and %d staged bytes during the warm run", before.XorbGets, after.XorbGets, after.XorbBytes)
-	}
 	if limit := max(int64(256<<10), coldBytes/5); warmBytes >= limit {
 		t.Errorf("warm run tunneled %d origin bytes, want under %d", warmBytes, limit)
 	}
-	if warmHits["bridge"] != 0 || warmHits["xorb"] != 0 || warmHits["reconstruction"] == 0 {
-		t.Errorf("warm requests at the front = %v, want a reconstruction and neither bridge nor gateway xorb GET", warmHits)
+	relayed := metric(t, peers[0].URL, `xetpd_peer_xorb_gets_total{requester="peer",status="200"}`)
+	if relayed < 1 {
+		t.Errorf("peer-1 served %v xorb GETs to peers, want peer-2's pulls", relayed)
 	}
+	// A cold resolve carries no xet headers while the peer ingests, so only the warm run goes through Xet Storage.
 	if !strings.Contains(warmLog, "Downloading file from Xet Storage") {
 		t.Errorf("warm hf log does not announce Xet Storage:\n%s", warmLog)
 	}
@@ -114,14 +90,8 @@ func TestHFCLI(t *testing.T) {
 	if strings.Contains(coldLog+warmLog, secret) {
 		t.Error("hf output echoes the secret")
 	}
-	if left := xorbHashes(t, filepath.Join(gw.DataDir, "data")); len(left) != 0 {
-		t.Errorf("gateway stores %v after the warm run", left)
-	}
-	if urls := reconstructionURLs(t, gw.URL, fileHash); !fromSeeds(peers, urls) {
-		t.Errorf("reconstruction URLs %v after the warm run do not all point at seeds", urls)
-	}
-	t.Logf("file %s = xorbs %v on both seeds; origin bytes cold %d, warm %d; front requests cold %v, warm %v; gateway xorb gets %+v\nwarm hf stderr:\n%s",
-		fileHash, xorbs, coldBytes, warmBytes, coldHits, warmHits, after.XorbGets, warmLog)
+	clustertest.WaitFor(t, readyTimeout, "peer-2 to announce the pulled file", func() bool { return seeded(clustertest.Diag(t, tr.URL), 2, 1) })
+	t.Logf("origin bytes cold %d, warm %d; peer-1 served %v xorb GETs to peer-2\nwarm hf stderr:\n%s", coldBytes, warmBytes, relayed, warmLog)
 }
 
 // hfBinary finds hf and skips unless hf_xet is installed in its Python environment.
@@ -240,93 +210,6 @@ func fileDigest(t *testing.T, p string) (string, int64) {
 	return clustertest.SHA256(data), int64(len(data))
 }
 
-// hashesOf lists the distinct xorbs the fetch URLs name, sorted.
-func hashesOf(urls []string) []string {
-	var out []string
-	for _, u := range urls {
-		out = append(out, path.Base(u))
-	}
-	slices.Sort(out)
-	return slices.Compact(out)
-}
-
-// fromSeeds reports whether every fetch URL points at one of the seeds.
-func fromSeeds(peers []*peerProc, urls []string) bool {
-	for _, u := range urls {
-		if !slices.ContainsFunc(peers, func(p *peerProc) bool { return strings.HasPrefix(u, p.URL+"/v1/xorbs/") }) {
-			return false
-		}
-	}
-	return len(urls) > 0
-}
-
-// front is the hub hf talks to: a Host-preserving reverse proxy onto the gateway that tallies routes and can refuse the plain xet-bridge.
-type front struct {
-	*httptest.Server
-	proxy    *httputil.ReverseProxy
-	noBridge atomic.Bool
-
-	mu   sync.Mutex
-	hits map[string]int
-}
-
-func newFront(t *testing.T, gatewayURL string) *front {
-	t.Helper()
-	target, err := url.Parse(gatewayURL)
-	if err != nil {
-		t.Fatal(err)
-	}
-	f := &front{hits: map[string]int{}}
-	f.proxy = &httputil.ReverseProxy{
-		Transport: &http.Transport{}, // loopback, no proxy environment
-		Rewrite: func(pr *httputil.ProxyRequest) {
-			pr.SetURL(target)
-			pr.Out.Host = pr.In.Host // the gateway derives link origins from Host
-		},
-	}
-	f.Server = httptest.NewServer(f)
-	t.Cleanup(f.Close)
-	return f
-}
-
-func (f *front) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	route := routeOf(r.URL.Path)
-	f.mu.Lock()
-	f.hits[route]++
-	f.mu.Unlock()
-	if route == "bridge" && f.noBridge.Load() {
-		http.Error(w, "plain download refused by the test", http.StatusServiceUnavailable)
-		return
-	}
-	f.proxy.ServeHTTP(w, r)
-}
-
-// reset returns the requests counted per route so far and starts over.
-func (f *front) reset() map[string]int {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	hits := f.hits
-	f.hits = map[string]int{}
-	return hits
-}
-
-// routeOf classifies a hub or CAS request path.
-func routeOf(p string) string {
-	switch {
-	case strings.HasPrefix(p, "/xet-bridge/"):
-		return "bridge"
-	case strings.Contains(p, "/reconstructions"):
-		return "reconstruction"
-	case strings.HasPrefix(p, "/v1/xorbs/"):
-		return "xorb"
-	case strings.HasPrefix(p, "/xet-token/"), strings.Contains(p, "-token/"):
-		return "token"
-	case strings.Contains(p, "/resolve/"):
-		return "resolve"
-	}
-	return "other"
-}
-
 // refuser is the proxy hf gets for anything beyond loopback: it refuses and records each target.
 type refuser struct {
 	*httptest.Server
@@ -352,7 +235,7 @@ func (g *refuser) seen() []string {
 	return slices.Clone(g.hosts)
 }
 
-// originProxy is the CONNECT proxy the gateway egresses through; it counts the bytes tunnels carry back from the origin.
+// originProxy is the CONNECT proxy the peers egress through; it counts the bytes tunnels carry back from the origin.
 type originProxy struct {
 	*httptest.Server
 	bytes   atomic.Int64

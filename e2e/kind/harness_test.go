@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -26,15 +27,15 @@ import (
 const (
 	clusterName = "xet-pd-e2e"
 	namespace   = "xet-pd"
-	gatewayPort = 8080
+	trackerPort = 8080
 	peerPort    = 8081
 	taintKey    = "xetpd-e2e"
 
-	gatewaySelector = "app.kubernetes.io/name=xet-pd-gateway"
+	trackerSelector = "app.kubernetes.io/name=xet-pd-tracker"
 	peerSelector    = "app.kubernetes.io/name=xet-pd-peer"
 	jobSelector     = "app.kubernetes.io/part-of=xet-pd-e2e"
 
-	gatewayImage = "xet-pd-gateway:kind"
+	trackerImage = "xet-pd-tracker:kind"
 	peerImage    = "xet-pd-peer:kind"
 	hfImage      = "xet-pd-hfcli:kind"
 )
@@ -49,19 +50,17 @@ const (
 	nodesTimeout   = 3 * time.Minute
 	loadTimeout    = 5 * time.Minute
 	rolloutTimeout = 5 * time.Minute
-	peersTimeout   = 60 * time.Second // both peers registered with their nodes
-	ingestTimeout  = 3 * time.Minute  // the gateway's first fetch of the fixture
-	storedTimeout  = 60 * time.Second // the fetched fixture in gateway storage
-	expireTimeout  = 90 * time.Second // the evicted peer gone from the pods and the registry
+	peersTimeout   = 60 * time.Second // both peers registered with the tracker
+	filesTimeout   = 60 * time.Second // a complete file listed by the tracker once its holder announced it
+	seedTimeout    = 60 * time.Second // the tracker's seed of the other peer
+	restartTimeout = 3 * time.Minute  // a deleted peer pod replaced and running
 	jobTimeout     = 4 * time.Minute
-	restoreTimeout = 3 * time.Minute  // the peers rolled out again after the untaint
 	waitDelay      = 10 * time.Second // pipes the children of a killed command hold open
 )
 
 // How long before go test's timeout panic the run and then each cleanup phase must end.
 const (
 	cleanupReserve = 3 * time.Minute
-	untaintReserve = 2 * time.Minute
 	dumpReserve    = time.Minute
 	deleteReserve  = 10 * time.Second
 )
@@ -146,26 +145,41 @@ func (c *cluster) raw(t testing.TB, pod string, port int, path string) string {
 	return c.kubectl(t, "get", "--raw", proxyPath(pod, port, path))
 }
 
-func (c *cluster) peers(ctx context.Context, gateway string) (apis.PeersResponse, error) {
+// peers reads the live registry of the tracker pod.
+func (c *cluster) peers(ctx context.Context, tracker string) (apis.PeersResponse, error) {
 	var d apis.PeersResponse
-	out, err := c.run(ctx, callTimeout, "", "kubectl", "get", "--raw", proxyPath(gateway, gatewayPort, apis.PeersPath))
+	out, err := c.run(ctx, callTimeout, "", "kubectl", "get", "--raw", proxyPath(tracker, trackerPort, apis.PeersPath))
 	if err == nil {
 		err = json.Unmarshal([]byte(out), &d)
 	}
 	return d, err
 }
 
-// nodesOf lists the node of each registered peer, sorted.
-func nodesOf(d apis.PeersResponse) []string {
-	var nodes []string
-	for _, p := range d.Peers {
-		nodes = append(nodes, p.Node)
+// peerStatus returns the tracker's entry for the peer advertising url.
+func peerStatus(d apis.PeersResponse, url string) (apis.PeerStatus, bool) {
+	i := slices.IndexFunc(d.Peers, func(p apis.PeerStatus) bool { return p.URL == url })
+	if i < 0 {
+		return apis.PeerStatus{}, false
 	}
-	slices.Sort(nodes)
-	return nodes
+	return d.Peers[i], true
 }
 
-type pod struct{ name, node string }
+// holdings renders each live peer as its URL with the complete files and xorbs it announced, sorted.
+func holdings(d apis.PeersResponse) []string {
+	var out []string
+	for _, p := range d.Peers {
+		out = append(out, fmt.Sprintf("%s files=%d xorbs=%d", p.URL, p.Files, p.Holdings))
+	}
+	slices.Sort(out)
+	return out
+}
+
+type pod struct{ name, node, hostIP string }
+
+// url is the origin a peer pod advertises: its node's IP, on hostNetwork.
+func (p pod) url() string {
+	return "http://" + net.JoinHostPort(p.hostIP, strconv.Itoa(peerPort))
+}
 
 // pods lists the running pods of the xet-pd namespace that match selector and are not being deleted.
 func (c *cluster) pods(t testing.TB, selector string) []pod {
@@ -174,7 +188,7 @@ func (c *cluster) pods(t testing.TB, selector string) []pod {
 		Items []struct {
 			Metadata struct{ Name, DeletionTimestamp string }
 			Spec     struct{ NodeName string }
-			Status   struct{ Phase string }
+			Status   struct{ Phase, HostIP string }
 		}
 	}
 	if err := json.Unmarshal([]byte(c.kubectl(t, "-n", namespace, "get", "pods", "-l", selector, "-o", "json")), &list); err != nil {
@@ -183,7 +197,7 @@ func (c *cluster) pods(t testing.TB, selector string) []pod {
 	var pods []pod
 	for _, p := range list.Items {
 		if p.Status.Phase == "Running" && p.Metadata.DeletionTimestamp == "" {
-			pods = append(pods, pod{p.Metadata.Name, p.Spec.NodeName})
+			pods = append(pods, pod{p.Metadata.Name, p.Spec.NodeName, p.Status.HostIP})
 		}
 	}
 	return pods
@@ -200,7 +214,7 @@ func (c *cluster) workers(t testing.TB) []string {
 	return nodes
 }
 
-// reset returns a kept cluster to a cold start: no test taint, no xet-pd objects or test Jobs, empty peer caches.
+// reset returns a kept cluster to a cold start: no taint an older run left, no xet-pd objects or test Jobs, empty peer caches.
 func (c *cluster) reset(t testing.TB) {
 	t.Helper()
 	_, _ = c.run(t.Context(), callTimeout, "", "kubectl", "taint", "nodes", "--all", taintKey+"-") // fails when no node carries it
@@ -208,22 +222,6 @@ func (c *cluster) reset(t testing.TB) {
 	c.kubectl(t, "-n", "default", "delete", "jobs", "-l", jobSelector)
 	for _, node := range c.workers(t) {
 		c.must(t, callTimeout, "docker", "exec", node, "rm", "-rf", "/var/lib/xet-pd/peer")
-	}
-}
-
-// untaint lifts the taint of the fallback step from node and waits for the peers; t's context is already canceled in cleanups.
-func (c *cluster) untaint(t testing.TB, node string) {
-	by := c.end.Add(-untaintReserve)
-	if time.Now().After(by) {
-		t.Logf("untaint of %s skipped: past its deadline", node)
-		return
-	}
-	ctx := context.Background()
-	if _, err := c.runBy(ctx, by, callTimeout, "", "kubectl", "taint", "nodes", node, taintKey+"-"); err != nil {
-		t.Errorf("lift the taint: %v", err)
-	}
-	if _, err := c.runBy(ctx, by, restoreTimeout+callTimeout, "", "kubectl", "-n", namespace, "rollout", "status", "ds/xet-pd-peer", "--timeout="+restoreTimeout.String()); err != nil {
-		t.Errorf("peers after the untaint: %v", err)
 	}
 }
 
@@ -237,7 +235,7 @@ func (c *cluster) dump(t testing.TB) {
 	for _, args := range [][]string{
 		{"get", "pods", "-A", "-o", "wide"},
 		{"get", "events", "-A", "--sort-by=.lastTimestamp"},
-		{"-n", namespace, "logs", "deploy/xet-pd-gateway", "--tail=50"},
+		{"-n", namespace, "logs", "deploy/xet-pd-tracker", "--tail=50"},
 		{"-n", namespace, "logs", "-l", peerSelector, "--prefix", "--tail=50"},
 		{"get", "nodes", "-o", "wide"},
 	} {
@@ -250,7 +248,7 @@ func (c *cluster) dump(t testing.TB) {
 	}
 }
 
-// The 2s sleep of jobYAML lets the gateway's pod informer index the pod IP first.
+// jobYAML points hf at the peer on the Job's own node through the Downward API, as deploy/k8s/base documents for clients.
 const jobYAML = `apiVersion: batch/v1
 kind: Job
 metadata:
@@ -278,8 +276,12 @@ spec:
           image: {{.Image}}
           imagePullPolicy: Never
           env:
+            - name: HOST_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
             - name: HF_ENDPOINT
-              value: http://xet-pd-gateway.xet-pd.svc:8080
+              value: http://$(HOST_IP):{{.Port}}
             - name: HOME
               value: /work
             - name: HF_HOME
@@ -319,7 +321,7 @@ var jobTemplate = template.Must(template.New("job").Parse(jobYAML))
 func (c *cluster) job(t testing.TB, name, node string) string {
 	t.Helper()
 	var spec strings.Builder
-	data := map[string]any{"Name": name, "Node": node, "Image": hfImage, "Repo": hfRepo, "File": hfFile, "Revision": hfRevision, "SHA": hfFileSHA, "Size": hfFileSize}
+	data := map[string]any{"Name": name, "Node": node, "Image": hfImage, "Port": peerPort, "Repo": hfRepo, "File": hfFile, "Revision": hfRevision, "SHA": hfFileSHA, "Size": hfFileSize}
 	if err := jobTemplate.Execute(&spec, data); err != nil {
 		t.Fatal(err)
 	}
@@ -376,45 +378,55 @@ func (c *cluster) jobReport(t testing.TB, name string) string {
 	return b.String()
 }
 
-// counts is what the assertions read after a Job.
+// counts is what the assertions read after a step.
 type counts struct {
-	peers                 apis.PeersResponse
-	local, fallback, none float64            // xetpd_gateway_locality_picks_total by outcome
-	direct                float64            // xetpd_gateway_xorb_gets_total{requester="direct"}
-	live                  float64            // xetpd_gateway_peers
-	client                map[string]float64 // xorb GETs a peer answered clients with 2xx, by node
+	peers   apis.PeersResponse
+	live    float64            // xetpd_tracker_peers
+	lookups float64            // xetpd_tracker_lookups_total
+	seeds   float64            // xetpd_tracker_seed_requests_total{result="ok"}
+	client  map[string]float64 // xorb GETs a peer answered clients with 2xx, by node
+	relayed map[string]float64 // xorb GETs a peer answered other peers with 2xx, by node
+	pulled  map[string]float64 // xetpd_peer_pulls_total{result="ok"}, by node
+	shards  map[string]float64 // xetpd_peer_shard_gets_total{status="200"}, by node
 }
 
-// count reads the gateway and the peers given as pod by node.
-func (c *cluster) count(t testing.TB, gateway string, peers map[string]string) counts {
+// count reads the tracker and the peer pods given by node.
+func (c *cluster) count(t testing.TB, tracker string, peers map[string]pod) counts {
 	t.Helper()
-	d, err := c.peers(t.Context(), gateway)
+	d, err := c.peers(t.Context(), tracker)
 	if err != nil {
 		t.Fatal(err)
 	}
-	m := clustertest.ParseMetrics(t, c.raw(t, gateway, gatewayPort, "/metrics"))
+	m := clustertest.ParseMetrics(t, c.raw(t, tracker, trackerPort, "/metrics"))
 	s := counts{
-		peers:    d,
-		local:    sample(t, m, `xetpd_gateway_locality_picks_total{outcome="local"}`),
-		fallback: sample(t, m, `xetpd_gateway_locality_picks_total{outcome="fallback"}`),
-		none:     sample(t, m, `xetpd_gateway_locality_picks_total{outcome="none"}`),
-		direct:   sample(t, m, `xetpd_gateway_xorb_gets_total{requester="direct"}`),
-		live:     sample(t, m, "xetpd_gateway_peers"),
-		client:   map[string]float64{},
+		peers:   d,
+		live:    sample(t, m, "xetpd_tracker_peers"),
+		lookups: sample(t, m, "xetpd_tracker_lookups_total"),
+		seeds:   sample(t, m, `xetpd_tracker_seed_requests_total{result="ok"}`),
+		client:  map[string]float64{},
+		relayed: map[string]float64{},
+		pulled:  map[string]float64{},
+		shards:  map[string]float64{},
 	}
-	for node, name := range peers {
-		for key, v := range clustertest.ParseMetrics(t, c.raw(t, name, peerPort, "/metrics")) {
-			if strings.HasPrefix(key, `xetpd_peer_xorb_gets_total{requester="client",status="2`) {
+	for node, p := range peers {
+		pm := clustertest.ParseMetrics(t, c.raw(t, p.name, peerPort, "/metrics"))
+		for key, v := range pm {
+			switch {
+			case strings.HasPrefix(key, `xetpd_peer_xorb_gets_total{requester="client",status="2`):
 				s.client[node] += v
+			case strings.HasPrefix(key, `xetpd_peer_xorb_gets_total{requester="peer",status="2`):
+				s.relayed[node] += v
 			}
 		}
+		s.pulled[node] = sample(t, pm, `xetpd_peer_pulls_total{result="ok"}`)
+		s.shards[node] = sample(t, pm, `xetpd_peer_shard_gets_total{status="200"}`)
 	}
 	return s
 }
 
 func (s counts) String() string {
-	return fmt.Sprintf("peers on %v, xorb gets %+v; client 2xx by node %v; picks local %v, fallback %v, none %v; direct xorb gets %v; peers gauge %v",
-		nodesOf(s.peers), s.peers.XorbGets, s.client, s.local, s.fallback, s.none, s.direct, s.live)
+	return fmt.Sprintf("peers %v; tracker peers gauge %v, lookups %v, seed requests ok %v; by node: client xorb 2xx %v, peer xorb 2xx %v, pulls ok %v, shard gets 200 %v",
+		holdings(s.peers), s.live, s.lookups, s.seeds, s.client, s.relayed, s.pulled, s.shards)
 }
 
 // sample returns the value of key and fails t when the exposition lacks it.

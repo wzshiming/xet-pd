@@ -1,11 +1,12 @@
 package peer
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
 	"io"
-	"net/http"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"time"
@@ -15,20 +16,19 @@ import (
 	"github.com/wzshiming/xet/xorb"
 
 	"github.com/wzshiming/xet-pd/apis"
-	"github.com/wzshiming/xet-pd/internal/lru"
 )
 
 const failedCooldown = 15 * time.Second
 
 var (
-	errNotFound = errors.New("xorb not found at gateway")
+	errNotFound = fmt.Errorf("no holder served the xorb: %w", fs.ErrNotExist)
 	errClosed   = errors.New("peer closed")
 	errEmpty    = errors.New("empty xorb")
 )
 
-// pull downloads one xorb from the gateway into a spool, validates it into the store and serves attached readers meanwhile.
+// pull downloads one xorb from a holder into a spool, validates it into the store and serves attached readers meanwhile.
 type pull struct {
-	p       *Peer
+	s       *store
 	hash    xet.XorbHash
 	started chan struct{} // closed once stream is set or the pull failed before it
 	done    chan struct{}
@@ -37,11 +37,11 @@ type pull struct {
 	length  int64     // declared Content-Length, -1 if unknown
 	size    int64     // committed bytes, set before the pull records the object
 	err     error     // outcome, read only after done
-	refs    int       // holders of the stream, guarded by p.mu
+	refs    int       // holders of the stream, guarded by s.mu
 
 	cancel context.CancelFunc // ends the pull, queueing included
-	queued bool               // still waiting for a pull slot, guarded by p.mu
-	keep   bool               // asked for by the gateway, so never dropped for lack of readers; guarded by p.mu
+	queued bool               // still waiting for a pull slot, guarded by s.mu
+	keep   bool               // forced, so never dropped for lack of readers; guarded by s.mu
 }
 
 type cooled struct {
@@ -62,109 +62,121 @@ func openSpool(dataDir string) (string, error) {
 	return spoolDir, nil
 }
 
-// acquire returns exactly one of a joined or new pull (release it) or a pinned committed xorb (unpin it); force clears a failure cooldown.
-func (p *Peer) acquire(hash xet.XorbHash, force bool) (*pull, *lru.Entry[xet.XorbHash, ready], error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if f := p.pulls[hash]; f != nil {
+// acquire joins the listed pull of hash or starts one, either to release, and returns nil once the xorb is local; force keeps the pull without readers and clears a failure cooldown.
+func (s *store) acquire(hash xet.XorbHash, force bool) (*pull, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if f := s.pulls[hash]; f != nil {
 		f.refs++
 		f.keep = f.keep || force
-		return f, nil, nil
+		return f, nil
 	}
-	if p.ctx.Err() != nil {
-		return nil, nil, errClosed
+	if s.ctx.Err() != nil {
+		return nil, errClosed
 	}
-	if entry := p.xorbs.Get(hash); entry != nil {
-		exists, err := p.store.HasXorb(p.ctx, hash)
-		if err != nil {
-			return nil, nil, err
-		}
-		if exists {
-			return nil, p.pinLocked(hash), nil
-		}
-		p.forget(entry)
+	// A pull leaves s.pulls only after its commit, so this sees every copy committed before.
+	if ok, err := s.Storage.HasXorb(s.ctx, hash); err != nil || ok {
+		return nil, err
 	}
 	now := time.Now()
-	for h, c := range p.cooldown {
+	for h, c := range s.cooldown {
 		if !now.Before(c.until) {
-			delete(p.cooldown, h)
+			delete(s.cooldown, h)
 		}
 	}
-	if c, ok := p.cooldown[hash]; ok {
+	if c, ok := s.cooldown[hash]; ok {
 		if !force {
-			return nil, nil, c.err
+			return nil, c.err
 		}
-		delete(p.cooldown, hash)
+		delete(s.cooldown, hash)
 	}
-	ctx, cancel := context.WithTimeout(p.ctx, p.cfg.PullTimeout)
-	f := &pull{p: p, hash: hash, started: make(chan struct{}), done: make(chan struct{}), refs: 2, cancel: cancel, queued: true, keep: force}
-	p.pulls[hash] = f
-	p.wg.Add(1)
+	ctx, cancel := context.WithTimeout(s.ctx, s.cfg.PullTimeout)
+	f := &pull{s: s, hash: hash, started: make(chan struct{}), done: make(chan struct{}), refs: 2, cancel: cancel, queued: true, keep: force}
+	s.pulls[hash] = f
+	s.wg.Add(1)
 	go func() {
-		defer p.wg.Done()
+		defer s.wg.Done()
 		f.run(ctx)
 	}()
-	return f, nil, nil
+	return f, nil
 }
 
 // run waits for a pull slot, downloads the xorb in it and settles the outcome; it ends the pull's context on return.
 func (f *pull) run(ctx context.Context) {
 	defer f.cancel()
-	p := f.p
+	s := f.s
 	var err error
 	select {
-	case p.sem <- struct{}{}:
-		p.mu.Lock()
+	case s.sem <- struct{}{}:
+		s.mu.Lock()
 		f.queued = false
-		p.mu.Unlock()
+		s.mu.Unlock()
 		err = f.download(ctx)
-		<-p.sem
+		<-s.sem
 	case <-ctx.Done():
 		err = ctx.Err()
 	}
 	f.finish(err)
 }
 
-// download fetches the xorb from the gateway into the spool, which readers stream meanwhile, and commits it.
+// download asks the best holders in turn until one delivers a byte, streams its copy into the spool, which readers read meanwhile, and commits it.
 func (f *pull) download(ctx context.Context) error {
-	p := f.p
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, apis.XorbURL(p.cfg.Gateway, f.hash.String()), nil)
+	resp, err := f.s.lookup(ctx, apis.LookupRequest{Xorbs: []string{f.hash.String()}})
 	if err != nil {
 		return err
 	}
-	req.Header.Set(apis.PeerHeader, p.id)
-	resp, err := p.client.Do(req)
+	holders := resp.Xorbs[f.hash.String()]
+	failed := errNotFound
+	for _, p := range holders[:min(len(holders), holderAttempts)] {
+		n, err := f.spool(ctx, p)
+		if f.stream != nil { // readers may have seen this copy's size, so it decides the pull
+			if err == nil {
+				err = f.commit(ctx, n)
+			}
+			return err
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		failed = fmt.Errorf("%w: %w", errNotFound, err)
+	}
+	return failed
+}
+
+// spool streams the copy of holder p into the spool, opened on its first byte, and returns how many bytes it took.
+func (f *pull) spool(ctx context.Context, p apis.Peer) (int64, error) {
+	body, length, err := f.s.fetch.xorb(ctx, p, f.hash)
 	if err != nil {
-		return err
+		return 0, err
 	}
-	defer func() { _ = resp.Body.Close() }()
-	switch {
-	case resp.StatusCode == http.StatusNotFound:
-		return errNotFound
-	case resp.StatusCode != http.StatusOK:
-		return fmt.Errorf("gateway status %s", resp.Status)
-	case resp.ContentLength > apis.MaxXorbBytes:
-		return fmt.Errorf("xorb of %d bytes exceeds cap", resp.ContentLength)
+	defer func() { _ = body.Close() }()
+	if length > apis.MaxXorbBytes {
+		return 0, fmt.Errorf("xorb of %d bytes exceeds cap", length)
 	}
-	f.open(resp.ContentLength)
-	n, err := io.Copy(f.stream.Writer(), io.LimitReader(resp.Body, apis.MaxXorbBytes+1))
+	br := bufio.NewReader(body)
+	if _, err := br.Peek(1); err != nil {
+		if err == io.EOF {
+			err = errEmpty
+		}
+		return 0, err
+	}
+	f.open(length)
+	n, err := io.Copy(f.stream.Writer(), io.LimitReader(br, apis.MaxXorbBytes+1))
 	switch {
 	case err != nil:
-		return err
+		return n, err
 	case n > apis.MaxXorbBytes:
-		return errors.New("xorb exceeds cap")
-	case n == 0:
-		return errEmpty
-	case resp.ContentLength >= 0 && n != resp.ContentLength:
-		return fmt.Errorf("short body: %d of %d bytes", n, resp.ContentLength)
+		return n, errors.New("xorb exceeds cap")
+	case length >= 0 && n != length:
+		return n, fmt.Errorf("short body: %d of %d bytes", n, length)
 	}
-	return f.commit(ctx, n)
+	return n, nil
 }
 
 // open creates the spool for a body of the declared length, -1 if unknown, and lets readers attach.
 func (f *pull) open(length int64) {
 	f.stream = ioswmr.NewSWMR(ioswmr.NewTemporaryFileBuffer(func() (*os.File, error) {
-		return os.CreateTemp(f.p.spoolDir, f.hash.String()+"-*.part")
+		return os.CreateTemp(f.s.spoolDir, f.hash.String()+"-*.part")
 	}), ioswmr.WithAutoClose())
 	f.hold, _ = f.stream.NewReader(0)
 	f.length = length
@@ -175,7 +187,7 @@ func (f *pull) open(length int64) {
 func (f *pull) commit(ctx context.Context, n int64) error {
 	f.size = n
 	rs, _ := f.stream.NewReadSeeker(0, int(n))
-	stored, err := f.p.store.PutXorb(ctx, f.hash, rs)
+	stored, err := f.s.PutXorb(ctx, f.hash, rs)
 	_ = rs.Close()
 	if err == nil && !stored {
 		// The store deduplicated against an existing object without reading this spool.
@@ -186,9 +198,9 @@ func (f *pull) commit(ctx context.Context, n int64) error {
 	return err
 }
 
-// finish ends the stream with err, unlists the pull, records the xorb or a cooldown, then wakes waiters and drops the pull's own reference.
+// finish ends the stream with err, unlists the pull, records a cooldown on failure, then wakes waiters and drops the pull's own reference.
 func (f *pull) finish(err error) {
-	p := f.p
+	s := f.s
 	if f.stream == nil {
 		close(f.started)
 	} else {
@@ -197,26 +209,24 @@ func (f *pull) finish(err error) {
 	f.err = err
 	switch {
 	case err == nil:
-		p.metrics.pull("ok")
+		s.cfg.Metrics.pull("ok")
 	case errors.Is(err, errNotFound):
-		p.metrics.pull("not_found")
+		s.cfg.Metrics.pull("not_found")
 	case errors.Is(err, context.Canceled):
-		p.metrics.pull("canceled")
+		s.cfg.Metrics.pull("canceled")
 	case errors.Is(err, context.DeadlineExceeded):
-		p.metrics.pull("timeout")
+		s.cfg.Metrics.pull("timeout")
 	default:
-		p.metrics.pull("error")
+		s.cfg.Metrics.pull("error")
 	}
-	p.mu.Lock()
-	if p.pulls[f.hash] == f { // release may have dropped it and a newer pull taken the key
-		delete(p.pulls, f.hash)
+	s.mu.Lock()
+	if s.pulls[f.hash] == f { // release may have dropped it and a newer pull taken the key
+		delete(s.pulls, f.hash)
 	}
-	if err == nil {
-		p.admit(f.hash, f.size, f)
-	} else if !errors.Is(err, context.Canceled) { // abandoned or closed is no fault of the xorb
-		p.cooldown[f.hash] = cooled{until: time.Now().Add(failedCooldown), err: err}
+	if err != nil && !errors.Is(err, context.Canceled) { // abandoned or closed is no fault of the xorb
+		s.cooldown[f.hash] = cooled{until: time.Now().Add(failedCooldown), err: err}
 	}
-	p.mu.Unlock()
+	s.mu.Unlock()
 	close(f.done)
 	f.release()
 }
@@ -245,21 +255,30 @@ func (f *pull) servable(ctx context.Context) (int64, error) {
 	}
 }
 
+// wait blocks until f finished or ctx ended, then lets go of f.
+func (f *pull) wait(ctx context.Context) error {
+	defer f.release()
+	select {
+	case <-f.done:
+		return f.err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 func (f *pull) release() {
-	f.p.mu.Lock()
+	s := f.s
+	s.mu.Lock()
 	f.refs--
 	if f.refs == 1 && f.queued && !f.keep {
 		// Only its goroutine is left; unlisting it under the same lock keeps acquire from joining it.
-		if f.p.pulls[f.hash] == f {
-			delete(f.p.pulls, f.hash)
+		if s.pulls[f.hash] == f {
+			delete(s.pulls, f.hash)
 		}
 		f.cancel()
 	}
 	last := f.refs == 0
-	if last {
-		f.p.evict() // a committed object nobody streams any more may go
-	}
-	f.p.mu.Unlock()
+	s.mu.Unlock()
 	if last && f.hold != nil {
 		_ = f.hold.Close()
 	}

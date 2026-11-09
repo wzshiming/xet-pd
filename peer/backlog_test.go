@@ -4,7 +4,6 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
-	"path"
 	"strings"
 	"testing"
 	"time"
@@ -15,27 +14,18 @@ import (
 	"github.com/wzshiming/xet-pd/internal/clustertest"
 )
 
-// backlogged returns a peer whose only pull slot is taken by a cold GET of a; the gateway holds a before its headers until release and serves b at once.
-func backlogged(t *testing.T) (*Peer, *httptest.Server, *clustertest.FakeGateway, xet.XorbHash, func() result) {
+// backlogged returns a peer whose only pull slot is taken by a cold GET of a; the holder holds a's body until release and serves b at once.
+func backlogged(t *testing.T) (*Peer, *httptest.Server, *clustertest.FakePeer, xet.XorbHash, func() result) {
 	t.Helper()
 	a, bodyA := clustertest.MakeXorb(t, 80, 2, 8<<10)
 	b, bodyB := clustertest.MakeXorb(t, 81, 2, 8<<10)
 	gate := make(chan struct{})
-	serve := clustertest.ServeByHash(map[xet.XorbHash][]byte{a: bodyA, b: bodyB})
-	g := clustertest.NewFakeGateway(t, func(w http.ResponseWriter, r *http.Request) {
-		if path.Base(r.URL.Path) == a.String() {
-			select {
-			case <-gate:
-			case <-r.Context().Done():
-				return
-			}
-		}
-		serve(w, r)
-	})
-	p, srv := newTestPeer(t, g.URL, func(c *Config) { c.MaxPulls, c.Heartbeat = 1, time.Hour })
+	tracker, holder := cluster(t, map[xet.XorbHash][]byte{a: bodyA, b: bodyB})
+	holder.GateXorb(a, bodyA, 0, gate)
+	p, srv := newTestPeer(t, tracker.URL, func(c *Config) { c.MaxPulls, c.Heartbeat = 1, time.Hour })
 	lateA := doAsync(t, xorbURL(srv, a))
-	clustertest.WaitFor(t, clustertest.WaitTimeout, "a holding the only pull slot", func() bool { return pullOf(p, a) != nil && len(g.Requests()) == 1 })
-	return p, srv, g, b, func() result {
+	clustertest.WaitFor(t, clustertest.WaitTimeout, "a holding the only pull slot", func() bool { return pullOf(p, a) != nil && len(holder.Requests()) == 1 })
+	return p, srv, holder, b, func() result {
 		close(gate)
 		return <-lateA
 	}
@@ -68,7 +58,7 @@ func postPull(t *testing.T, srv *httptest.Server, hash xet.XorbHash) int {
 }
 
 func TestQueuedPullDroppedWhenClientLeaves(t *testing.T) {
-	p, srv, g, b, release := backlogged(t)
+	p, srv, holder, b, release := backlogged(t)
 	leave := clientGet(t, p, b)
 	var fb *pull
 	clustertest.WaitFor(t, clustertest.WaitTimeout, "b queued behind a", func() bool {
@@ -83,8 +73,8 @@ func TestQueuedPullDroppedWhenClientLeaves(t *testing.T) {
 		t.Fatal("dropped pull of b never finished")
 	}
 	_, cooling := cooldownOf(p, b)
-	if cooling || len(g.Requests()) != 1 {
-		t.Fatalf("after dropping b: cooling %v, gateway GETs %d, want false and 1", cooling, len(g.Requests()))
+	if cooling || len(holder.Requests()) != 1 {
+		t.Fatalf("after dropping b: cooling %v, holder GETs %d, want false and 1", cooling, len(holder.Requests()))
 	}
 	if r := release(); r.err != nil || r.resp.StatusCode != http.StatusOK {
 		t.Fatalf("GET a = %d, %v, want 200", r.resp.StatusCode, r.err)
@@ -92,15 +82,15 @@ func TestQueuedPullDroppedWhenClientLeaves(t *testing.T) {
 	if resp, _, err := do(t, http.MethodGet, xorbURL(srv, b)); err != nil || resp.StatusCode != http.StatusOK {
 		t.Fatalf("GET b after the drop = %d, %v, want 200", resp.StatusCode, err)
 	}
-	if n := len(g.Requests()); n != 2 {
-		t.Fatalf("gateway GETs = %d, want 2", n)
+	if n := len(holder.Requests()); n != 2 {
+		t.Fatalf("holder GETs = %d, want 2", n)
 	}
 	clustertest.WaitFor(t, clustertest.WaitTimeout, "b committed", admitted(p, b))
 }
 
 // The gateway counts on an accepted pull, so it waits out the queue with no client attached.
 func TestQueuedGatewayPullKeptWithoutClients(t *testing.T) {
-	p, srv, g, b, release := backlogged(t)
+	p, srv, holder, b, release := backlogged(t)
 	if code := postPull(t, srv, b); code != http.StatusAccepted {
 		t.Fatalf("pull b = %d, want 202", code)
 	}
@@ -113,13 +103,13 @@ func TestQueuedGatewayPullKeptWithoutClients(t *testing.T) {
 	}
 	release()
 	clustertest.WaitFor(t, clustertest.WaitTimeout, "b committed", admitted(p, b))
-	if n := len(g.Requests()); n != 2 {
-		t.Fatalf("gateway GETs = %d, want 2", n)
+	if n := len(holder.Requests()); n != 2 {
+		t.Fatalf("holder GETs = %d, want 2", n)
 	}
 }
 
 func TestQueuedGatewayPullKeptWhenJoinedClientLeaves(t *testing.T) {
-	p, srv, g, b, release := backlogged(t)
+	p, srv, holder, b, release := backlogged(t)
 	if code := postPull(t, srv, b); code != http.StatusAccepted {
 		t.Fatalf("pull b = %d, want 202", code)
 	}
@@ -140,13 +130,13 @@ func TestQueuedGatewayPullKeptWhenJoinedClientLeaves(t *testing.T) {
 	}
 	release()
 	clustertest.WaitFor(t, clustertest.WaitTimeout, "b committed", admitted(p, b))
-	if n := len(g.Requests()); n != 2 {
-		t.Fatalf("gateway GETs = %d, want 2", n)
+	if n := len(holder.Requests()); n != 2 {
+		t.Fatalf("holder GETs = %d, want 2", n)
 	}
 }
 
 func TestQueuedPullKeptOnceGatewayJoins(t *testing.T) {
-	p, srv, g, b, release := backlogged(t)
+	p, srv, holder, b, release := backlogged(t)
 	leave := clientGet(t, p, b)
 	var fb *pull
 	clustertest.WaitFor(t, clustertest.WaitTimeout, "b queued behind a", func() bool {
@@ -165,8 +155,8 @@ func TestQueuedPullKeptOnceGatewayJoins(t *testing.T) {
 	}
 	release()
 	clustertest.WaitFor(t, clustertest.WaitTimeout, "b committed", admitted(p, b))
-	if n := len(g.Requests()); n != 2 {
-		t.Fatalf("gateway GETs = %d, want 2", n)
+	if n := len(holder.Requests()); n != 2 {
+		t.Fatalf("holder GETs = %d, want 2", n)
 	}
 }
 

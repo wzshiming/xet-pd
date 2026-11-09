@@ -127,7 +127,7 @@ func (p *Peer) serveXorb(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if err != nil {
-		http.Error(w, err.Error(), statusOf(err))
+		http.Error(w, "xorb unavailable", statusOf(err))
 		return
 	}
 	defer func() { _ = rs.Close() }()
@@ -196,7 +196,7 @@ func (p *Peer) serveShard(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	case err != nil:
-		http.Error(w, err.Error(), http.StatusBadGateway)
+		http.Error(w, "shard unavailable", http.StatusBadGateway)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")

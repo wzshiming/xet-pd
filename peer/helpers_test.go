@@ -91,7 +91,7 @@ func admitStored(t *testing.T, p *Peer, hash xet.XorbHash, body []byte) {
 	p.admit(hash, int64(len(body)), true)
 }
 
-// minSeedsOf reads the MinSeeds the announcer took from the tracker's last reply.
+// minSeedsOf reads the MinSeeds the announcer last took from a tracker reply.
 func minSeedsOf(p *Peer) int64 { return p.ann.minSeeds.Load() }
 
 func pinsOf(p *Peer, hash xet.XorbHash) int {

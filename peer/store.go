@@ -515,6 +515,9 @@ func (s *store) openLocal(ctx context.Context, hash xet.XorbHash) (io.ReadSeekCl
 	s.pin(hash)
 	rs, err := s.Storage.GetXorbReadSeekCloser(ctx, hash)
 	if errors.Is(err, fs.ErrNotExist) {
+		if s.onLost != nil {
+			s.onLost(hash)
+		}
 		err = fmt.Errorf("no local copy of xorb %s: %w", hash, fs.ErrNotExist) // the local error names the file's path
 	}
 	if err != nil {

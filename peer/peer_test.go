@@ -414,6 +414,26 @@ func TestShardRouteServesKnownFilesToHoldersOfTheSecret(t *testing.T) {
 	})
 }
 
+func TestShardRouteErrorNamesNoLocalPath(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores file modes")
+	}
+	tf := makeFile(t, 95)
+	gone := tf.xorbHashes()[0]
+	p, srv := newTestPeer(t, clustertest.NewFakeTracker(t).URL, nil)
+	ingest(t, storeOf(p), tf)
+	deleteStored(t, p, gone)
+	path := sidecarPath(storeOf(p), gone)
+	if err := os.Chmod(path, 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(path, 0o644) })
+	resp, body, _ := do(t, http.MethodGet, srv.URL+apis.ShardPathPrefix+tf.file.Hash)
+	if resp.StatusCode != http.StatusBadGateway || strings.Contains(string(body), configOf(p).DataDir) {
+		t.Fatalf("GET shard with an unreadable sidecar = %d %q, want 502 naming no local path", resp.StatusCode, body)
+	}
+}
+
 func TestMetricsEndpoint(t *testing.T) {
 	hash, body := clustertest.MakeXorb(t, 53, 2, 8<<10)
 	cold, coldBody := clustertest.MakeXorb(t, 54, 2, 8<<10)
@@ -810,6 +830,19 @@ func TestUpstreamFailures(t *testing.T) {
 		}
 		if resp, _, _ := do(t, http.MethodGet, u); resp.StatusCode != http.StatusBadGateway || gets.Load() != 1 {
 			t.Fatalf("GET in cooldown = %d, holder GETs = %d, want 502 and 1", resp.StatusCode, gets.Load())
+		}
+	})
+	t.Run("tracker unreachable", func(t *testing.T) {
+		tracker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			if conn, _, err := w.(http.Hijacker).Hijack(); err == nil {
+				_ = conn.Close()
+			}
+		}))
+		t.Cleanup(tracker.Close)
+		p, srv := newTestPeer(t, tracker.URL, nil)
+		resp, got, _ := do(t, http.MethodGet, xorbURL(srv, hash))
+		if resp.StatusCode != http.StatusBadGateway || strings.Contains(string(got), tracker.URL) || strings.Contains(string(got), configOf(p).DataDir) {
+			t.Fatalf("GET with the tracker unreachable = %d %q, want 502 naming neither the tracker nor a local path", resp.StatusCode, got)
 		}
 	})
 }

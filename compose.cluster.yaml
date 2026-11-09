@@ -31,7 +31,7 @@ services:
     command:
       - -listen=:8080
       - -replicas=2
-      - -min-seeds=2
+      - -min-seeds=1
       - -peer-ttl=10s
     environment: *secret
     ports:

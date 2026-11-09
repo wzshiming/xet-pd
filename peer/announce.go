@@ -21,7 +21,7 @@ type announcer struct {
 	control  *http.Client  // carries the secret and never follows redirects
 	wake     chan struct{} // coalesced inventory change signal
 	ready    atomic.Bool   // the tracker took an announce without asking to resync; never cleared
-	minSeeds atomic.Int64  // MinSeeds of the last successful reply, 1 until the first
+	minSeeds atomic.Int64  // MinSeeds of the last successful reply carrying a positive one, 1 until then
 
 	// Only run touches these.
 	acked                holdings // inventory the tracker confirmed
@@ -53,7 +53,7 @@ func (a *announcer) run() {
 		} else {
 			a.failed = false
 			a.acked, a.full = snap, out.Resync
-			if a.minSeeds.Swap(int64(out.MinSeeds)) != int64(out.MinSeeds) {
+			if out.MinSeeds > 0 && a.minSeeds.Swap(int64(out.MinSeeds)) != int64(out.MinSeeds) {
 				p.kickEviction()
 			}
 			if out.Resync {

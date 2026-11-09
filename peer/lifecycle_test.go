@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"log/slog"
 	"maps"
 	"net/http"
 	"net/http/httptest"
@@ -707,6 +708,41 @@ func TestCloseCancelsHungAnnounceAndPull(t *testing.T) {
 	}
 }
 
+func TestCloseWaitsForAcceptedPull(t *testing.T) {
+	captureWarnings(t) // restores slog and log once the test ends
+	held := newHoldWriter()
+	slog.SetDefault(slog.New(slog.NewTextHandler(held, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	p, srv := newTestPeer(t, clustertest.NewFakeTracker(t).URL, nil)
+	if resp, body := send(t, http.MethodPost, srv.URL+apis.PullPath, `{"file":"`+strings.Repeat("ab", 32)+`"}`); resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("pull = %d %q, want 202", resp.StatusCode, body)
+	}
+	// No peer holds the file, so the pull fails at once and its warning waits on the gate.
+	select {
+	case <-held.started:
+	case <-time.After(clustertest.WaitTimeout):
+		t.Fatal("the failed pull logged nothing")
+	}
+	closed := make(chan struct{})
+	go func() {
+		_ = p.Close()
+		close(closed)
+	}()
+	select {
+	case <-closed:
+		t.Fatal("Close returned while the accepted pull was still logging its failure")
+	case <-time.After(200 * time.Millisecond): // a Close that skips the pull shows only by returning, so no event can end this window
+	}
+	close(held.gate)
+	select {
+	case <-closed:
+	case <-time.After(clustertest.WaitTimeout):
+		t.Fatal("Close did not return once the accepted pull finished")
+	}
+	if !strings.Contains(held.buf.String(), `msg="peer: pull file"`) {
+		t.Fatalf("logged %q, want the pull's failure", held.buf.String())
+	}
+}
+
 // replyMinSeeds answers every announce with 200, a 30s TTL and n as MinSeeds.
 func replyMinSeeds(n int) func(http.ResponseWriter, *http.Request, apis.AnnounceRequest) (int, apis.AnnounceResponse) {
 	return func(http.ResponseWriter, *http.Request, apis.AnnounceRequest) (int, apis.AnnounceResponse) {
@@ -794,6 +830,28 @@ func TestMinSeedsChangeWakesEviction(t *testing.T) {
 	clustertest.WaitFor(t, clustertest.WaitTimeout, "the oldest seed copy evicted once MinSeeds dropped to 1", func() bool { return !stored(t, p, xs[0]) })
 	if !stored(t, p, xs[1]) {
 		t.Fatal("eviction went past the cap")
+	}
+}
+
+func TestReplyWithoutMinSeedsKeepsTheLastOne(t *testing.T) {
+	tracker := clustertest.NewFakeTracker(t)
+	p, tf, _ := seedsOverCap(t, tracker, 2)
+	xs := tf.xorbHashes()
+	tracker.SetReply(replyMinSeeds(0))
+	n := len(tracker.Announces())
+	wakeAnnouncer(p)
+	tracker.Replied(t, n)
+	wakeAnnouncer(p)
+	tracker.Announce(t, n+1) // sent only once the announcer handled the reply without MinSeeds
+	tracker.Hold(apis.Peer{ID: "one", URL: "http://one.test"}, xs...)
+	p.evictPass()
+	if !stored(t, p, xs[0]) || !stored(t, p, xs[1]) {
+		t.Fatal("seed copy evicted with one other holder after a reply without MinSeeds, want MinSeeds 2 kept")
+	}
+	tracker.Hold(apis.Peer{ID: "two", URL: "http://two.test"}, xs...)
+	p.evictPass()
+	if stored(t, p, xs[0]) || !stored(t, p, xs[1]) {
+		t.Fatal("with two other holders under the kept MinSeeds 2, want the oldest seed copy evicted and the other kept")
 	}
 }
 
@@ -942,20 +1000,31 @@ func TestRestartAnnouncesOnlyCompleteFiles(t *testing.T) {
 
 func TestLostXorbLeavesCacheAndAnnounce(t *testing.T) {
 	hash, body := clustertest.MakeXorb(t, 82, 2, 8<<10)
-	tracker := clustertest.NewFakeTracker(t)
-	p, srv := newTestPeer(t, tracker.URL, func(c *Config) { c.Heartbeat = time.Hour })
-	commitDirect(t, p, hash, body)
-	_, i := tracker.FindAnnounce(t, 0, func(a clustertest.Announce) bool { return hasAdd(a, hash) && a.Code == http.StatusOK })
-	deleteStored(t, p, hash)
-	if resp, _, _ := do(t, http.MethodGet, xorbURL(srv, hash)); resp.StatusCode != http.StatusNotFound {
-		t.Fatalf("GET of the lost xorb = %d, want 404", resp.StatusCode)
-	}
-	removed, _ := tracker.FindAnnounce(t, i+1, func(a clustertest.Announce) bool { return hasRemove(a, hash) })
-	if removed.Req.Full || !slices.Equal(removed.Req.Remove, hashes(hash)) || len(removed.Req.Add) != 0 {
-		t.Fatalf("delta after the loss = %+v, want %s removed", removed.Req, hash)
-	}
-	if u := usage(p); u != 0 || admitted(p, hash)() {
-		t.Fatalf("after the loss: usage %d, cached %v, want 0 and false", u, admitted(p, hash)())
+	for _, read := range []struct {
+		name, method string
+		hdr          []string
+	}{
+		{"client GET", http.MethodGet, nil},
+		{"relay GET", http.MethodGet, []string{apis.PeerHeader, "other"}},
+		{"HEAD", http.MethodHead, nil},
+	} {
+		t.Run(read.name, func(t *testing.T) {
+			tracker := clustertest.NewFakeTracker(t)
+			p, srv := newTestPeer(t, tracker.URL, func(c *Config) { c.Heartbeat = time.Hour })
+			commitDirect(t, p, hash, body)
+			_, i := tracker.FindAnnounce(t, 0, func(a clustertest.Announce) bool { return hasAdd(a, hash) && a.Code == http.StatusOK })
+			deleteStored(t, p, hash)
+			if resp, _, _ := do(t, read.method, xorbURL(srv, hash), read.hdr...); resp.StatusCode != http.StatusNotFound {
+				t.Fatalf("%s of the lost xorb = %d, want 404", read.name, resp.StatusCode)
+			}
+			if u := usage(p); u != 0 || admitted(p, hash)() {
+				t.Fatalf("after a %s of the lost xorb: usage %d, cached %v, want 0 and false", read.name, u, admitted(p, hash)())
+			}
+			removed, _ := tracker.FindAnnounce(t, i+1, func(a clustertest.Announce) bool { return hasRemove(a, hash) })
+			if removed.Req.Full || !slices.Equal(removed.Req.Remove, hashes(hash)) || len(removed.Req.Add) != 0 {
+				t.Fatalf("delta after the loss = %+v, want %s removed", removed.Req, hash)
+			}
+		})
 	}
 }
 

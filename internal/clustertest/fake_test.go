@@ -2,7 +2,9 @@ package clustertest_test
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"io/fs"
 	"net/http"
@@ -18,10 +20,12 @@ import (
 )
 
 var (
-	peerA = apis.Peer{ID: "a", URL: "http://a"}
-	peerB = apis.Peer{ID: "b", URL: "http://b"}
-	peerC = apis.Peer{ID: "c", URL: "http://c"}
-	file1 = apis.File{Hash: strings.Repeat("f", 64), SHA256: strings.Repeat("e", 64)}
+	peerA     = apis.Peer{ID: "a", URL: "http://a"}
+	peerB     = apis.Peer{ID: "b", URL: "http://b"}
+	peerC     = apis.Peer{ID: "c", URL: "http://c"}
+	upstreamA = apis.Peer{ID: "a", URL: "http://a", Upstream: true}
+	upstreamC = apis.Peer{ID: "c", URL: "http://c", Upstream: true}
+	file1     = apis.File{Hash: strings.Repeat("f", 64), SHA256: strings.Repeat("e", 64)}
 )
 
 // xorbHash is the valid xorb hash spelled by 64 copies of digit.
@@ -48,7 +52,7 @@ func TestFakeTrackerRecordsAnnounces(t *testing.T) {
 	tr := clustertest.NewFakeTracker(t)
 	req := apis.AnnounceRequest{Peer: peerA, Epoch: "e1", Full: true, AddFiles: []apis.File{file1}}
 	resp, err := apis.Announce(t.Context(), tr.Client(), tr.URL, "s3cret", req)
-	if err != nil || resp != (apis.AnnounceResponse{TTL: 30}) {
+	if err != nil || !reflect.DeepEqual(resp, apis.AnnounceResponse{TTL: 30}) {
 		t.Fatalf("Announce = %+v, %v, want TTL 30", resp, err)
 	}
 	if a := tr.Replied(t, 0); !reflect.DeepEqual(a.Req, req) || a.Code != http.StatusOK || a.Header.Get("Authorization") != "Bearer s3cret" {
@@ -74,6 +78,40 @@ func TestFakeTrackerSetReply(t *testing.T) {
 	}
 	if got := tr.Announces(); len(got) != 2 || got[1].Req.Epoch != "e2" || got[1].Code != http.StatusOK {
 		t.Fatalf("Announces = %+v, want e1 then e2 answered 200", got)
+	}
+}
+
+func TestFakeTrackerSetUpstreamsSortsByID(t *testing.T) {
+	t.Parallel()
+	tr := clustertest.NewFakeTracker(t)
+	tr.SetUpstreams(upstreamC, upstreamA)
+	resp, err := apis.Announce(t.Context(), tr.Client(), tr.URL, "", apis.AnnounceRequest{Epoch: "e1"})
+	if want := (apis.AnnounceResponse{TTL: 30, Upstreams: []apis.Peer{upstreamA, upstreamC}}); err != nil || !reflect.DeepEqual(resp, want) {
+		t.Fatalf("Announce = %+v, %v, want %+v", resp, err, want)
+	}
+}
+
+func TestFakeTrackerSetReplyIgnoresUpstreams(t *testing.T) {
+	t.Parallel()
+	tr := clustertest.NewFakeTracker(t)
+	tr.SetUpstreams(upstreamA)
+	canned := apis.AnnounceResponse{TTL: 5}
+	tr.SetReply(func(http.ResponseWriter, *http.Request, apis.AnnounceRequest) (int, apis.AnnounceResponse) {
+		return http.StatusOK, canned
+	})
+	if resp, err := apis.Announce(t.Context(), tr.Client(), tr.URL, "", apis.AnnounceRequest{Epoch: "e1"}); err != nil || !reflect.DeepEqual(resp, canned) {
+		t.Fatalf("Announce through SetReply = %+v, %v, want %+v verbatim", resp, err, canned)
+	}
+}
+
+func TestFakeTrackerSetUpstreamsWithoutPeersClears(t *testing.T) {
+	t.Parallel()
+	tr := clustertest.NewFakeTracker(t)
+	tr.SetUpstreams(upstreamA)
+	tr.SetUpstreams()
+	resp, err := apis.Announce(t.Context(), tr.Client(), tr.URL, "", apis.AnnounceRequest{Epoch: "e1"})
+	if want := (apis.AnnounceResponse{TTL: 30}); err != nil || !reflect.DeepEqual(resp, want) {
+		t.Fatalf("Announce after SetUpstreams() = %+v, %v, want %+v", resp, err, want)
 	}
 }
 
@@ -112,6 +150,45 @@ func TestFakeTrackerHoldFileAnswersBothHashes(t *testing.T) {
 	loc := apis.FileLocation{File: file1, Peers: []apis.Peer{peerC, peerB}}
 	if want := (apis.LookupResponse{SHA256s: map[string]apis.FileLocation{file1.SHA256: loc}, Files: map[string]apis.FileLocation{file1.Hash: loc}}); !reflect.DeepEqual(got, want) {
 		t.Fatalf("Lookup = %+v, want %+v", got, want)
+	}
+}
+
+func TestFakeTrackerHoldShardAnswersBothHashes(t *testing.T) {
+	t.Parallel()
+	tr := clustertest.NewFakeTracker(t)
+	tr.HoldShard(peerC, file1)
+	tr.HoldShard(peerB, file1)
+	tr.HoldShard(peerC, file1)
+	got := lookup(t, tr, apis.LookupRequest{Peer: "a", SHA256s: []string{file1.SHA256}, Files: []string{file1.Hash}})
+	loc := apis.FileLocation{File: file1, Peers: []apis.Peer{peerC, peerB}}
+	if want := (apis.LookupResponse{SHA256s: map[string]apis.FileLocation{file1.SHA256: loc}, Files: map[string]apis.FileLocation{file1.Hash: loc}}); !reflect.DeepEqual(got, want) {
+		t.Fatalf("Lookup = %+v, want %+v", got, want)
+	}
+}
+
+func TestFakeTrackerHoldShardExcludesTheAsker(t *testing.T) {
+	t.Parallel()
+	tr := clustertest.NewFakeTracker(t)
+	file2 := apis.File{Hash: strings.Repeat("d", 64), SHA256: strings.Repeat("c", 64)}
+	tr.HoldShard(peerA, file1)
+	tr.HoldShard(peerB, file1)
+	tr.HoldShard(peerA, file2)
+	got := lookup(t, tr, apis.LookupRequest{Peer: "a", SHA256s: []string{file2.SHA256}, Files: []string{file1.Hash, file2.Hash}})
+	if want := (apis.LookupResponse{Files: map[string]apis.FileLocation{file1.Hash: {File: file1, Peers: []apis.Peer{peerB}}}}); !reflect.DeepEqual(got, want) {
+		t.Fatalf("Lookup as a = %+v, want %+v", got, want)
+	}
+}
+
+func TestFakeTrackerForgetDropsShardHolders(t *testing.T) {
+	t.Parallel()
+	tr := clustertest.NewFakeTracker(t)
+	tr.HoldShard(peerA, file1)
+	tr.HoldShard(peerB, file1)
+	tr.Forget("a")
+	got := lookup(t, tr, apis.LookupRequest{SHA256s: []string{file1.SHA256}, Files: []string{file1.Hash}})
+	loc := apis.FileLocation{File: file1, Peers: []apis.Peer{peerB}}
+	if want := (apis.LookupResponse{SHA256s: map[string]apis.FileLocation{file1.SHA256: loc}, Files: map[string]apis.FileLocation{file1.Hash: loc}}); !reflect.DeepEqual(got, want) {
+		t.Fatalf("Lookup after Forget(a) = %+v, want %+v", got, want)
 	}
 }
 
@@ -309,7 +386,7 @@ func TestFakePeerRecordsPulls(t *testing.T) {
 	if err := apis.Pull(t.Context(), p.Client(), p.URL, "s3cret", req); err != nil {
 		t.Fatalf("Pull = %v, want accepted", err)
 	}
-	if got := p.Pull(t, 0); got.Req != req || got.Header.Get("Authorization") != "Bearer s3cret" {
+	if got := p.Pull(t, 0); !reflect.DeepEqual(got.Req, req) || got.Header.Get("Authorization") != "Bearer s3cret" {
 		t.Fatalf("Pull(0) = %+v, want %+v with its header", got, req)
 	}
 	p.SetPullStatus(http.StatusServiceUnavailable)
@@ -318,6 +395,26 @@ func TestFakePeerRecordsPulls(t *testing.T) {
 	}
 	if got := p.Pulls(); len(got) != 2 || got[1].Req.File != "aa" {
 		t.Fatalf("Pulls = %+v, want both pulls in order", got)
+	}
+}
+
+func TestFakePeerRecordsLargePulls(t *testing.T) {
+	t.Parallel()
+	p := clustertest.NewFakePeer(t, "p1")
+	req := apis.PullRequest{File: file1.Hash, Seed: true}
+	for i := range 2300 {
+		req.Xorbs = append(req.Xorbs, fmt.Sprintf("%064x", i))
+		req.Shards = append(req.Shards, fmt.Sprintf("f%063x", i))
+	}
+	body, err := json.Marshal(req)
+	if err != nil || len(body) < 300<<10 {
+		t.Fatalf("fixture body is %d bytes, %v; want about 300 KiB", len(body), err)
+	}
+	if err := apis.Pull(t.Context(), p.Client(), p.URL, "", req); err != nil {
+		t.Fatalf("Pull of a %d-byte body = %v, want accepted", len(body), err)
+	}
+	if got := p.Pull(t, 0); !reflect.DeepEqual(got.Req, req) {
+		t.Fatalf("Pull(0) recorded %d xorbs, %d shards, file %q, seed %v; want the whole request", len(got.Req.Xorbs), len(got.Req.Shards), got.Req.File, got.Req.Seed)
 	}
 }
 

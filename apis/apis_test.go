@@ -31,6 +31,9 @@ func TestWireConstants(t *testing.T) {
 	if MaxAnnounceBytes != 32<<20 || MaxLookupBytes != 32<<20 || MaxShardBytes != 64<<20 || MaxReplyBytes != 4096 {
 		t.Fatalf("MaxAnnounceBytes, MaxLookupBytes, MaxShardBytes, MaxReplyBytes = %d, %d, %d, %d", MaxAnnounceBytes, MaxLookupBytes, MaxShardBytes, MaxReplyBytes)
 	}
+	if MaxPullBytes != 1<<20 || MaxPullBatch != 256 {
+		t.Fatalf("MaxPullBytes, MaxPullBatch = %d, %d", MaxPullBytes, MaxPullBatch)
+	}
 	if XorbPathPrefix != "/v1/xorbs/default/" {
 		t.Fatalf("XorbPathPrefix = %q", XorbPathPrefix)
 	}
@@ -57,7 +60,7 @@ func TestPullRequestWire(t *testing.T) {
 	if err := json.Unmarshal(encoded, &out); err != nil {
 		t.Fatal(err)
 	}
-	if out != in {
+	if !reflect.DeepEqual(out, in) {
 		t.Fatalf("round trip\n got %+v\nwant %+v", out, in)
 	}
 }
@@ -77,8 +80,68 @@ func TestPullRequestSeedWire(t *testing.T) {
 	if err := json.Unmarshal(encoded, &out); err != nil {
 		t.Fatal(err)
 	}
-	if out != in {
+	if !reflect.DeepEqual(out, in) {
 		t.Fatalf("round trip\n got %+v\nwant %+v", out, in)
+	}
+}
+
+func TestPullRequestBatchWire(t *testing.T) {
+	t.Parallel()
+	in := PullRequest{Xorbs: []string{"aa", "bb"}, Shards: []string{"f1"}, Seed: true}
+	want := `{"xorbs":["aa","bb"],"shards":["f1"],"seed":true}`
+	encoded, err := json.Marshal(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(encoded) != want {
+		t.Fatalf("encoded\n got %s\nwant %s", encoded, want)
+	}
+	var out PullRequest
+	if err := json.Unmarshal(encoded, &out); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(out, in) {
+		t.Fatalf("round trip\n got %+v\nwant %+v", out, in)
+	}
+}
+
+func TestPullRequestOmitsEmptyFields(t *testing.T) {
+	t.Parallel()
+	for _, in := range []PullRequest{{}, {Xorbs: []string{}, Shards: []string{}}} {
+		encoded, err := json.Marshal(in)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(encoded) != `{}` {
+			t.Fatalf("encoded %+v\n got %s\nwant {}", in, encoded)
+		}
+	}
+}
+
+func TestPeerWire(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		in   Peer
+		want string
+	}{
+		{Peer{ID: "peer-1", URL: "http://peer-1:8080"}, `{"id":"peer-1","url":"http://peer-1:8080"}`},
+		{Peer{ID: "peer-1", URL: "http://peer-1:8080", Upstream: true}, `{"id":"peer-1","url":"http://peer-1:8080","upstream":true}`},
+	}
+	for _, c := range cases {
+		got, err := json.Marshal(c.in)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(got) != c.want {
+			t.Fatalf("encoded\n got %s\nwant %s", got, c.want)
+		}
+		var out Peer
+		if err := json.Unmarshal(got, &out); err != nil {
+			t.Fatal(err)
+		}
+		if out != c.in {
+			t.Fatalf("round trip\n got %+v\nwant %+v", out, c.in)
+		}
 	}
 }
 
@@ -154,6 +217,44 @@ func TestAnnounceRequestFilesWire(t *testing.T) {
 	}
 }
 
+func TestAnnounceRequestShardsWire(t *testing.T) {
+	t.Parallel()
+	in := AnnounceRequest{
+		Peer:         Peer{ID: "peer-1", URL: "http://peer-1:8080"},
+		Epoch:        "epoch-1",
+		AddShards:    []File{{Hash: "f1", SHA256: "s1"}},
+		RemoveShards: []string{"f2"},
+	}
+	want := `{"peer":{"id":"peer-1","url":"http://peer-1:8080"},"epoch":"epoch-1","add_shards":[{"hash":"f1","sha256":"s1"}],"remove_shards":["f2"]}`
+	got, err := json.Marshal(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != want {
+		t.Fatalf("encoded\n got %s\nwant %s", got, want)
+	}
+	var out AnnounceRequest
+	if err := json.Unmarshal(got, &out); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(out, in) {
+		t.Fatalf("round trip\n got %+v\nwant %+v", out, in)
+	}
+}
+
+func TestAnnounceRequestOmitsEmptyShards(t *testing.T) {
+	t.Parallel()
+	in := AnnounceRequest{Peer: Peer{ID: "peer-1", URL: "http://peer-1:8080"}, Epoch: "epoch-1", AddShards: []File{}, RemoveShards: []string{}}
+	want := `{"peer":{"id":"peer-1","url":"http://peer-1:8080"},"epoch":"epoch-1"}`
+	got, err := json.Marshal(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != want {
+		t.Fatalf("encoded\n got %s\nwant %s", got, want)
+	}
+}
+
 func TestAnnounceRequestOmitsEmptyDelta(t *testing.T) {
 	t.Parallel()
 	in := AnnounceRequest{Peer: Peer{ID: "peer-1", URL: "http://peer-1:8080"}, Epoch: "epoch-1"}
@@ -199,6 +300,11 @@ func TestAnnounceResponseWire(t *testing.T) {
 		{AnnounceResponse{TTL: 30}, `{"ttl":30}`},
 		{AnnounceResponse{Resync: true, TTL: 30}, `{"resync":true,"ttl":30}`},
 		{AnnounceResponse{TTL: 30, MinSeeds: 2}, `{"ttl":30,"min_seeds":2}`},
+		// Upstreams keep the order given: sorting them is the tracker's job.
+		{
+			AnnounceResponse{TTL: 30, Upstreams: []Peer{{ID: "p2", URL: "http://p2", Upstream: true}, {ID: "p1", URL: "http://p1", Upstream: true}}},
+			`{"ttl":30,"upstreams":[{"id":"p2","url":"http://p2","upstream":true},{"id":"p1","url":"http://p1","upstream":true}]}`,
+		},
 	}
 	for _, c := range cases {
 		got, err := json.Marshal(c.in)
@@ -212,7 +318,7 @@ func TestAnnounceResponseWire(t *testing.T) {
 		if err := json.Unmarshal(got, &out); err != nil {
 			t.Fatal(err)
 		}
-		if out != c.in {
+		if !reflect.DeepEqual(out, c.in) {
 			t.Fatalf("round trip\n got %+v\nwant %+v", out, c.in)
 		}
 	}
@@ -220,8 +326,14 @@ func TestAnnounceResponseWire(t *testing.T) {
 
 func TestPeersResponseWire(t *testing.T) {
 	t.Parallel()
-	in := PeersResponse{Peers: []PeerStatus{{ID: "peer-1", URL: "http://peer-1:8080", Epoch: "epoch-1", Expiry: time.Date(2026, 9, 23, 14, 0, 0, 0, time.UTC), Holdings: 3, Files: 2}}}
-	want := `{"peers":[{"id":"peer-1","url":"http://peer-1:8080","epoch":"epoch-1","expiry":"2026-09-23T14:00:00Z","holdings":3,"files":2}]}`
+	expiry := time.Date(2026, 9, 23, 14, 0, 0, 0, time.UTC)
+	in := PeersResponse{Peers: []PeerStatus{
+		{ID: "peer-1", URL: "http://peer-1:8080", Upstream: true, Epoch: "epoch-1", Expiry: expiry, Holdings: 3, Shards: 4, Files: 2},
+		{ID: "peer-2", URL: "http://peer-2:8080", Epoch: "epoch-2", Expiry: expiry},
+	}}
+	want := `{"peers":[` +
+		`{"id":"peer-1","url":"http://peer-1:8080","upstream":true,"epoch":"epoch-1","expiry":"2026-09-23T14:00:00Z","holdings":3,"shards":4,"files":2},` +
+		`{"id":"peer-2","url":"http://peer-2:8080","epoch":"epoch-2","expiry":"2026-09-23T14:00:00Z","holdings":0,"shards":0,"files":0}]}`
 	got, err := json.Marshal(in)
 	if err != nil {
 		t.Fatal(err)

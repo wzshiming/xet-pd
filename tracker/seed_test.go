@@ -4,6 +4,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -55,7 +56,7 @@ func TestSeedAsksTopRankedNonHolderOnce(t *testing.T) {
 		}
 	}
 	got := top.Pulls()[0]
-	if got.Req != (apis.PullRequest{File: seedFile.Hash, Seed: true}) || got.Header.Get("Authorization") != "Bearer "+secret {
+	if !reflect.DeepEqual(got.Req, apis.PullRequest{File: seedFile.Hash, Seed: true}) || got.Header.Get("Authorization") != "Bearer "+secret {
 		t.Fatalf("pull = %+v with Authorization %q, want a seed pull of the file with the bearer secret", got.Req, got.Header.Get("Authorization"))
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -179,7 +180,7 @@ func TestAnnounceRequiresSecret(t *testing.T) {
 	if len(xorbHolders(reg, testHash)) != 0 {
 		t.Fatal("unauthenticated announce changed the registry")
 	}
-	if status, _, resp := post(t, srv, body, "Authorization", "Bearer "+secret); status != http.StatusOK || resp != (apis.AnnounceResponse{TTL: 30, MinSeeds: 1}) || len(xorbHolders(reg, testHash)) != 1 {
+	if status, _, resp := post(t, srv, body, "Authorization", "Bearer "+secret); status != http.StatusOK || !reflect.DeepEqual(resp, apis.AnnounceResponse{TTL: 30, MinSeeds: 1}) || len(xorbHolders(reg, testHash)) != 1 {
 		t.Fatalf("authenticated announce = %d %+v", status, resp)
 	}
 	if _, text := request(t, http.MethodGet, srv.URL+apis.PeersPath, ""); strings.Contains(text, secret) {

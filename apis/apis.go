@@ -33,6 +33,10 @@ const (
 	MaxShardBytes = 64 << 20
 	// MaxReplyBytes caps an announce reply and a pull request body, and how much of a reply is drained before its connection is reused.
 	MaxReplyBytes = 4096
+	// MaxPullBytes caps a pull request body.
+	MaxPullBytes = 1 << 20
+	// MaxPullBatch caps the Xorbs and Shards entries of one pull request together.
+	MaxPullBatch = 256
 )
 
 // MaxIDLen bounds Peer.ID and AnnounceRequest.Epoch, in bytes.
@@ -53,11 +57,15 @@ func ValidLabel(s string, maxLen int) bool {
 	return true
 }
 
-// PullRequest is the PullPath body: a pull names a file.
+// PullRequest is the PullPath body: at least one entry across Xorbs and Shards, or a File; 202 means accepted, the pulls run asynchronously.
 type PullRequest struct {
-	// File, in the form of File.Hash, names a file to pull complete: its shard and every xorb the shard references.
+	// Xorbs lists hashes of xorbs to pull whole.
+	Xorbs []string `json:"xorbs,omitempty"`
+	// Shards lists hashes of files, in the form of File.Hash, whose ShardResponse the peer fetches.
+	Shards []string `json:"shards,omitempty"`
+	// File, in the form of File.Hash, names a file to pull complete: its shard and every xorb the shard references. Superseded by Xorbs/Shards.
 	File string `json:"file,omitempty"`
-	// Seed marks the copy as a seed copy, which the peer keeps until MinSeeds other live holders have it.
+	// Seed marks the copy as a seed copy, which the peer keeps until MinSeeds other live holders have it; it applies to every listed xorb.
 	Seed bool `json:"seed,omitempty"`
 }
 
@@ -67,6 +75,8 @@ type Peer struct {
 	ID string `json:"id"`
 	// URL is the peer's origin, scheme://host[:port] as Origin canonicalizes it, where its xorbs are fetched and pulls are posted.
 	URL string `json:"url"`
+	// Upstream is true when the peer is configured with an external hub and fetches from it; peers without it mirror through such peers.
+	Upstream bool `json:"upstream,omitempty"`
 }
 
 // File identifies a file by its xet file hash and its SHA-256; it stays comparable so it can be compared and keyed by value.
@@ -83,15 +93,19 @@ type AnnounceRequest struct {
 	Peer Peer `json:"peer"`
 	// Epoch is drawn at random once per peer start, 1 to 128 of [A-Za-z0-9._-]; a delta under another epoch than the registered one is refused with Resync.
 	Epoch string `json:"epoch"`
-	// Full replaces both the registered xorb set and file set: it discards them before the lists apply and (re)registers the peer; a delta applies Add and Remove to the xorbs, AddFiles and RemoveFiles to the files.
+	// Full replaces the registered xorb, shard and file sets: it discards them before the lists apply and (re)registers the peer; a delta applies Add and Remove to the xorbs, AddShards and RemoveShards to the shards, AddFiles and RemoveFiles to the files.
 	Full bool `json:"full,omitempty"`
 	// Add lists xorb hashes the peer holds, 64 hex digits each, lowercased by the tracker; one invalid hash rejects the whole announce.
 	Add []string `json:"add,omitempty"`
 	// Remove lists xorb hashes the peer dropped, in the form of Add; it applies after Add.
 	Remove []string `json:"remove,omitempty"`
-	// AddFiles lists files the peer holds complete, meaning it holds their shard and every xorb the shard references.
+	// AddShards lists files whose shard the peer holds: the shard bytes and the packed chunk offsets of every xorb it references, as ShardResponse carries them, whether or not it holds those xorbs.
+	AddShards []File `json:"add_shards,omitempty"`
+	// RemoveShards lists hashes of files whose shard the peer dropped, in the form of File.Hash; it applies after AddShards, so it wins inside one request.
+	RemoveShards []string `json:"remove_shards,omitempty"`
+	// AddFiles lists files the peer holds complete, meaning it holds their shard and every xorb the shard references. Superseded by AddShards/RemoveShards.
 	AddFiles []File `json:"add_files,omitempty"`
-	// RemoveFiles lists hashes of files the peer no longer holds complete, in the form of File.Hash.
+	// RemoveFiles lists hashes of files the peer no longer holds complete, in the form of File.Hash. Superseded by AddShards/RemoveShards.
 	RemoveFiles []string `json:"remove_files,omitempty"`
 }
 
@@ -103,6 +117,8 @@ type AnnounceResponse struct {
 	TTL int64 `json:"ttl"`
 	// MinSeeds is how many other live holders a seed copy needs before the peer may evict it.
 	MinSeeds int `json:"min_seeds,omitempty"`
+	// Upstreams lists the live peers whose Upstream is set, sorted by ID, on every reply; omitted when there are none.
+	Upstreams []Peer `json:"upstreams,omitempty"`
 }
 
 // PeerStatus is one live peer in PeersResponse.
@@ -111,13 +127,17 @@ type PeerStatus struct {
 	ID string `json:"id"`
 	// URL is the peer's canonical origin.
 	URL string `json:"url"`
+	// Upstream is the peer's Peer.Upstream.
+	Upstream bool `json:"upstream,omitempty"`
 	// Epoch is the epoch of the peer's last accepted announce.
 	Epoch string `json:"epoch"`
 	// Expiry is when the peer is dropped unless it announces again: its last accepted announce plus TTL.
 	Expiry time.Time `json:"expiry"`
 	// Holdings counts the distinct xorbs the peer announced.
 	Holdings int `json:"holdings"`
-	// Files counts the complete files the peer announced.
+	// Shards counts the shards the peer announced.
+	Shards int `json:"shards"`
+	// Files counts the complete files the peer announced. Superseded by Shards.
 	Files int `json:"files"`
 }
 
@@ -139,11 +159,11 @@ type LookupRequest struct {
 	Files []string `json:"files,omitempty"`
 }
 
-// FileLocation is a file and the live peers holding it complete.
+// FileLocation is a file and the live peers holding its shard.
 type FileLocation struct {
 	// File is embedded, so its hash and sha256 sit beside peers on the wire.
 	File
-	// Peers lists the live complete holders, best first.
+	// Peers lists the live peers holding the file's shard, best first.
 	Peers []Peer `json:"peers"`
 }
 
@@ -151,9 +171,9 @@ type FileLocation struct {
 type LookupResponse struct {
 	// Xorbs maps a requested xorb hash to its live holders, best first.
 	Xorbs map[string][]Peer `json:"xorbs,omitempty"`
-	// SHA256s maps a requested SHA-256 to the file it names and that file's location.
+	// SHA256s maps a requested SHA-256 to the file it names and the live peers holding the file's shard, best first.
 	SHA256s map[string]FileLocation `json:"sha256s,omitempty"`
-	// Files maps a requested file hash to the file's location.
+	// Files maps a requested file hash to the file and the live peers holding the file's shard, best first.
 	Files map[string]FileLocation `json:"files,omitempty"`
 }
 

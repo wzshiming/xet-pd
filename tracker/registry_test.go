@@ -504,13 +504,13 @@ func TestRestartedEpochDeltaResyncsAndDropsHoldings(t *testing.T) {
 
 func TestUnknownPeerHeartbeatResyncs(t *testing.T) {
 	r := newRegistry(time.Minute, 2)
-	if resp, _ := r.announce(deltaReq(testPeer(1), "e", nil, nil)); resp != (apis.AnnounceResponse{Resync: true, TTL: 60, MinSeeds: 2}) {
+	if resp, _ := r.announce(deltaReq(testPeer(1), "e", nil, nil)); !reflect.DeepEqual(resp, apis.AnnounceResponse{Resync: true, TTL: 60, MinSeeds: 2}) {
 		t.Fatalf("unknown heartbeat response = %+v, want resync with TTL and MinSeeds", resp)
 	}
 	if got := r.rank("h1"); len(got) != 0 {
 		t.Fatalf("rank = %v, want the unknown peer left unregistered by a delta", got)
 	}
-	if resp, _ := r.announce(fullReq(testPeer(1), "e", "h1")); resp != (apis.AnnounceResponse{TTL: 60, MinSeeds: 2}) {
+	if resp, _ := r.announce(fullReq(testPeer(1), "e", "h1")); !reflect.DeepEqual(resp, apis.AnnounceResponse{TTL: 60, MinSeeds: 2}) {
 		t.Fatalf("full from unknown peer = %+v, want accepted with TTL and MinSeeds", resp)
 	}
 	if got := xorbHolders(r, "h1"); !slices.Equal(got, []apis.Peer{testPeer(1)}) {
@@ -550,7 +550,7 @@ func TestSnapshotListsLivePeers(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	const wantJSON = `{"id":"p2","url":"http://p2","epoch":"e2","expiry":"1970-01-01T00:17:40Z","holdings":2,"files":1}`
+	const wantJSON = `{"id":"p2","url":"http://p2","epoch":"e2","expiry":"1970-01-01T00:17:40Z","holdings":2,"shards":0,"files":1}`
 	if string(b) != wantJSON {
 		t.Fatalf("snapshot JSON = %s, want %s", b, wantJSON)
 	}

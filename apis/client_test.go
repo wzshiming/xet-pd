@@ -121,7 +121,7 @@ func TestAnnounce(t *testing.T) {
 	srv, reqs := replying(t, http.StatusOK, `{"ttl":30,"min_seeds":2}`)
 	req := AnnounceRequest{Peer: Peer{ID: "p1", URL: "http://p1"}, Epoch: "e1", Full: true}
 	resp, err := Announce(t.Context(), srv.Client(), srv.URL, "s3cret", req)
-	if err != nil || resp != (AnnounceResponse{TTL: 30, MinSeeds: 2}) {
+	if err != nil || !reflect.DeepEqual(resp, AnnounceResponse{TTL: 30, MinSeeds: 2}) {
 		t.Fatalf("Announce = %+v, %v, want TTL 30 and MinSeeds 2", resp, err)
 	}
 	want := seen{http.MethodPost, AnnouncePath, "application/json", "Bearer s3cret", "", `{"peer":{"id":"p1","url":"http://p1"},"epoch":"e1","full":true}`}

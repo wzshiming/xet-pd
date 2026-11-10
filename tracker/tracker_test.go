@@ -3,6 +3,7 @@ package tracker
 import (
 	"io"
 	"net/http"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -219,7 +220,7 @@ func TestAnnounceSeedsCompleteFile(t *testing.T) {
 			t.Fatalf("%s saw %d pulls, want %d", id, len(p.Pulls()), want)
 		}
 	}
-	if got := top.Pulls()[0]; got.Req != (apis.PullRequest{File: seedFile.Hash, Seed: true}) || got.Header.Get("Authorization") != "Bearer "+secret {
+	if got := top.Pulls()[0]; !reflect.DeepEqual(got.Req, apis.PullRequest{File: seedFile.Hash, Seed: true}) || got.Header.Get("Authorization") != "Bearer "+secret {
 		t.Fatalf("pull = %+v with Authorization %q", got.Req, got.Header.Get("Authorization"))
 	}
 	if n := clustertest.Scrape(t, srv.URL)[`xetpd_tracker_seed_requests_total{result="ok"}`]; n != 1 {

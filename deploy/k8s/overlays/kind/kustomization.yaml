@@ -5,8 +5,8 @@ resources:
   - ../../base
 # Loaded into the nodes with kind load docker-image, never pulled.
 images:
-  - name: ghcr.io/wzshiming/xet-pd-gateway
-    newName: xet-pd-gateway
+  - name: ghcr.io/wzshiming/xet-pd-tracker
+    newName: xet-pd-tracker
     newTag: kind
   - name: ghcr.io/wzshiming/xet-pd-peer
     newName: xet-pd-peer
@@ -18,6 +18,5 @@ secretGenerator:
     options:
       disableNameSuffixHash: true
 patches:
-  - path: gateway-patch.yaml
+  - path: tracker-patch.yaml
   - path: peer-patch.yaml
-  - path: pvc-patch.yaml

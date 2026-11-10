@@ -4,9 +4,11 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"mime"
 	"mime/multipart"
 	"net"
@@ -51,7 +53,7 @@ func hasRemove(a clustertest.Announce, hash xet.XorbHash) bool {
 // seedStore commits body into a data directory before a peer opens it.
 func seedStore(t *testing.T, dir string, hash xet.XorbHash, body []byte) {
 	t.Helper()
-	store, err := local.NewStorage(local.WithBasePath(dir))
+	store, err := local.NewStorage(local.WithBasePath(filepath.Join(dir, "data")))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -61,12 +63,23 @@ func seedStore(t *testing.T, dir string, hash xet.XorbHash, body []byte) {
 }
 
 func xorbPath(dir string, hash xet.XorbHash) string {
-	return filepath.Join(dir, filepath.FromSlash(storage.ObjectKey("xorbs", hash.String())))
+	return filepath.Join(dir, "data", filepath.FromSlash(storage.ObjectKey("xorbs", hash.String())))
 }
 
-func newTestPeer(t *testing.T, gw string, mod func(*Config)) (*Peer, *httptest.Server) {
+// cluster starts a tracker and a peer it names as the holder of every xorb in bodies, each served whole.
+func cluster(t *testing.T, bodies map[xet.XorbHash][]byte) (*clustertest.FakeTracker, *clustertest.FakePeer) {
 	t.Helper()
-	cfg := Config{Advertise: "http://seed.test", Gateway: gw, DataDir: t.TempDir()}
+	tracker, holder := clustertest.NewFakeTracker(t), clustertest.NewFakePeer(t, "holder")
+	for hash, body := range bodies {
+		holder.ServeXorb(hash, body)
+		tracker.Hold(holder.Peer(), hash)
+	}
+	return tracker, holder
+}
+
+func newTestPeer(t *testing.T, tracker string, mod func(*Config)) (*Peer, *httptest.Server) {
+	t.Helper()
+	cfg := Config{Advertise: "http://seed.test", Tracker: tracker, Upstream: "http://upstream.test", DataDir: t.TempDir()}
 	if mod != nil {
 		mod(&cfg)
 	}
@@ -126,15 +139,12 @@ func TestStartupFullAnnouncesSeededInventory(t *testing.T) {
 	dir := t.TempDir()
 	seedStore(t, dir, a, bodyA)
 	seedStore(t, dir, b, bodyB)
-	g := clustertest.NewFakeGateway(t, func(w http.ResponseWriter, _ *http.Request) {
-		t.Error("seeded object reached the gateway")
-		w.WriteHeader(http.StatusInternalServerError)
+	tracker := clustertest.NewFakeTracker(t)
+	p, srv := newTestPeer(t, tracker.URL, func(c *Config) {
+		c.DataDir, c.Heartbeat, c.Secret = dir, time.Hour, "s3cret"
 	})
-	p, srv := newTestPeer(t, g.URL, func(c *Config) {
-		c.DataDir, c.Heartbeat, c.Secret, c.Node = dir, time.Hour, "s3cret", "node-a"
-	})
-	first := g.Announce(t, 0)
-	want := apis.AnnounceRequest{Peer: apis.Peer{ID: peerID(p), URL: "http://seed.test", Node: "node-a"}, Epoch: peerEpoch(p), Full: true, Add: hashes(a, b)}
+	first := tracker.Announce(t, 0)
+	want := apis.AnnounceRequest{Peer: apis.Peer{ID: peerID(p), URL: "http://seed.test"}, Epoch: peerEpoch(p), Full: true, Add: hashes(a, b)}
 	if got := first.Req; !slices.Equal(got.Add, want.Add) || got.Peer != want.Peer || got.Epoch != want.Epoch || !got.Full || len(got.Remove) != 0 {
 		t.Fatalf("startup announce = %+v, want %+v", got, want)
 	}
@@ -145,24 +155,30 @@ func TestStartupFullAnnouncesSeededInventory(t *testing.T) {
 	if err != nil || resp.StatusCode != http.StatusOK || !bytes.Equal(got, bodyA) {
 		t.Fatalf("GET seeded = %d, %d bytes, %v", resp.StatusCode, len(got), err)
 	}
-	if n := len(g.Announces()); n != 1 {
+	if n := len(tracker.Announces()); n != 1 {
 		t.Fatalf("announces after startup = %d, want 1", n)
+	}
+	if n := len(tracker.Lookups()); n != 0 {
+		t.Fatalf("lookups for a seeded object = %d, want 0", n)
 	}
 }
 
 func TestConfigValidation(t *testing.T) {
-	base := Config{Advertise: "http://seed:8080/", Gateway: "https://gw.example/", DataDir: t.TempDir()}
+	base := Config{Advertise: "http://seed:8080/", Tracker: "https://tracker.example/", Upstream: "https://hub.example/", DataDir: t.TempDir()}
 	bad := map[string]func(*Config){
 		"missing data dir":      func(c *Config) { c.DataDir = "" },
-		"gateway userinfo":      func(c *Config) { c.Gateway = "http://u:p@gw" },
-		"gateway query":         func(c *Config) { c.Gateway = "http://gw?x=1" },
-		"gateway fragment":      func(c *Config) { c.Gateway = "http://gw#f" },
-		"gateway base path":     func(c *Config) { c.Gateway = "http://gw/base" },
-		"gateway scheme":        func(c *Config) { c.Gateway = "ftp://gw" },
-		"gateway no host":       func(c *Config) { c.Gateway = "http:///x" },
-		"gateway empty host":    func(c *Config) { c.Gateway = "http://:1234" },
-		"gateway port range":    func(c *Config) { c.Gateway = "http://gw:65536" },
-		"gateway credentials":   func(c *Config) { c.Gateway = "http://bob:hunter2@gw/%zz" },
+		"tracker userinfo":      func(c *Config) { c.Tracker = "http://u:p@tracker" },
+		"tracker query":         func(c *Config) { c.Tracker = "http://tracker?x=1" },
+		"tracker fragment":      func(c *Config) { c.Tracker = "http://tracker#f" },
+		"tracker base path":     func(c *Config) { c.Tracker = "http://tracker/base" },
+		"tracker scheme":        func(c *Config) { c.Tracker = "ftp://tracker" },
+		"tracker no host":       func(c *Config) { c.Tracker = "http:///x" },
+		"tracker empty host":    func(c *Config) { c.Tracker = "http://:1234" },
+		"tracker port range":    func(c *Config) { c.Tracker = "http://tracker:65536" },
+		"tracker credentials":   func(c *Config) { c.Tracker = "http://bob:hunter2@tracker/%zz" },
+		"upstream base path":    func(c *Config) { c.Upstream = "http://hub/base" },
+		"upstream scheme":       func(c *Config) { c.Upstream = "ftp://hub" },
+		"upstream credentials":  func(c *Config) { c.Upstream = "http://bob:hunter2@hub/%zz" },
 		"advertise relative":    func(c *Config) { c.Advertise = "seed:8080" },
 		"advertise empty":       func(c *Config) { c.Advertise = "" },
 		"advertise empty port":  func(c *Config) { c.Advertise = "http://seed:" },
@@ -190,21 +206,21 @@ func TestConfigValidation(t *testing.T) {
 	}
 	defer func() { _ = p.Close() }()
 	cfg := configOf(p)
-	if cfg.Advertise != "http://seed:8080" || cfg.Gateway != "https://gw.example" {
-		t.Fatalf("normalized URLs = %q %q", cfg.Advertise, cfg.Gateway)
+	if cfg.Advertise != "http://seed:8080" || cfg.Tracker != "https://tracker.example" || cfg.Upstream != "https://hub.example" {
+		t.Fatalf("normalized URLs = %q %q %q", cfg.Advertise, cfg.Tracker, cfg.Upstream)
 	}
 	if cfg.MaxPulls != 8 || cfg.PullTimeout != 10*time.Minute || cfg.Heartbeat != 10*time.Second {
 		t.Fatalf("defaults = %+v", cfg)
 	}
 }
 
-func TestConfigRejectsInvalidNode(t *testing.T) {
-	p, err := New(Config{Advertise: "http://seed:8080", Gateway: "http://gw", DataDir: t.TempDir(), Node: "bad node"})
+func TestConfigRequiresUpstream(t *testing.T) {
+	p, err := New(Config{Advertise: "http://seed:8080", Tracker: "http://tracker", DataDir: t.TempDir()})
 	if err == nil {
 		_ = p.Close()
-		t.Fatal(`New accepted node "bad node"`)
+		t.Fatal("New accepted a config without an upstream")
 	}
-	if want := `node "bad node": expected 1 to 253 of [A-Za-z0-9._-]`; err.Error() != want {
+	if want := "upstream is required"; err.Error() != want {
 		t.Fatalf("New error = %q, want %q", err, want)
 	}
 }
@@ -213,7 +229,7 @@ func TestNewIdentityAndSpoolCleanup(t *testing.T) {
 	dir := t.TempDir()
 	stale := filepath.Join(dir, "spool", "deadbeef-123.part")
 	keep := filepath.Join(dir, "spool", "notes.txt")
-	ready := filepath.Join(dir, "xorbs", "ab", "cd", "ef")
+	ready := filepath.Join(dir, "data", "xorbs", "ab", "cd", "ef")
 	for _, f := range []string{stale, keep, ready} {
 		if err := os.MkdirAll(filepath.Dir(f), 0o755); err != nil {
 			t.Fatal(err)
@@ -222,7 +238,7 @@ func TestNewIdentityAndSpoolCleanup(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	a, err := New(Config{Advertise: "http://seed:8080", Gateway: "http://gw", DataDir: dir})
+	a, err := New(Config{Advertise: "http://seed:8080", Tracker: "http://tracker", Upstream: "http://hub", DataDir: dir})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -235,7 +251,7 @@ func TestNewIdentityAndSpoolCleanup(t *testing.T) {
 			t.Fatalf("New removed %s: %v", f, err)
 		}
 	}
-	b, err := New(Config{Advertise: "http://seed:8080/", Gateway: "http://gw2", DataDir: t.TempDir()})
+	b, err := New(Config{Advertise: "http://seed:8080/", Tracker: "http://tracker2", Upstream: "http://hub", DataDir: t.TempDir()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -243,7 +259,7 @@ func TestNewIdentityAndSpoolCleanup(t *testing.T) {
 	if peerID(a) == "" || peerID(a) != peerID(b) {
 		t.Fatalf("id not stable for the same advertise: %q vs %q", peerID(a), peerID(b))
 	}
-	c, err := New(Config{Advertise: "http://other:8080", Gateway: "http://gw", DataDir: t.TempDir()})
+	c, err := New(Config{Advertise: "http://other:8080", Tracker: "http://tracker", Upstream: "http://hub", DataDir: t.TempDir()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -264,11 +280,8 @@ func TestNewIdentityAndSpoolCleanup(t *testing.T) {
 
 func TestWarmServe(t *testing.T) {
 	hash, body := clustertest.MakeXorb(t, 1, 4, 16<<10)
-	g := clustertest.NewFakeGateway(t, func(w http.ResponseWriter, _ *http.Request) {
-		t.Error("warm object reached the gateway")
-		w.WriteHeader(http.StatusInternalServerError)
-	})
-	p, srv := newTestPeer(t, g.URL, nil)
+	tracker := clustertest.NewFakeTracker(t)
+	p, srv := newTestPeer(t, tracker.URL, nil)
 	commitDirect(t, p, hash, body)
 	u := xorbURL(srv, hash)
 	etag := `"` + hash.String() + `"`
@@ -324,38 +337,115 @@ func TestWarmServe(t *testing.T) {
 		}
 	}
 	resp, _, _ = do(t, http.MethodPut, u)
-	if resp.StatusCode != http.StatusMethodNotAllowed && resp.StatusCode != http.StatusNotFound {
-		t.Fatalf("PUT = %d", resp.StatusCode)
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("PUT = %d, want 403", resp.StatusCode)
+	}
+	if n := len(tracker.Lookups()); n != 0 {
+		t.Fatalf("lookups for a warm object = %d, want 0", n)
 	}
 }
 
 // Like xet's CAS server, the route accepts any prefix segment and selects the xorb by hash alone.
 func TestXorbRouteIgnoresPrefix(t *testing.T) {
 	hash, body := clustertest.MakeXorb(t, 12, 2, 8<<10)
-	g := clustertest.NewFakeGateway(t, func(w http.ResponseWriter, _ *http.Request) {
-		t.Error("stored object reached the gateway")
-		w.WriteHeader(http.StatusInternalServerError)
-	})
-	p, srv := newTestPeer(t, g.URL, nil)
+	tracker := clustertest.NewFakeTracker(t)
+	p, srv := newTestPeer(t, tracker.URL, nil)
 	commitDirect(t, p, hash, body)
 	resp, got, err := do(t, http.MethodGet, srv.URL+"/v1/xorbs/x/"+hash.String())
 	if err != nil || resp.StatusCode != http.StatusOK || !bytes.Equal(got, body) {
 		t.Fatalf("GET under a foreign prefix = %d, %d bytes, %v", resp.StatusCode, len(got), err)
+	}
+	if n := len(tracker.Lookups()); n != 0 {
+		t.Fatalf("lookups for a stored object = %d, want 0", n)
+	}
+}
+
+func TestRelayAndHeadNeverPull(t *testing.T) {
+	held, body := clustertest.MakeXorb(t, 16, 2, 8<<10)
+	unknown, _ := clustertest.MakeXorb(t, 17, 2, 8<<10)
+	tracker, holder := cluster(t, map[xet.XorbHash][]byte{held: body})
+	p, srv := newTestPeer(t, tracker.URL, nil)
+	if resp, _, _ := do(t, http.MethodGet, xorbURL(srv, held), apis.PeerHeader, "other"); resp.StatusCode != http.StatusNotFound || len(tracker.Lookups()) != 0 {
+		t.Fatalf("relay GET of a xorb held elsewhere = %d after %d lookups, want 404 and none", resp.StatusCode, len(tracker.Lookups()))
+	}
+	if resp, got, _ := do(t, http.MethodHead, xorbURL(srv, held)); resp.StatusCode != http.StatusOK || resp.ContentLength != -1 || len(got) != 0 {
+		t.Fatalf("HEAD of a xorb held elsewhere = %d, length %d, want 200 without a length", resp.StatusCode, resp.ContentLength)
+	}
+	if resp, _, _ := do(t, http.MethodHead, xorbURL(srv, unknown)); resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("HEAD of a xorb nobody holds = %d, want 404", resp.StatusCode)
+	}
+	if n := len(holder.Requests()); n != 0 || stored(t, p, held) {
+		t.Fatalf("holder GETs = %d, stored %v; want no pull", n, stored(t, p, held))
+	}
+}
+
+func TestShardRouteServesKnownFilesToHoldersOfTheSecret(t *testing.T) {
+	tf := makeFile(t, 93, 94)
+	p, srv := newTestPeer(t, clustertest.NewFakeTracker(t).URL, func(c *Config) { c.Secret, c.Heartbeat = testSecret, time.Hour })
+	ingest(t, storeOf(p), tf)
+	auth := []string{"Authorization", "Bearer " + testSecret, apis.PeerHeader, "other"}
+	resp, body, err := do(t, http.MethodGet, srv.URL+apis.ShardPathPrefix+tf.file.Hash, auth...)
+	var got apis.ShardResponse
+	if err != nil || resp.StatusCode != http.StatusOK || json.Unmarshal(body, &got) != nil {
+		t.Fatalf("GET shard = %d %q, %v; want the file's ShardResponse", resp.StatusCode, body, err)
+	}
+	if sh, err := storage.DecodeStoredShard(bytes.NewReader(got.Shard)); err != nil || sh.File(tf.hash) == nil {
+		t.Fatalf("served shard decodes to %v, want the shard of %s", err, tf.hash)
+	}
+	if !maps.EqualFunc(got.Offsets, tf.resp.Offsets, slices.Equal[[]uint64]) {
+		t.Fatalf("served offsets = %v, want %v", got.Offsets, tf.resp.Offsets)
+	}
+	for _, tt := range []struct {
+		file string
+		hdr  []string
+		want int
+	}{
+		{tf.file.Hash, nil, http.StatusUnauthorized},
+		{strings.Repeat("cd", 32), auth, http.StatusNotFound},
+		{"nothex", auth, http.StatusBadRequest},
+	} {
+		if resp, body, _ := do(t, http.MethodGet, srv.URL+apis.ShardPathPrefix+tt.file, tt.hdr...); resp.StatusCode != tt.want {
+			t.Fatalf("GET shard of %s with %q = %d %q, want %d", tt.file, tt.hdr, resp.StatusCode, body, tt.want)
+		}
+	}
+	awaitSamples(t, srv, map[string]float64{
+		`xetpd_peer_shard_gets_total{status="200"}`: 1, `xetpd_peer_shard_gets_total{status="401"}`: 1,
+		`xetpd_peer_shard_gets_total{status="404"}`: 1, `xetpd_peer_shard_gets_total{status="400"}`: 1,
+	})
+}
+
+func TestShardRouteErrorNamesNoLocalPath(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores file modes")
+	}
+	tf := makeFile(t, 95)
+	gone := tf.xorbHashes()[0]
+	p, srv := newTestPeer(t, clustertest.NewFakeTracker(t).URL, nil)
+	ingest(t, storeOf(p), tf)
+	deleteStored(t, p, gone)
+	path := sidecarPath(storeOf(p), gone)
+	if err := os.Chmod(path, 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(path, 0o644) })
+	resp, body, _ := do(t, http.MethodGet, srv.URL+apis.ShardPathPrefix+tf.file.Hash)
+	if resp.StatusCode != http.StatusBadGateway || strings.Contains(string(body), configOf(p).DataDir) {
+		t.Fatalf("GET shard with an unreadable sidecar = %d %q, want 502 naming no local path", resp.StatusCode, body)
 	}
 }
 
 func TestMetricsEndpoint(t *testing.T) {
 	hash, body := clustertest.MakeXorb(t, 53, 2, 8<<10)
 	cold, coldBody := clustertest.MakeXorb(t, 54, 2, 8<<10)
-	g := clustertest.NewFakeGateway(t, clustertest.ServeBody(coldBody))
-	p, srv := newTestPeer(t, g.URL, func(c *Config) { c.Heartbeat, c.Secret, c.XorbCacheSize = time.Hour, "s3cret", 1<<20 })
+	tracker, _ := cluster(t, map[xet.XorbHash][]byte{cold: coldBody})
+	p, srv := newTestPeer(t, tracker.URL, func(c *Config) { c.Heartbeat, c.Secret, c.XorbCacheSize = time.Hour, "s3cret", 1<<20 })
 	resp, text, err := do(t, http.MethodGet, srv.URL+"/metrics")
 	if err != nil || resp.StatusCode != http.StatusOK || !strings.HasPrefix(resp.Header.Get("Content-Type"), "text/plain") {
 		t.Fatalf("GET /metrics without credentials = %d %q, %v, want 200 text/plain", resp.StatusCode, resp.Header.Get("Content-Type"), err)
 	}
 	for _, typ := range []string{
-		"xorb_gets_total counter", "pulls_total counter", "announces_total counter", "restore_dropped_total counter",
-		"xorb_cache_bytes gauge", "xorb_cache_entries gauge", "xorb_cache_limit_bytes gauge", "pulls_in_flight gauge", "cooldowns gauge",
+		"xorb_gets_total counter", "pulls_total counter", "announces_total counter", "restore_dropped_total counter", "shard_gets_total counter",
+		"files gauge", "xorb_cache_bytes gauge", "xorb_cache_entries gauge", "xorb_cache_limit_bytes gauge", "pulls_in_flight gauge", "cooldowns gauge",
 	} {
 		if !strings.Contains("\n"+string(text), "\n# TYPE xetpd_peer_"+typ+"\n") {
 			t.Fatalf("GET /metrics lacks # TYPE xetpd_peer_%s", typ)
@@ -369,9 +459,10 @@ func TestMetricsEndpoint(t *testing.T) {
 	}
 	for _, key := range []string{
 		`xetpd_peer_xorb_gets_total{requester="client",status="200"}`, `xetpd_peer_xorb_gets_total{requester="client",status="206"}`, `xetpd_peer_xorb_gets_total{requester="client",status="404"}`,
-		`xetpd_peer_xorb_gets_total{requester="gateway",status="200"}`, `xetpd_peer_xorb_gets_total{requester="gateway",status="206"}`, `xetpd_peer_xorb_gets_total{requester="gateway",status="404"}`,
+		`xetpd_peer_xorb_gets_total{requester="peer",status="200"}`, `xetpd_peer_xorb_gets_total{requester="peer",status="206"}`, `xetpd_peer_xorb_gets_total{requester="peer",status="404"}`,
 		`xetpd_peer_pulls_total{result="ok"}`, `xetpd_peer_pulls_total{result="not_found"}`, `xetpd_peer_pulls_total{result="canceled"}`, `xetpd_peer_pulls_total{result="timeout"}`, `xetpd_peer_pulls_total{result="error"}`,
-		"xetpd_peer_restore_dropped_total", "xetpd_peer_xorb_cache_bytes", "xetpd_peer_xorb_cache_entries", "xetpd_peer_pulls_in_flight", "xetpd_peer_cooldowns",
+		`xetpd_peer_shard_gets_total{status="200"}`, `xetpd_peer_shard_gets_total{status="404"}`,
+		"xetpd_peer_restore_dropped_total", "xetpd_peer_files", "xetpd_peer_xorb_cache_bytes", "xetpd_peer_xorb_cache_entries", "xetpd_peer_pulls_in_flight", "xetpd_peer_cooldowns",
 	} {
 		if v, ok := m[key]; !ok || v != 0 {
 			t.Fatalf("fresh %s = %v (present %v), want a visible 0", key, v, ok)
@@ -395,7 +486,7 @@ func TestMetricsEndpoint(t *testing.T) {
 	}{
 		{xorbURL(srv, hash), nil, http.StatusOK},
 		{xorbURL(srv, hash), []string{"Range", "bytes=0-9"}, http.StatusPartialContent},
-		{xorbURL(srv, cold), []string{apis.PeerHeader, "gw"}, http.StatusNotFound},
+		{xorbURL(srv, cold), []string{apis.PeerHeader, "other"}, http.StatusNotFound},
 		{srv.URL + "/v1/xorbs/default/nothex", nil, http.StatusBadRequest},
 	} {
 		if resp, _, _ := do(t, http.MethodGet, req.url, req.hdr...); resp.StatusCode != req.status {
@@ -403,10 +494,10 @@ func TestMetricsEndpoint(t *testing.T) {
 		}
 	}
 	awaitSamples(t, srv, map[string]float64{
-		`xetpd_peer_xorb_gets_total{requester="client",status="200"}`:  1,
-		`xetpd_peer_xorb_gets_total{requester="client",status="206"}`:  1,
-		`xetpd_peer_xorb_gets_total{requester="gateway",status="404"}`: 1,
-		`xetpd_peer_xorb_gets_total{requester="client",status="400"}`:  1,
+		`xetpd_peer_xorb_gets_total{requester="client",status="200"}`: 1,
+		`xetpd_peer_xorb_gets_total{requester="client",status="206"}`: 1,
+		`xetpd_peer_xorb_gets_total{requester="peer",status="404"}`:   1,
+		`xetpd_peer_xorb_gets_total{requester="client",status="400"}`: 1,
 	})
 	m = clustertest.Scrape(t, srv.URL)
 	if m["xetpd_peer_xorb_cache_bytes"] != float64(usage(p)) || m["xetpd_peer_xorb_cache_entries"] != 1 || m["xetpd_peer_xorb_cache_limit_bytes"] != float64(configOf(p).XorbCacheSize) {
@@ -414,6 +505,8 @@ func TestMetricsEndpoint(t *testing.T) {
 	}
 	pullAndSettle(t, p, srv, cold, coldBody)
 	awaitSamples(t, srv, map[string]float64{`xetpd_peer_pulls_total{result="ok"}`: 1, "xetpd_peer_pulls_in_flight": 0})
+	ingest(t, storeOf(p), makeFile(t, 55))
+	awaitSamples(t, srv, map[string]float64{"xetpd_peer_files": 1})
 }
 
 type result struct {
@@ -439,8 +532,9 @@ func TestGatedPullServesPrefixBeforeUpstreamCompletes(t *testing.T) {
 	hash, body := clustertest.MakeXorb(t, 2, 4, 16<<10)
 	release := make(chan struct{})
 	const prefix = 20 << 10
-	g := clustertest.NewFakeGateway(t, clustertest.GatedBody(body, prefix, release))
-	p, srv := newTestPeer(t, g.URL, nil)
+	tracker, holder := cluster(t, map[xet.XorbHash][]byte{hash: body})
+	holder.GateXorb(hash, body, prefix, release)
+	p, srv := newTestPeer(t, tracker.URL, nil)
 	u := xorbURL(srv, hash)
 
 	resp, got, err := do(t, http.MethodGet, u, "Range", "bytes=0-1023")
@@ -448,11 +542,11 @@ func TestGatedPullServesPrefixBeforeUpstreamCompletes(t *testing.T) {
 		t.Fatalf("prefix range while gated = %d, %d bytes, %v", resp.StatusCode, len(got), err)
 	}
 	resp, _, _ = do(t, http.MethodHead, u)
-	if resp.StatusCode != http.StatusOK || resp.ContentLength != int64(len(body)) {
-		t.Fatalf("HEAD while gated = %d, length %d", resp.StatusCode, resp.ContentLength)
+	if resp.StatusCode != http.StatusOK || resp.ContentLength != -1 {
+		t.Fatalf("HEAD while gated = %d, length %d, want 200 without a length", resp.StatusCode, resp.ContentLength)
 	}
 	late := doAsync(t, u, "Range", fmt.Sprintf("bytes=%d-%d", prefix, prefix))
-	// The last flushed byte proves the peer has consumed all the gateway sent before release.
+	// The last flushed byte proves the peer has consumed all the holder sent before release.
 	resp, got, err = do(t, http.MethodGet, u, "Range", fmt.Sprintf("bytes=%d-%d", prefix-1, prefix-1))
 	if err != nil || resp.StatusCode != http.StatusPartialContent || !bytes.Equal(got, body[prefix-1:prefix]) {
 		t.Fatalf("last flushed byte while gated = %d, %q, %v", resp.StatusCode, got, err)
@@ -478,14 +572,45 @@ func TestGatedPullServesPrefixBeforeUpstreamCompletes(t *testing.T) {
 	if resp.StatusCode != http.StatusOK || !bytes.Equal(got, body) {
 		t.Fatalf("relay GET after commit = %d", resp.StatusCode)
 	}
-	if n := len(g.Requests()); n != 1 {
-		t.Fatalf("gateway GETs = %d, want 1", n)
+	if n := len(holder.Requests()); n != 1 {
+		t.Fatalf("holder GETs = %d, want 1", n)
 	}
-	h := g.Requests()[0].Header
+	h := holder.Requests()[0].Header
 	if h.Get(apis.PeerHeader) != peerID(p) || h.Get("Authorization") != "" || h.Get("Range") != "" {
 		t.Fatalf("upstream request headers = %v", h)
 	}
 	clustertest.WaitFor(t, clustertest.WaitTimeout, "spool cleanup", spoolEmpty(p))
+}
+
+// A client reads the first bytes of a xorb while its only holder still holds back the rest.
+func TestServeWhilePulling(t *testing.T) {
+	hash, body := clustertest.MakeXorb(t, 18, 4, 64<<10)
+	const prefix = 100 << 10
+	release := make(chan struct{})
+	tracker, holder := cluster(t, nil)
+	holder.GateXorb(hash, body, prefix, release)
+	tracker.Hold(holder.Peer(), hash)
+	p, srv := newTestPeer(t, tracker.URL, nil)
+	resp, err := streamClient.Get(xorbURL(srv, hash))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	head := make([]byte, prefix/2)
+	if _, err := io.ReadFull(resp.Body, head); err != nil || resp.StatusCode != http.StatusOK || resp.ContentLength != int64(len(body)) || !bytes.Equal(head, body[:len(head)]) {
+		t.Fatalf("GET while the holder holds the rest = %d, length %d, first bytes %v", resp.StatusCode, resp.ContentLength, err)
+	}
+	if stored(t, p, hash) {
+		t.Fatal("xorb committed before the holder sent the rest")
+	}
+	close(release)
+	if rest, err := io.ReadAll(resp.Body); err != nil || !bytes.Equal(rest, body[len(head):]) {
+		t.Fatalf("rest after release = %d bytes, %v, want %d", len(rest), err, len(body)-len(head))
+	}
+	clustertest.WaitFor(t, clustertest.WaitTimeout, "the pulled xorb committed", admitted(p, hash))
+	if n := len(holder.Requests()); n != 1 {
+		t.Fatalf("holder GETs = %d, want 1", n)
+	}
 }
 
 // Readers are not held back for validation: a mismatching body reaches the client as a clean 200, only the pull fails.
@@ -493,8 +618,10 @@ func TestStreamDoesNotWaitForValidation(t *testing.T) {
 	hash, _ := clustertest.MakeXorb(t, 13, 4, 16<<10)
 	_, served := clustertest.MakeXorb(t, 14, 4, 16<<10)
 	release := make(chan struct{})
-	g := clustertest.NewFakeGateway(t, clustertest.GatedBody(served, 4<<10, release))
-	p, srv := newTestPeer(t, g.URL, nil)
+	tracker, holder := cluster(t, nil)
+	holder.GateXorb(hash, served, 4<<10, release)
+	tracker.Hold(holder.Peer(), hash)
+	p, srv := newTestPeer(t, tracker.URL, nil)
 	u := xorbURL(srv, hash)
 
 	resp, err := streamClient.Get(u)
@@ -516,29 +643,23 @@ func TestStreamDoesNotWaitForValidation(t *testing.T) {
 	if !cooling {
 		t.Fatal("failed pull left no cooldown")
 	}
-	if resp, _, _ := do(t, http.MethodGet, u); resp.StatusCode != http.StatusBadGateway || len(g.Requests()) != 1 {
-		t.Fatalf("GET in cooldown = %d, gateway GETs = %d, want 502 and 1", resp.StatusCode, len(g.Requests()))
+	if resp, _, _ := do(t, http.MethodGet, u); resp.StatusCode != http.StatusBadGateway || len(holder.Requests()) != 1 {
+		t.Fatalf("GET in cooldown = %d, holder GETs = %d, want 502 and 1", resp.StatusCode, len(holder.Requests()))
 	}
-	pr, err := http.Post(srv.URL+apis.PullPath, "application/json", strings.NewReader(`{"hash":"`+hash.String()+`"}`))
-	if err != nil {
-		t.Fatal(err)
-	}
-	_ = pr.Body.Close()
-	if pr.StatusCode != http.StatusAccepted {
-		t.Fatalf("pull in cooldown = %d, want 202", pr.StatusCode)
-	}
+	forcePull(t, p, hash)
 	clustertest.WaitFor(t, clustertest.WaitTimeout, "forced pull exit", noPulls(p))
 	clustertest.WaitFor(t, clustertest.WaitTimeout, "spool cleanup", spoolEmpty(p))
-	if n := len(g.Requests()); n != 2 {
-		t.Fatalf("gateway GETs after the forced pull = %d, want 2", n)
+	if n := len(holder.Requests()); n != 2 {
+		t.Fatalf("holder GETs after the forced pull = %d, want 2", n)
 	}
 }
 
 func TestConcurrentColdRequestsShareOnePull(t *testing.T) {
 	hash, body := clustertest.MakeXorb(t, 3, 4, 16<<10)
 	release := make(chan struct{})
-	g := clustertest.NewFakeGateway(t, clustertest.GatedBody(body, 4<<10, release))
-	_, srv := newTestPeer(t, g.URL, nil)
+	tracker, holder := cluster(t, map[xet.XorbHash][]byte{hash: body})
+	holder.GateXorb(hash, body, 4<<10, release)
+	_, srv := newTestPeer(t, tracker.URL, nil)
 	u := xorbURL(srv, hash)
 
 	const n = 10
@@ -555,8 +676,8 @@ func TestConcurrentColdRequestsShareOnePull(t *testing.T) {
 		})
 	}
 	wg.Wait()
-	if got := len(g.Requests()); got != 1 {
-		t.Fatalf("gateway GETs = %d, want 1", got)
+	if got := len(holder.Requests()); got != 1 {
+		t.Fatalf("holder GETs = %d, want 1", got)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
@@ -576,54 +697,58 @@ func TestConcurrentColdRequestsShareOnePull(t *testing.T) {
 			t.Fatalf("shared waiter = %d, %d bytes, %v", resp.StatusCode, len(got), err)
 		}
 	}
-	if got := len(g.Requests()); got != 1 {
-		t.Fatalf("gateway GETs = %d, want 1", got)
+	if got := len(holder.Requests()); got != 1 {
+		t.Fatalf("holder GETs = %d, want 1", got)
 	}
 }
 
 func TestUpstreamFailures(t *testing.T) {
 	hash, body := clustertest.MakeXorb(t, 4, 2, 8<<10)
 	other, _ := clustertest.MakeXorb(t, 5, 2, 8<<10)
-	status := func(code int) http.HandlerFunc {
-		return func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(code) }
-	}
 	t.Run("not found", func(t *testing.T) {
-		g := clustertest.NewFakeGateway(t, status(http.StatusNotFound))
-		_, srv := newTestPeer(t, g.URL, nil)
+		tracker, holder := cluster(t, nil)
+		tracker.Hold(holder.Peer(), hash)
+		_, srv := newTestPeer(t, tracker.URL, nil)
 		if resp, _, _ := do(t, http.MethodGet, xorbURL(srv, hash)); resp.StatusCode != http.StatusNotFound {
 			t.Fatalf("GET = %d", resp.StatusCode)
 		}
-		if resp, _, _ := do(t, http.MethodHead, xorbURL(srv, hash)); resp.StatusCode != http.StatusNotFound {
-			t.Fatalf("HEAD in cooldown = %d", resp.StatusCode)
+		if resp, _, _ := do(t, http.MethodGet, xorbURL(srv, hash)); resp.StatusCode != http.StatusNotFound {
+			t.Fatalf("GET in cooldown = %d", resp.StatusCode)
 		}
-		if n := len(g.Requests()); n != 1 {
-			t.Fatalf("gateway GETs = %d, want 1 (cooldown)", n)
+		if n, m := len(holder.Requests()), len(tracker.Lookups()); n != 1 || m != 1 {
+			t.Fatalf("holder GETs = %d, lookups = %d, want 1 and 1 (cooldown)", n, m)
 		}
 		awaitSamples(t, srv, map[string]float64{`xetpd_peer_pulls_total{result="not_found"}`: 1})
 	})
-	t.Run("upstream error", func(t *testing.T) {
-		g := clustertest.NewFakeGateway(t, status(http.StatusInternalServerError))
-		_, srv := newTestPeer(t, g.URL, nil)
-		if resp, _, _ := do(t, http.MethodGet, xorbURL(srv, hash)); resp.StatusCode != http.StatusBadGateway {
+	t.Run("holder error", func(t *testing.T) {
+		tracker := clustertest.NewFakeTracker(t)
+		rawHolder(t, tracker, "broken", hash, withStatus(http.StatusInternalServerError))
+		_, srv := newTestPeer(t, tracker.URL, nil)
+		// A holder failing before any byte is skipped; with none left the xorb has no copy.
+		if resp, _, _ := do(t, http.MethodGet, xorbURL(srv, hash)); resp.StatusCode != http.StatusNotFound {
 			t.Fatalf("GET = %d", resp.StatusCode)
 		}
 	})
 	t.Run("oversized", func(t *testing.T) {
-		g := clustertest.NewFakeGateway(t, func(w http.ResponseWriter, _ *http.Request) {
+		tracker := clustertest.NewFakeTracker(t)
+		gets := rawHolder(t, tracker, "oversized", hash, func(w http.ResponseWriter, _ *http.Request) {
 			w.Header().Set("Content-Length", strconv.Itoa(129<<20))
 			w.WriteHeader(http.StatusOK)
 		})
-		_, srv := newTestPeer(t, g.URL, nil)
-		if resp, _, _ := do(t, http.MethodGet, xorbURL(srv, hash)); resp.StatusCode != http.StatusBadGateway {
+		p, srv := newTestPeer(t, tracker.URL, nil)
+		if resp, _, _ := do(t, http.MethodGet, xorbURL(srv, hash)); resp.StatusCode != http.StatusNotFound {
 			t.Fatalf("GET = %d", resp.StatusCode)
 		}
-		if n := len(g.Requests()); n != 1 {
-			t.Fatalf("gateway GETs = %d, want 1", n)
+		if n := gets.Load(); n != 1 {
+			t.Fatalf("holder GETs = %d, want 1", n)
+		}
+		if stored(t, p, hash) {
+			t.Fatal("oversized xorb published")
 		}
 	})
 	t.Run("empty body", func(t *testing.T) {
-		g := clustertest.NewFakeGateway(t, clustertest.ServeBody(nil))
-		p, srv := newTestPeer(t, g.URL, nil)
+		tracker, _ := cluster(t, map[xet.XorbHash][]byte{hash: nil})
+		p, srv := newTestPeer(t, tracker.URL, nil)
 		if resp, _, _ := do(t, http.MethodGet, xorbURL(srv, hash)); resp.StatusCode == http.StatusOK {
 			t.Fatal("empty body served as 200")
 		}
@@ -637,11 +762,12 @@ func TestUpstreamFailures(t *testing.T) {
 		}
 	})
 	t.Run("empty chunked body", func(t *testing.T) {
-		g := clustertest.NewFakeGateway(t, func(w http.ResponseWriter, _ *http.Request) {
+		tracker := clustertest.NewFakeTracker(t)
+		rawHolder(t, tracker, "chunked", hash, func(w http.ResponseWriter, _ *http.Request) {
 			// An early flush commits to chunked encoding, so the peer sees no Content-Length.
 			w.(http.Flusher).Flush()
 		})
-		p, srv := newTestPeer(t, g.URL, nil)
+		p, srv := newTestPeer(t, tracker.URL, nil)
 		if resp, _, _ := do(t, http.MethodGet, xorbURL(srv, hash)); resp.StatusCode == http.StatusOK {
 			t.Fatal("empty chunked body served as 200")
 		}
@@ -655,8 +781,8 @@ func TestUpstreamFailures(t *testing.T) {
 		}
 	})
 	t.Run("hash mismatch", func(t *testing.T) {
-		g := clustertest.NewFakeGateway(t, clustertest.ServeBody(body))
-		p, srv := newTestPeer(t, g.URL, nil)
+		tracker, holder := cluster(t, map[xet.XorbHash][]byte{other: body})
+		p, srv := newTestPeer(t, tracker.URL, nil)
 		u := xorbURL(srv, other)
 		_, _, _ = do(t, http.MethodGet, u)
 		clustertest.WaitFor(t, clustertest.WaitTimeout, "spool cleanup", spoolEmpty(p))
@@ -666,17 +792,18 @@ func TestUpstreamFailures(t *testing.T) {
 		if resp, _, _ := do(t, http.MethodGet, u); resp.StatusCode != http.StatusBadGateway {
 			t.Fatalf("GET in cooldown = %d", resp.StatusCode)
 		}
-		if n := len(g.Requests()); n != 1 {
-			t.Fatalf("gateway GETs = %d, want 1 (cooldown)", n)
+		if n := len(holder.Requests()); n != 1 {
+			t.Fatalf("holder GETs = %d, want 1 (cooldown)", n)
 		}
-		if ok, _ := filepath.Glob(filepath.Join(configOf(p).DataDir, "xorbs", "*", "*", ".xorb-*")); len(ok) != 0 {
+		if ok, _ := filepath.Glob(filepath.Join(configOf(p).DataDir, "data", "xorbs", "*", "*", ".xorb-*")); len(ok) != 0 {
 			t.Fatalf("storage temp files left: %v", ok)
 		}
 		awaitSamples(t, srv, map[string]float64{`xetpd_peer_pulls_total{result="error"}`: 1, "xetpd_peer_cooldowns": 1})
 	})
 	t.Run("short body", func(t *testing.T) {
 		release := make(chan struct{})
-		g := clustertest.NewFakeGateway(t, func(w http.ResponseWriter, r *http.Request) {
+		tracker := clustertest.NewFakeTracker(t)
+		gets := rawHolder(t, tracker, "short", hash, func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Length", strconv.Itoa(len(body)))
 			_, _ = w.Write(body[:4<<10])
 			w.(http.Flusher).Flush()
@@ -685,7 +812,7 @@ func TestUpstreamFailures(t *testing.T) {
 			case <-r.Context().Done():
 			}
 		})
-		p, srv := newTestPeer(t, g.URL, nil)
+		p, srv := newTestPeer(t, tracker.URL, nil)
 		u := xorbURL(srv, hash)
 		resp, err := streamClient.Get(u)
 		if err != nil {
@@ -701,110 +828,97 @@ func TestUpstreamFailures(t *testing.T) {
 		if stored(t, p, hash) {
 			t.Fatal("short xorb published")
 		}
-		if resp, _, _ := do(t, http.MethodGet, u); resp.StatusCode != http.StatusBadGateway || len(g.Requests()) != 1 {
-			t.Fatalf("GET in cooldown = %d, gateway GETs = %d, want 502 and 1", resp.StatusCode, len(g.Requests()))
+		if resp, _, _ := do(t, http.MethodGet, u); resp.StatusCode != http.StatusBadGateway || gets.Load() != 1 {
+			t.Fatalf("GET in cooldown = %d, holder GETs = %d, want 502 and 1", resp.StatusCode, gets.Load())
+		}
+	})
+	t.Run("tracker unreachable", func(t *testing.T) {
+		tracker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			if conn, _, err := w.(http.Hijacker).Hijack(); err == nil {
+				_ = conn.Close()
+			}
+		}))
+		t.Cleanup(tracker.Close)
+		p, srv := newTestPeer(t, tracker.URL, nil)
+		resp, got, _ := do(t, http.MethodGet, xorbURL(srv, hash))
+		if resp.StatusCode != http.StatusBadGateway || strings.Contains(string(got), tracker.URL) || strings.Contains(string(got), configOf(p).DataDir) {
+			t.Fatalf("GET with the tracker unreachable = %d %q, want 502 naming neither the tracker nor a local path", resp.StatusCode, got)
 		}
 	})
 }
 
-func TestPullAndLocalOnlyRelay(t *testing.T) {
-	hash, body := clustertest.MakeXorb(t, 6, 4, 16<<10)
-	release := make(chan struct{})
-	g := clustertest.NewFakeGateway(t, clustertest.GatedBody(body, 4<<10, release))
-	p, srv := newTestPeer(t, g.URL, func(c *Config) { c.Secret = "s3cret" })
-	u := xorbURL(srv, hash)
-	pull := func(auth, payload string) int {
-		t.Helper()
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		req, _ := http.NewRequestWithContext(ctx, http.MethodPost, srv.URL+apis.PullPath, strings.NewReader(payload))
-		if auth != "" {
-			req.Header.Set("Authorization", auth)
+func TestPullRequestPullsTheFileAsProtectedSeed(t *testing.T) {
+	tf := makeFile(t, 90, 91)
+	xs := tf.xorbHashes()
+	other, otherBody := clustertest.MakeXorb(t, 92, 2, 8<<10)
+	tracker, holder := newTracker(t), newHolder(t, "holder")
+	tracker.SetReply(replyMinSeeds(1))
+	holder.ServeShard(tf.file, tf.resp)
+	tracker.HoldFile(holder.Peer(), tf.file)
+	for h, body := range tf.xorbs {
+		holder.ServeXorb(h, body)
+		tracker.Hold(holder.Peer(), h)
+	}
+	p, srv := newTestPeer(t, tracker.URL, func(c *Config) {
+		c.Secret, c.Heartbeat, c.XorbCacheSize = testSecret, time.Hour, int64(len(tf.xorbs[xs[0]])+len(tf.xorbs[xs[1]]))
+	})
+	payload := `{"file":"` + tf.file.Hash + `","seed":true}`
+	for _, tt := range []struct {
+		auth, payload string
+		want          int
+	}{
+		{"", payload, http.StatusUnauthorized},
+		{"Bearer wrong", payload, http.StatusUnauthorized},
+		{"Bearer " + testSecret, `{"file":"zz","seed":true}`, http.StatusBadRequest},
+		{"Bearer " + testSecret, `{"hash":"` + xs[0].String() + `"}`, http.StatusBadRequest},
+		{"Bearer " + testSecret, payload + `{}`, http.StatusBadRequest},
+		{"Bearer " + testSecret, payload + strings.Repeat(" ", apis.MaxReplyBytes+1-len(payload)), http.StatusRequestEntityTooLarge},
+	} {
+		if resp, body := send(t, http.MethodPost, srv.URL+apis.PullPath, tt.payload, "Authorization", tt.auth); resp.StatusCode != tt.want {
+			t.Fatalf("pull with %q of %.70q = %d %q, want %d", tt.auth, tt.payload, resp.StatusCode, body, tt.want)
 		}
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			t.Fatal(err)
-		}
-		_ = resp.Body.Close()
-		return resp.StatusCode
 	}
-	payload := fmt.Sprintf(`{"hash":"%s"}`, hash)
-
-	if resp, _, _ := do(t, http.MethodGet, u, apis.PeerHeader, "gw"); resp.StatusCode != http.StatusNotFound {
-		t.Fatalf("relay miss = %d", resp.StatusCode)
+	if n, m := len(holder.Requests()), len(tracker.Lookups()); n != 0 || m != 0 {
+		t.Fatalf("holder requests and lookups before an accepted pull = %d and %d, want none", n, m)
 	}
-	if code := pull("", payload); code != http.StatusUnauthorized {
-		t.Fatalf("pull without secret = %d", code)
+	if resp, body := send(t, http.MethodPost, srv.URL+apis.PullPath, payload, "Authorization", "Bearer "+testSecret); resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("pull = %d %q, want 202", resp.StatusCode, body)
 	}
-	if code := pull("Bearer wrong", payload); code != http.StatusUnauthorized {
-		t.Fatalf("pull with wrong secret = %d", code)
+	for _, h := range xs {
+		clustertest.WaitFor(t, clustertest.WaitTimeout, "the pull of "+h.String(), admitted(p, h))
 	}
-	if code := pull("Bearer s3cret", `{"hash":"zz"}`); code != http.StatusBadRequest {
-		t.Fatalf("pull with bad hash = %d", code)
-	}
-	if code := pull("Bearer s3cret", payload+`{}`); code != http.StatusBadRequest {
-		t.Fatalf("pull with trailing data = %d", code)
-	}
-	if code := pull("Bearer s3cret", payload+strings.Repeat(" ", maxPullBytes+1-len(payload))); code != http.StatusRequestEntityTooLarge {
-		t.Fatalf("pull over the body limit = %d, want 413", code)
-	}
-	if n := len(g.Requests()); n != 0 {
-		t.Fatalf("gateway GETs before any accepted pull = %d", n)
-	}
-	if code := pull("Bearer s3cret", payload); code != http.StatusAccepted {
-		t.Fatalf("pull = %d", code)
-	}
-	clustertest.WaitFor(t, clustertest.WaitTimeout, "pull start", func() bool { return len(g.Requests()) == 1 })
-	if resp, _, _ := do(t, http.MethodGet, u, apis.PeerHeader, "gw"); resp.StatusCode != http.StatusNotFound {
-		t.Fatalf("relay miss while pulling = %d", resp.StatusCode)
-	}
-	if code := pull("Bearer s3cret", payload); code != http.StatusAccepted {
-		t.Fatalf("repeated pull = %d", code)
-	}
-	close(release)
-	resp, got, err := do(t, http.MethodGet, u)
-	if err != nil || resp.StatusCode != http.StatusOK || !bytes.Equal(got, body) {
-		t.Fatalf("public GET sharing the pull = %d, %d bytes, %v", resp.StatusCode, len(got), err)
-	}
-	settled(t, p)
-	if resp, _, _ := do(t, http.MethodGet, u, apis.PeerHeader, "gw"); resp.StatusCode != http.StatusOK {
-		t.Fatalf("relay hit = %d", resp.StatusCode)
-	}
-	if code := pull("Bearer s3cret", payload); code != http.StatusAccepted {
-		t.Fatalf("pull for a complete xorb = %d", code)
-	}
-	if n := len(g.Requests()); n != 1 {
-		t.Fatalf("gateway GETs = %d, want 1", n)
+	// With no other holder left, the seed copies outlast a younger xorb over the cap.
+	tracker.Forget("holder")
+	commitDirect(t, p, other, otherBody)
+	clustertest.WaitFor(t, clustertest.WaitTimeout, "the cache back under its cap", func() bool { return usage(p) <= configOf(p).XorbCacheSize })
+	if !stored(t, p, xs[0]) || !stored(t, p, xs[1]) || stored(t, p, other) {
+		t.Fatal("want the seed file's xorbs kept and the younger xorb evicted")
 	}
 }
 
 func TestUnknownContentLengthWaitsForValidation(t *testing.T) {
 	hash, body := clustertest.MakeXorb(t, 7, 4, 16<<10)
-	g := clustertest.NewFakeGateway(t, func(w http.ResponseWriter, _ *http.Request) {
+	tracker := clustertest.NewFakeTracker(t)
+	gets := rawHolder(t, tracker, "chunked", hash, func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write(body[:100])
 		w.(http.Flusher).Flush()
 		_, _ = w.Write(body[100:])
 	})
-	_, srv := newTestPeer(t, g.URL, nil)
+	_, srv := newTestPeer(t, tracker.URL, nil)
 	resp, got, err := do(t, http.MethodGet, xorbURL(srv, hash))
 	if err != nil || resp.StatusCode != http.StatusOK || !bytes.Equal(got, body) || resp.ContentLength != int64(len(body)) {
 		t.Fatalf("GET = %d, %d bytes, length %d, %v", resp.StatusCode, len(got), resp.ContentLength, err)
 	}
-	req, _ := http.NewRequest(http.MethodPost, srv.URL+apis.PullPath, strings.NewReader(fmt.Sprintf(`{"hash":"%s"}`, hash)))
-	pr, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	_ = pr.Body.Close()
-	if pr.StatusCode != http.StatusAccepted || len(g.Requests()) != 1 {
-		t.Fatalf("pull without secret = %d, gateway GETs = %d", pr.StatusCode, len(g.Requests()))
+	if n := gets.Load(); n != 1 {
+		t.Fatalf("holder GETs = %d, want 1", n)
 	}
 }
 
 func TestCloseCancelsPullAndReaders(t *testing.T) {
 	hash, body := clustertest.MakeXorb(t, 8, 4, 16<<10)
-	g := clustertest.NewFakeGateway(t, clustertest.GatedBody(body, 4<<10, make(chan struct{})))
-	p, srv := newTestPeer(t, g.URL, nil)
+	tracker, holder := cluster(t, map[xet.XorbHash][]byte{hash: body})
+	holder.GateXorb(hash, body, 4<<10, make(chan struct{}))
+	p, srv := newTestPeer(t, tracker.URL, nil)
 	u := xorbURL(srv, hash)
 	resp, err := streamClient.Get(u)
 	if err != nil {
@@ -836,17 +950,17 @@ func TestCloseCancelsPullAndReaders(t *testing.T) {
 	}
 }
 
-func TestAcquireAfterCommitReportsReady(t *testing.T) {
+func TestAcquireAfterCommitStartsNoPull(t *testing.T) {
 	hash, body := clustertest.MakeXorb(t, 9, 2, 8<<10)
-	g := clustertest.NewFakeGateway(t, clustertest.ServeBody(body))
-	p, srv := newTestPeer(t, g.URL, nil)
+	tracker, holder := cluster(t, map[xet.XorbHash][]byte{hash: body})
+	p, srv := newTestPeer(t, tracker.URL, nil)
 	if resp, got, err := do(t, http.MethodGet, xorbURL(srv, hash)); err != nil || resp.StatusCode != http.StatusOK || !bytes.Equal(got, body) {
 		t.Fatalf("cold GET = %d, %d bytes, %v", resp.StatusCode, len(got), err)
 	}
 	clustertest.WaitFor(t, clustertest.WaitTimeout, "pull exit", noPulls(p))
 	clustertest.WaitFor(t, clustertest.WaitTimeout, "spool cleanup", spoolEmpty(p))
 	// A handler that missed the store before that commit now takes its pull decision.
-	f, rd, err := p.acquire(hash, false)
+	f, err := storeOf(p).acquire(hash, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -854,12 +968,8 @@ func TestAcquireAfterCommitReportsReady(t *testing.T) {
 		f.release()
 		t.Fatal("acquire started a redundant pull for a committed xorb")
 	}
-	if rd == nil || rd.Key != hash {
-		t.Fatalf("acquire did not reserve the committed xorb: %+v", rd)
-	}
-	p.unpin(rd)
-	if n := len(g.Requests()); n != 1 {
-		t.Fatalf("gateway GETs = %d, want 1", n)
+	if n := len(holder.Requests()); n != 1 {
+		t.Fatalf("holder GETs = %d, want 1", n)
 	}
 }
 
@@ -868,12 +978,14 @@ func TestDeduplicatedSpoolStillValidates(t *testing.T) {
 	corrupt := bytes.Clone(body)
 	corrupt[len(corrupt)/2] ^= 0xff
 	release := make(chan struct{})
-	g := clustertest.NewFakeGateway(t, clustertest.GatedBody(corrupt, 4<<10, release))
-	p, srv := newTestPeer(t, g.URL, nil)
+	tracker, holder := cluster(t, nil)
+	holder.GateXorb(hash, corrupt, 4<<10, release)
+	tracker.Hold(holder.Peer(), hash)
+	p, srv := newTestPeer(t, tracker.URL, nil)
 	u := xorbURL(srv, hash)
 
 	late := doAsync(t, u)
-	clustertest.WaitFor(t, clustertest.WaitTimeout, "pull start", func() bool { return len(g.Requests()) == 1 })
+	clustertest.WaitFor(t, clustertest.WaitTimeout, "pull start", func() bool { return len(holder.Requests()) == 1 })
 	// A valid copy is committed underneath the running pull, so its PutXorb deduplicates.
 	commitDirect(t, p, hash, body)
 	close(release)
@@ -890,8 +1002,8 @@ func TestDeduplicatedSpoolStillValidates(t *testing.T) {
 	if err != nil || resp.StatusCode != http.StatusOK || !bytes.Equal(got, body) {
 		t.Fatalf("committed xorb after the failed pull = %d, %d bytes, %v", resp.StatusCode, len(got), err)
 	}
-	if n := len(g.Requests()); n != 1 {
-		t.Fatalf("gateway GETs = %d, want 1", n)
+	if n := len(holder.Requests()); n != 1 {
+		t.Fatalf("holder GETs = %d, want 1", n)
 	}
 }
 
@@ -899,8 +1011,9 @@ func TestDeadClientReleasesReaderAndKeepsPull(t *testing.T) {
 	hash, body := clustertest.MakeXorb(t, 11, 4, 16<<10)
 	release := make(chan struct{})
 	const prefix = 4 << 10
-	g := clustertest.NewFakeGateway(t, clustertest.GatedBody(body, prefix, release))
-	p, srv := newTestPeer(t, g.URL, nil)
+	tracker, holder := cluster(t, map[xet.XorbHash][]byte{hash: body})
+	holder.GateXorb(hash, body, prefix, release)
+	p, srv := newTestPeer(t, tracker.URL, nil)
 	conn, err := net.Dial("tcp", srv.Listener.Addr().String())
 	if err != nil {
 		t.Fatal(err)
@@ -938,7 +1051,7 @@ func TestDeadClientReleasesReaderAndKeepsPull(t *testing.T) {
 	if err != nil || resp.StatusCode != http.StatusOK || !bytes.Equal(got, body) {
 		t.Fatalf("GET after the dead client = %d, %d bytes, %v", resp.StatusCode, len(got), err)
 	}
-	if n := len(g.Requests()); n != 1 {
-		t.Fatalf("gateway GETs = %d, want 1", n)
+	if n := len(holder.Requests()); n != 1 {
+		t.Fatalf("holder GETs = %d, want 1", n)
 	}
 }

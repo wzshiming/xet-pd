@@ -1,4 +1,4 @@
-// Package cli is the command-line plumbing the gateway and peer commands share.
+// Package cli is the command-line plumbing the tracker and peer commands share.
 package cli
 
 import (
@@ -166,7 +166,7 @@ func (s *FlagSet) Parse(args []string, getenv func(string) string, help io.Write
 
 // SecretFlags registers -secret and -secret-file; their environment fallback is resolved by ResolveSecret.
 func (s *FlagSet) SecretFlags() (secret, file *string) {
-	secret = s.String("secret", "", "bearer token shared by the gateway and its peers [env XET_PD_SECRET]")
+	secret = s.String("secret", "", "bearer token shared by the tracker and its peers [env XET_PD_SECRET]")
 	file = s.String("secret-file", "", "file holding the shared secret, surrounding whitespace trimmed [env XET_PD_SECRET_FILE]")
 	return secret, file
 }

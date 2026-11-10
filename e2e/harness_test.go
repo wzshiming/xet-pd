@@ -34,10 +34,10 @@ const (
 	stopTimeout   = 15 * time.Second // SIGTERM to exit
 	readyTimeout  = 20 * time.Second // process start, registration, control round trips
 	ingestTimeout = 60 * time.Second // hub ingest of one fixture file
-	seedTimeout   = 60 * time.Second // seeds pulling and the gateway evicting
+	seedTimeout   = 60 * time.Second // the tracker seeding a complete file to another peer
 )
 
-var binDir string // holds the race-instrumented gateway and peer binaries TestMain builds
+var binDir string // holds the race-instrumented tracker and peer binaries TestMain builds
 
 func TestMain(m *testing.M) {
 	code, err := buildAndRun(m)
@@ -59,10 +59,10 @@ func buildAndRun(m *testing.M) (int, error) {
 		return 1, err
 	}
 	binDir = dir
-	build := exec.Command("go", "build", "-race", "-o", binDir, "./cmd/gateway", "./cmd/peer")
+	build := exec.Command("go", "build", "-race", "-o", binDir, "./cmd/tracker", "./cmd/peer")
 	build.Dir = root
 	if out, err := build.CombinedOutput(); err != nil {
-		return 1, fmt.Errorf("go build -race ./cmd/gateway ./cmd/peer: %v\n%s", err, out)
+		return 1, fmt.Errorf("go build -race ./cmd/tracker ./cmd/peer: %v\n%s", err, out)
 	}
 	return m.Run(), nil
 }
@@ -125,7 +125,7 @@ type proc struct {
 	stopped bool
 }
 
-// startProc launches the binary of role, gateway or peer; env entries extend childEnv.
+// startProc launches the binary of role, tracker or peer; env entries extend childEnv.
 func startProc(t *testing.T, role, name string, args []string, env ...string) *proc {
 	t.Helper()
 	ctx, cancel := context.WithCancel(t.Context())
@@ -247,27 +247,32 @@ func (p *proc) awaitHealthy(origin string) error {
 	}
 }
 
-type gatewayProc struct {
+type trackerProc struct {
 	*proc
-	URL     string
-	DataDir string
+	URL string
 }
 
-// startGateway runs a gateway on a free loopback port; the secret travels in the environment.
-func startGateway(t *testing.T, upstream, secret string, flags []string, env ...string) *gatewayProc {
+// startTracker runs a tracker on a free loopback port, or on the -listen address flags name, retrying while that address is still taken; the secret travels in the environment.
+func startTracker(t *testing.T, secret string, flags []string, env ...string) *trackerProc {
 	t.Helper()
-	dir := t.TempDir()
-	args := append([]string{"-listen", "127.0.0.1:0", "-data-dir", dir, "-upstream", upstream}, flags...)
-	p := startProc(t, "gateway", "gateway", args, append(secretEnv(secret), env...)...)
-	addr, err := p.awaitBanner("gateway listening on ")
-	if err != nil {
+	args := append([]string{"-listen", "127.0.0.1:0"}, flags...)
+	for attempt := 1; ; attempt++ {
+		p := startProc(t, "tracker", "tracker", args, append(secretEnv(secret), env...)...)
+		addr, err := p.awaitBanner("tracker listening on ")
+		if err == nil {
+			tr := &trackerProc{proc: p, URL: "http://" + addr}
+			if err := p.awaitHealthy(tr.URL); err != nil {
+				t.Fatal(err)
+			}
+			return tr
+		}
+		if attempt < 3 && p.exited() && strings.Contains(p.stderr.String(), "address already in use") {
+			p.discard()
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
 		t.Fatal(err)
 	}
-	g := &gatewayProc{proc: p, URL: "http://" + addr, DataDir: dir}
-	if err := p.awaitHealthy(g.URL); err != nil {
-		t.Fatal(err)
-	}
-	return g
 }
 
 type peerProc struct {
@@ -276,12 +281,12 @@ type peerProc struct {
 	DataDir string
 }
 
-// startPeer runs a seed on a reserved loopback port it also advertises, retrying if the port is taken meanwhile.
-func startPeer(t *testing.T, gatewayURL, secret string, flags []string, env ...string) *peerProc {
+// startPeer runs a peer mirroring upstream on a reserved loopback port it also advertises, retrying if the port is taken meanwhile.
+func startPeer(t *testing.T, trackerURL, upstream, secret string, flags []string, env ...string) *peerProc {
 	t.Helper()
 	for attempt := 1; ; attempt++ {
 		addr, dir := reserveAddr(t), t.TempDir()
-		args := append([]string{"-listen", addr, "-advertise", "http://" + addr, "-gateway", gatewayURL, "-data-dir", dir}, flags...)
+		args := append([]string{"-listen", addr, "-advertise", "http://" + addr, "-tracker", trackerURL, "-upstream", upstream, "-data-dir", dir}, flags...)
 		p := startProc(t, "peer", "peer "+addr, args, append(secretEnv(secret), env...)...)
 		err := p.awaitHealthy("http://" + addr)
 		if err == nil {
@@ -307,7 +312,7 @@ func reserveAddr(t *testing.T) string {
 	return addr
 }
 
-// runCLI runs the binary args[0] names, gateway or peer, with the remaining args to completion.
+// runCLI runs the binary args[0] names, tracker or peer, with the remaining args to completion.
 func runCLI(t *testing.T, args []string, env ...string) (code int, stdout, stderr string) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(t.Context(), stopTimeout)
@@ -402,23 +407,34 @@ func headReady(t *testing.T, resolveURL string) http.Header {
 	return hdr
 }
 
-// seeded reports whether the gateway stages nothing while each of n live peers holds count xorbs.
-func seeded(d apis.PeersResponse, n, count int) bool {
-	if d.XorbBytes != 0 || len(d.Peers) != n {
-		return false
-	}
-	for _, p := range d.Peers {
-		if p.Holdings != count {
-			return false
-		}
-	}
-	return true
+// seeded reports whether the tracker lists n live peers, each with at least files complete files.
+func seeded(d apis.PeersResponse, n, files int) bool {
+	return len(d.Peers) == n && !slices.ContainsFunc(d.Peers, func(p apis.PeerStatus) bool { return p.Files < files })
 }
 
-// reconstructionURLs lists the xorb fetch URLs of the gateway's V1 reconstruction.
-func reconstructionURLs(t *testing.T, gw, fileHash string) []string {
+// peerStatus returns the tracker's entry for the peer advertising url.
+func peerStatus(d apis.PeersResponse, url string) (apis.PeerStatus, bool) {
+	i := slices.IndexFunc(d.Peers, func(p apis.PeerStatus) bool { return p.URL == url })
+	if i < 0 {
+		return apis.PeerStatus{}, false
+	}
+	return d.Peers[i], true
+}
+
+// metric returns the value of series, name{labels} as exposed, in the /metrics of origin.
+func metric(t *testing.T, origin, series string) float64 {
 	t.Helper()
-	resp, body := request(t, http.MethodGet, gw+"/v1/reconstructions/"+fileHash, "")
+	v, ok := clustertest.Scrape(t, origin)[series]
+	if !ok {
+		t.Fatalf("%s/metrics has no %s", origin, series)
+	}
+	return v
+}
+
+// reconstructionURLs lists the xorb fetch URLs of the V1 reconstruction origin serves.
+func reconstructionURLs(t *testing.T, origin, fileHash string) []string {
+	t.Helper()
+	resp, body := request(t, http.MethodGet, origin+"/v1/reconstructions/"+fileHash, "")
 	var v1 download.ReconstructionResponseV1
 	if resp.StatusCode != http.StatusOK || json.Unmarshal(body, &v1) != nil {
 		t.Fatalf("reconstruction of %s = %d %q", fileHash, resp.StatusCode, body)
@@ -484,10 +500,10 @@ func fetchURLs(v2 *download.ReconstructionResponseV2) []string {
 	return urls
 }
 
-// xorbHashes lists the xorbs a local store under base holds, sorted.
-func xorbHashes(t *testing.T, base string) []string {
+// xorbHashes lists the xorbs the local store of a peer's data directory holds, sorted.
+func xorbHashes(t *testing.T, dataDir string) []string {
 	t.Helper()
-	root := filepath.Join(base, "xorbs")
+	root := filepath.Join(dataDir, "data", "xorbs")
 	var out []string
 	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil || d.IsDir() {

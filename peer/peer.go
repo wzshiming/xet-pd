@@ -1,5 +1,5 @@
-// Package peer implements an xet-pd seed: it caches whole xorbs pulled through
-// the gateway and serves them, with range support, while they are still being pulled.
+// Package peer implements an xet-pd peer: its node's read-only HF endpoint, a hub mirror and CAS over
+// a store that pulls missing xorbs from the peers holding them and serves them while they are still being pulled.
 package peer
 
 import (
@@ -11,11 +11,17 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"path/filepath"
+	"slices"
 	"sync"
 	"time"
 
 	"github.com/wzshiming/xet"
-	"github.com/wzshiming/xet/storage/local"
+	"github.com/wzshiming/xet/auth"
+	"github.com/wzshiming/xet/client"
+	"github.com/wzshiming/xet/mirror"
+	"github.com/wzshiming/xet/server"
+	"github.com/wzshiming/xet/server/hf"
 
 	"github.com/wzshiming/xet-pd/apis"
 	"github.com/wzshiming/xet-pd/internal/lru"
@@ -23,15 +29,16 @@ import (
 
 // Config configures New; zero MaxPulls, PullTimeout and Heartbeat take the defaults below.
 type Config struct {
-	Advertise     string        // public origin of this peer, scheme://host[:port]
-	Node          string        // node this peer runs on, as the gateway's locality resolver names it; empty announces none
-	Gateway       string        // upstream gateway origin
-	DataDir       string        // data directory: xorbs/ committed objects, spool/ in-flight pulls
+	Advertise     string        // public origin of this peer, scheme://host[:port]; also the hub's external URL
+	Tracker       string        // tracker origin: announces and lookups go there
+	Upstream      string        // origin of the upstream hub the mirror ingests from
+	UpstreamToken string        // optional bearer token for the upstream hub
+	DataDir       string        // data directory: data/ the local store, spool/ in-flight pulls, mirror/ the hub mirror
 	XorbCacheSize int64         // bytes of committed xorbs to keep, 0 unlimited; spools are extra
-	MaxPulls      int           // parallel pulls from the gateway, default 8
+	MaxPulls      int           // parallel pulls from other peers, default 8
 	PullTimeout   time.Duration // per pull including queueing, default 10m
 	Heartbeat     time.Duration // announce interval, default 10s
-	Secret        string        // optional bearer token shared with the gateway for pull and announce
+	Secret        string        // optional bearer token shared with the tracker and the other peers
 }
 
 // Defaults New applies to zero Config values; cmd/peer shows them as flag defaults.
@@ -41,17 +48,20 @@ const (
 	DefaultHeartbeat   = 10 * time.Second
 )
 
-// normalize canonicalizes both origins, rejects an invalid node, a missing data dir or negative values and fills in the defaults.
+// normalize canonicalizes the origins, rejects a missing upstream or data dir and negative values and fills in the defaults.
 func (c *Config) normalize() error {
 	var err error
 	if c.Advertise, err = apis.Origin(c.Advertise); err != nil {
 		return fmt.Errorf("advertise: %w", err)
 	}
-	if c.Gateway, err = apis.Origin(c.Gateway); err != nil {
-		return fmt.Errorf("gateway: %w", err)
+	if c.Tracker, err = apis.Origin(c.Tracker); err != nil {
+		return fmt.Errorf("tracker: %w", err)
 	}
-	if c.Node != "" && !apis.ValidLabel(c.Node, apis.MaxNodeLen) {
-		return fmt.Errorf("node %q: expected 1 to %d of [A-Za-z0-9._-]", c.Node, apis.MaxNodeLen)
+	if c.Upstream == "" {
+		return errors.New("upstream is required")
+	}
+	if c.Upstream, err = apis.Origin(c.Upstream); err != nil {
+		return fmt.Errorf("upstream: %w", err)
 	}
 	if c.DataDir == "" {
 		return errors.New("data dir is required")
@@ -65,106 +75,144 @@ func (c *Config) normalize() error {
 	return nil
 }
 
-// Peer is a running seed: it serves HTTP until Close.
+// Peer is a running node endpoint: it serves HTTP until Close.
 type Peer struct {
-	cfg      Config
-	id       string // stable, derived from Advertise
-	epoch    string // random per start
-	store    *local.Storage
-	spoolDir string
-	client   *http.Client // data fetches, no secret
-	mux      *http.ServeMux
-	ann      *announcer
-	metrics  *peerMetrics
+	cfg       Config
+	id        string // stable, derived from Advertise
+	epoch     string // random per start
+	st        *store
+	cas       http.Handler    // CAS routes over st, falling through to the hub mirror
+	transport *http.Transport // upstream hub downloads
+	mux       *http.ServeMux
+	ann       *announcer
+	metrics   *peerMetrics
+
+	evictions chan struct{} // coalesced eviction wake signal
 
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
-	sem    chan struct{} // bounds parallel upstream pulls
 	once   sync.Once
 
-	mu       sync.Mutex // guards pulls, cooldown, xorbs with each entry's pins and pull, each pull's refs, queued and keep, and cancel-vs-acquire
-	pulls    map[xet.XorbHash]*pull
-	cooldown map[xet.XorbHash]cooled
-	xorbs    lru.Index[xet.XorbHash, ready] // committed xorbs
+	mu        sync.Mutex                           // guards xorbs, files, xorbFiles, seeds and warned
+	xorbs     lru.Index[xet.XorbHash, ready]       // committed xorbs
+	files     map[string]fileEntry                 // known files by hash
+	xorbFiles map[xet.XorbHash]map[string]struct{} // hashes of the known files referencing each xorb
+	seeds     map[string]struct{}                  // hashes of the files whose xorbs are seed copies
+	warned    bool                                 // over the cap with nothing evictable, logged once until it fits
 }
 
-// New normalizes cfg, restores the xorbs already in DataDir and starts announcing them to the gateway.
+// New normalizes cfg, restores the xorbs already in DataDir, starts announcing them to the tracker and serves the hub mirror and CAS over them.
 func New(cfg Config) (*Peer, error) {
 	if err := cfg.normalize(); err != nil {
-		return nil, err
-	}
-	store, err := local.NewStorage(local.WithBasePath(cfg.DataDir))
-	if err != nil {
-		return nil, err
-	}
-	spoolDir, err := openSpool(cfg.DataDir)
-	if err != nil {
 		return nil, err
 	}
 	var nonce [16]byte
 	if _, err := rand.Read(nonce[:]); err != nil {
 		return nil, err
 	}
+	issuer, err := auth.NewIssuer(nil, 0, nil)
+	if err != nil {
+		return nil, err
+	}
 	sum := sha256.Sum256([]byte(cfg.Advertise))
-	transport := apis.NewTransport()
+	id := hex.EncodeToString(sum[:16])
+	control := apis.NewClient(apis.NewTransport())
+	metrics := newPeerMetrics()
+	st, err := newStore(storeConfig{
+		Dir: cfg.DataDir, Self: apis.Peer{ID: id, URL: cfg.Advertise}, Tracker: cfg.Tracker, Secret: cfg.Secret,
+		Client: control, MaxPulls: cfg.MaxPulls, PullTimeout: cfg.PullTimeout, Metrics: metrics,
+	})
+	if err != nil {
+		return nil, err
+	}
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	mir, err := mirror.NewMirror(mirror.WithStorage(st), mirror.WithCacheDir(filepath.Join(cfg.DataDir, "mirror")), mirror.WithTransport(transport))
+	if err != nil {
+		_ = st.Close()
+		return nil, err
+	}
+	provider := client.StaticUpstreamProvider(cfg.Upstream, cfg.UpstreamToken)
+	hub := hf.NewHandler(
+		hf.WithMirror(mir),
+		hf.WithUpstreamProvider(provider),
+		hf.WithExternalURL(cfg.Advertise),
+		hf.WithMinter(hf.MinterFunc(func(_ *http.Request, req hf.TokenRequest) (string, int64, error) {
+			if req.Permission != auth.Read {
+				return "", 0, auth.ErrForbidden // answered here, never delegated to the upstream
+			}
+			return issuer.Sign(auth.Grant{Permission: auth.Read, File: req.File})
+		})),
+		hf.WithNext(hf.NewUpstreamProxy(provider)),
+	)
 	ctx, cancel := context.WithCancel(context.Background())
 	p := &Peer{
-		cfg:      cfg,
-		id:       hex.EncodeToString(sum[:16]),
-		epoch:    hex.EncodeToString(nonce[:]),
-		store:    store,
-		spoolDir: spoolDir,
-		client:   &http.Client{Transport: transport},
-		ctx:      ctx,
-		cancel:   cancel,
-		sem:      make(chan struct{}, cfg.MaxPulls),
-		pulls:    map[xet.XorbHash]*pull{},
-		cooldown: map[xet.XorbHash]cooled{},
-		metrics:  newPeerMetrics(),
+		cfg:   cfg,
+		id:    id,
+		epoch: hex.EncodeToString(nonce[:]),
+		st:    st,
+		// No authorizer: the CAS serves the clients of its own node.
+		cas:       server.NewHandler(server.WithStorage(st), server.WithNext(hub)),
+		transport: transport,
+		ctx:       ctx,
+		cancel:    cancel,
+		metrics:   metrics,
+
+		evictions: make(chan struct{}, 1),
+		files:     map[string]fileEntry{},
+		xorbFiles: map[xet.XorbHash]map[string]struct{}{},
+		seeds:     map[string]struct{}{},
 	}
 	p.metrics.reg.MustRegister(peerState{p})
-	p.ann = &announcer{p: p, control: apis.NewClient(transport), wake: make(chan struct{}, 1), full: true}
+	p.ann = &announcer{p: p, control: control, wake: make(chan struct{}, 1), full: true}
+	p.ann.minSeeds.Store(1)
+	st.onStored, st.onRead, st.onIdle, st.onFile, st.onLost = p.admit, p.touch, p.retryEviction, p.learn, p.lost
 	p.mux = p.routes()
 	if err := p.restore(); err != nil {
 		cancel()
+		_ = st.Close()
 		return nil, err
 	}
-	p.wg.Add(1)
+	p.wg.Add(2)
 	go func() {
 		defer p.wg.Done()
 		p.ann.run()
 	}()
+	go func() {
+		defer p.wg.Done()
+		p.evictor()
+	}()
 	return p, nil
 }
 
-// Close stops the announcer, cancels in-flight pulls, waits for them and drops idle upstream connections.
+// Close stops the announcer and the evictor, cancels in-flight pulls, waits for them and drops idle connections; ingests the mirror started finish on their own.
 func (p *Peer) Close() error {
 	p.once.Do(func() {
 		p.mu.Lock()
-		p.cancel() // acquire checks p.ctx under p.mu, so no pull starts after Close
+		p.cancel() // servePull adds to p.wg under p.mu only while p.ctx lives
 		p.mu.Unlock()
+		_ = p.st.Close()
 		p.wg.Wait()
-		p.client.CloseIdleConnections()
+		p.ann.control.CloseIdleConnections()
+		p.transport.CloseIdleConnections()
 	})
 	return nil
 }
 
 type peerStats struct {
-	bytes                     int64
-	entries, pulls, cooldowns int
+	bytes                            int64
+	files, entries, pulls, cooldowns int
 }
 
-// stats leaves out cooldowns past their end that acquire has yet to sweep.
 func (p *Peer) stats() peerStats {
-	now := time.Now()
+	pulls, cooldowns := p.st.stats()
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	s := peerStats{bytes: p.xorbs.Usage(), entries: p.xorbs.Len(), pulls: len(p.pulls)}
-	for _, c := range p.cooldown {
-		if now.Before(c.until) {
-			s.cooldowns++
+	files := 0
+	for _, f := range p.files {
+		if !slices.ContainsFunc(f.Xorbs, func(x xet.XorbHash) bool { return p.xorbs.Get(x) == nil }) {
+			files++
 		}
 	}
-	return s
+	return peerStats{bytes: p.xorbs.Usage(), files: files, entries: p.xorbs.Len(), pulls: pulls, cooldowns: cooldowns}
 }

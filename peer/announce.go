@@ -2,31 +2,36 @@ package peer
 
 import (
 	"context"
-	"fmt"
 	"log/slog"
 	"net/http"
 	"slices"
 	"sync/atomic"
 	"time"
 
+	"github.com/wzshiming/xet"
+
 	"github.com/wzshiming/xet-pd/apis"
 )
 
-const (
-	announceTimeout = 5 * time.Second
-	maxReplyBytes   = 4096
-)
+const announceTimeout = 5 * time.Second
 
-// announcer reconciles the gateway's view with the inventory.
+// announcer reconciles the tracker's view with the inventory.
 type announcer struct {
-	p       *Peer
-	control *http.Client  // carries the secret and never follows redirects
-	wake    chan struct{} // coalesced inventory change signal
-	ready   atomic.Bool   // the gateway took an announce without asking to resync; never cleared
+	p        *Peer
+	control  *http.Client  // carries the secret and never follows redirects
+	wake     chan struct{} // coalesced inventory change signal
+	ready    atomic.Bool   // the tracker took an announce without asking to resync; never cleared
+	minSeeds atomic.Int64  // MinSeeds of the last successful reply carrying a positive one, 1 until then
 
 	// Only run touches these.
-	acked                map[string]struct{} // inventory the gateway confirmed
-	full, failed, warned bool                // full: the next request carries the whole inventory
+	acked                holdings // inventory the tracker confirmed
+	full, failed, warned bool     // full: the next request carries the whole inventory
+}
+
+// holdings is what an announce reports: the cached xorbs and the complete files, by hash.
+type holdings struct {
+	xorbs map[string]struct{}
+	files map[string]apis.File
 }
 
 // run announces at start, on every inventory change and on every heartbeat until p.ctx ends.
@@ -43,11 +48,14 @@ func (a *announcer) run() {
 			if !a.failed {
 				slog.Warn("peer: announce", "err", err)
 			}
-			// The gateway may have applied this request, so only a Full can resync it.
+			// The tracker may have applied this request, so only a Full can resync it.
 			a.failed, a.full = true, true
 		} else {
 			a.failed = false
 			a.acked, a.full = snap, out.Resync
+			if out.MinSeeds > 0 && a.minSeeds.Swap(int64(out.MinSeeds)) != int64(out.MinSeeds) {
+				p.kickEviction()
+			}
 			if out.Resync {
 				p.metrics.announce("resync")
 			} else {
@@ -55,7 +63,7 @@ func (a *announcer) run() {
 				a.ready.Store(true)
 			}
 			if !a.warned && out.TTL > 0 && p.cfg.Heartbeat >= time.Duration(out.TTL)*time.Second {
-				slog.Warn("peer: heartbeat not shorter than gateway TTL", "heartbeat", p.cfg.Heartbeat, "ttl", out.TTL)
+				slog.Warn("peer: heartbeat not shorter than tracker TTL", "heartbeat", p.cfg.Heartbeat, "ttl", out.TTL)
 				a.warned = true
 			}
 			// A resync to a delta is answered at once; a resync to a Full waits for the heartbeat.
@@ -72,8 +80,8 @@ func (a *announcer) run() {
 	}
 }
 
-// snapshot copies the inventory under p.mu.
-func (a *announcer) snapshot() map[string]struct{} {
+// snapshot copies the cached xorbs and the complete files under p.mu.
+func (a *announcer) snapshot() holdings {
 	p := a.p
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -81,50 +89,53 @@ func (a *announcer) snapshot() map[string]struct{} {
 	case <-a.wake: // changes before this snapshot are covered by it
 	default:
 	}
-	snap := make(map[string]struct{}, p.xorbs.Len())
+	snap := holdings{xorbs: make(map[string]struct{}, p.xorbs.Len()), files: map[string]apis.File{}}
 	for e := range p.xorbs.Oldest() {
-		snap[e.Key.String()] = struct{}{}
+		snap.xorbs[e.Key.String()] = struct{}{}
+	}
+	for h, f := range p.files {
+		if !slices.ContainsFunc(f.Xorbs, func(x xet.XorbHash) bool { return p.xorbs.Get(x) == nil }) {
+			snap.files[h] = f.File
+		}
 	}
 	return snap
 }
 
 // request announces snap whole when full, else as its delta from acked.
-func (a *announcer) request(snap map[string]struct{}) apis.AnnounceRequest {
+func (a *announcer) request(snap holdings) apis.AnnounceRequest {
 	p := a.p
-	req := apis.AnnounceRequest{Peer: apis.Peer{ID: p.id, URL: p.cfg.Advertise, Node: p.cfg.Node}, Epoch: p.epoch, Full: a.full}
-	for h := range snap {
-		if _, ok := a.acked[h]; a.full || !ok {
-			req.Add = append(req.Add, h)
-		}
+	req := apis.AnnounceRequest{Peer: apis.Peer{ID: p.id, URL: p.cfg.Advertise}, Epoch: p.epoch, Full: a.full}
+	req.Add, req.Remove = delta(snap.xorbs, a.acked.xorbs, a.full)
+	var added []string
+	added, req.RemoveFiles = delta(snap.files, a.acked.files, a.full)
+	for _, h := range added {
+		req.AddFiles = append(req.AddFiles, snap.files[h])
 	}
-	for h := range a.acked {
-		if _, ok := snap[h]; !ok && !a.full {
-			req.Remove = append(req.Remove, h)
-		}
-	}
-	slices.Sort(req.Add)
-	slices.Sort(req.Remove)
 	return req
 }
 
-// post sends req to the gateway and decodes its reply.
+// delta lists, sorted, the keys of snap that acked lacks, all of them when full, and the keys of acked that snap lacks, none when full.
+func delta[V any](snap, acked map[string]V, full bool) (add, remove []string) {
+	for k := range snap {
+		if _, ok := acked[k]; full || !ok {
+			add = append(add, k)
+		}
+	}
+	for k := range acked {
+		if _, ok := snap[k]; !ok && !full {
+			remove = append(remove, k)
+		}
+	}
+	slices.Sort(add)
+	slices.Sort(remove)
+	return add, remove
+}
+
+// post sends req to the tracker and decodes its reply.
 func (a *announcer) post(req apis.AnnounceRequest) (apis.AnnounceResponse, error) {
-	p := a.p
-	var out apis.AnnounceResponse
-	ctx, cancel := context.WithTimeout(p.ctx, announceTimeout)
+	ctx, cancel := context.WithTimeout(a.p.ctx, announceTimeout)
 	defer cancel()
-	resp, err := apis.PostJSON(ctx, a.control, p.cfg.Gateway+apis.AnnouncePath, p.cfg.Secret, req)
-	if err != nil {
-		return out, err
-	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode/100 != 2 {
-		return out, fmt.Errorf("gateway status %s", resp.Status)
-	}
-	if derr := apis.DecodeJSON(resp.Body, maxReplyBytes, &out); derr != nil {
-		return out, fmt.Errorf("gateway reply: %w", derr)
-	}
-	return out, nil
+	return apis.Announce(ctx, a.control, a.p.cfg.Tracker, a.p.cfg.Secret, req)
 }
 
 // kick wakes the announcer without blocking; safe under p.mu and after Close.

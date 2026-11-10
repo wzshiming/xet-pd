@@ -59,7 +59,7 @@ func TestReadJSON(t *testing.T) {
 	}
 }
 
-// Mixed versions rely on it: a gateway accepts announces carrying fields it predates.
+// Mixed versions rely on it: a tracker accepts announces carrying fields it predates.
 func TestReadJSONIgnoresUnknownFields(t *testing.T) {
 	t.Parallel()
 	w := httptest.NewRecorder()
@@ -105,5 +105,13 @@ func TestXorbURL(t *testing.T) {
 	got := XorbURL("http://g:1", "abc")
 	if want := "http://g:1/v1/xorbs/default/abc"; got != want || got != "http://g:1"+XorbPathPrefix+"abc" {
 		t.Errorf("XorbURL(%q, %q) = %q, want %q", "http://g:1", "abc", got, want)
+	}
+}
+
+func TestShardURL(t *testing.T) {
+	t.Parallel()
+	got := ShardURL("http://p:1", "abc")
+	if want := "http://p:1/xet-pd/v1/shards/abc"; got != want || got != "http://p:1"+ShardPathPrefix+"abc" {
+		t.Errorf("ShardURL(%q, %q) = %q, want %q", "http://p:1", "abc", got, want)
 	}
 }

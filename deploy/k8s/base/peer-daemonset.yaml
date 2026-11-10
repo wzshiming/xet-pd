@@ -83,12 +83,19 @@ spec:
               value: $(NODE_IP):$(PEER_PORT)
             - name: XET_PD_ADVERTISE
               value: http://$(NODE_IP):$(PEER_PORT)
-            - name: XET_PD_GATEWAY
-              value: http://xet-pd-gateway.$(POD_NAMESPACE).svc:8080
-            - name: XET_PD_NODE
+            - name: XET_PD_TRACKER
+              value: http://xet-pd-tracker.$(POD_NAMESPACE).svc:8080
+            - name: HF_ENDPOINT
               valueFrom:
-                fieldRef:
-                  fieldPath: spec.nodeName
+                configMapKeyRef:
+                  name: xet-pd-upstream
+                  key: HF_ENDPOINT
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: xet-pd-hf-token
+                  key: HF_TOKEN
+                  optional: true
             - name: XET_PD_DATA_DIR
               value: /data
             - name: XET_PD_LOG_FORMAT
@@ -120,7 +127,7 @@ spec:
               cpu: 100m
               memory: 128Mi
             limits:
-              memory: 512Mi
+              memory: 1Gi
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true

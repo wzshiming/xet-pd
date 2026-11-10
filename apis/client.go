@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"time"
 )
@@ -53,4 +54,77 @@ func DecodeJSON(r io.Reader, limit int64, v any) error {
 		return fmt.Errorf("exceeds %d bytes", limit)
 	}
 	return decode(bytes.NewReader(data), v)
+}
+
+// Announce posts req to the tracker's AnnouncePath and decodes its 200 reply.
+func Announce(ctx context.Context, c *http.Client, tracker, secret string, req AnnounceRequest) (AnnounceResponse, error) {
+	var out AnnounceResponse
+	err := exchange(ctx, c, tracker+AnnouncePath, secret, req, MaxReplyBytes, &out)
+	return out, err
+}
+
+// Lookup posts req to the tracker's LookupPath and decodes its 200 reply.
+func Lookup(ctx context.Context, c *http.Client, tracker, secret string, req LookupRequest) (LookupResponse, error) {
+	var out LookupResponse
+	err := exchange(ctx, c, tracker+LookupPath, secret, req, MaxLookupBytes, &out)
+	return out, err
+}
+
+// Pull posts req to the peer's PullPath; only 202 means the peer took it.
+func Pull(ctx context.Context, c *http.Client, peer, secret string, req PullRequest) error {
+	resp, err := PostJSON(ctx, c, peer+PullPath, secret, req)
+	if err != nil {
+		return err
+	}
+	defer drain(resp)
+	if resp.StatusCode != http.StatusAccepted {
+		return fmt.Errorf("status %s", resp.Status)
+	}
+	return nil
+}
+
+// GetShard fetches the ShardResponse of fileHash from peer, sending self as PeerHeader; a 404 yields an error wrapping fs.ErrNotExist.
+func GetShard(ctx context.Context, c *http.Client, peer, secret, self, fileHash string) (ShardResponse, error) {
+	var out ShardResponse
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, ShardURL(peer, fileHash), nil)
+	if err != nil {
+		return out, err
+	}
+	req.Header.Set(PeerHeader, self)
+	if secret != "" {
+		req.Header.Set("Authorization", "Bearer "+secret)
+	}
+	resp, err := c.Do(req)
+	if err != nil {
+		return out, err
+	}
+	defer drain(resp)
+	switch resp.StatusCode {
+	case http.StatusOK:
+		err = DecodeJSON(resp.Body, MaxShardBytes, &out)
+	case http.StatusNotFound:
+		err = fmt.Errorf("status %s: %w", resp.Status, fs.ErrNotExist)
+	default:
+		err = fmt.Errorf("status %s", resp.Status)
+	}
+	return out, err
+}
+
+// exchange posts body to url and decodes a 200 reply of at most limit bytes into out.
+func exchange(ctx context.Context, c *http.Client, url, secret string, body any, limit int64, out any) error {
+	resp, err := PostJSON(ctx, c, url, secret, body)
+	if err != nil {
+		return err
+	}
+	defer drain(resp)
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("status %s", resp.Status)
+	}
+	return DecodeJSON(resp.Body, limit, out)
+}
+
+// drain reads up to MaxReplyBytes of what is left of resp's body, so its connection can be reused, and closes it.
+func drain(resp *http.Response) {
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, MaxReplyBytes))
+	_ = resp.Body.Close()
 }

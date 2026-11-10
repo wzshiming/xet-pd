@@ -106,6 +106,10 @@ func TestSeedBatchesObjectsPerPeer(t *testing.T) {
 func TestSeedCapsPullBatch(t *testing.T) {
 	reg := newRegistry(time.Hour, 1)
 	s := newTestSeeder(t, reg, seedConfig{replicas: 2})
+	// With one pull slot free the rest waits for the first request's answer, so the pulls arrive in the order sent.
+	for range maxPulls - 1 {
+		s.sem <- struct{}{}
+	}
 	peers := fakePeers(t, "", "holder", "seed")
 	hold(reg, s, peers["seed"].Peer(), nil)
 	xorbs := make([]string, apis.MaxPullBatch)
@@ -123,6 +127,9 @@ func TestSeedCapsPullBatch(t *testing.T) {
 	slices.Sort(want)
 	if !slices.Equal(got, want) {
 		t.Fatalf("the two pulls carry %d objects, want each of the %d once", len(got), len(want))
+	}
+	for range maxPulls - 1 {
+		<-s.sem
 	}
 	settle(t, s)
 	if n := len(peers["seed"].Pulls()); n != 2 {

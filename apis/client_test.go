@@ -165,10 +165,10 @@ func TestLookup(t *testing.T) {
 func TestPull(t *testing.T) {
 	t.Parallel()
 	srv, reqs := replying(t, http.StatusAccepted, "")
-	if err := Pull(t.Context(), srv.Client(), srv.URL, "s3cret", PullRequest{File: "f1", Seed: true}); err != nil {
+	if err := Pull(t.Context(), srv.Client(), srv.URL, "s3cret", PullRequest{Shards: []string{"f1"}, Seed: true}); err != nil {
 		t.Fatalf("Pull answered 202 = %v, want nil", err)
 	}
-	want := seen{http.MethodPost, PullPath, "application/json", "Bearer s3cret", "", `{"file":"f1","seed":true}`}
+	want := seen{http.MethodPost, PullPath, "application/json", "Bearer s3cret", "", `{"shards":["f1"],"seed":true}`}
 	if got := <-reqs; got != want {
 		t.Fatalf("Pull sent %+v, want %+v", got, want)
 	}
@@ -178,7 +178,7 @@ func TestPullAcceptsOnly202(t *testing.T) {
 	t.Parallel()
 	for _, code := range []int{http.StatusOK, http.StatusNoContent} {
 		srv, _ := replying(t, code, "")
-		err := Pull(t.Context(), srv.Client(), srv.URL, "", PullRequest{File: "f1"})
+		err := Pull(t.Context(), srv.Client(), srv.URL, "", PullRequest{Shards: []string{"f1"}})
 		if status := fmt.Sprintf("%d %s", code, http.StatusText(code)); err == nil || !strings.Contains(err.Error(), status) {
 			t.Errorf("Pull answered %s = %v, want an error naming the status", status, err)
 		}

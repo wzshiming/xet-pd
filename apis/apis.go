@@ -6,11 +6,11 @@ import "time"
 const (
 	// AnnouncePath is POST on the tracker, bearer-guarded: a peer registers its identity and xorb inventory (AnnounceRequest, answered by AnnounceResponse).
 	AnnouncePath = "/xet-pd/v1/announce"
-	// PullPath is POST on a peer, bearer-guarded: the tracker asks it to fetch one file complete (PullRequest, answered 202 once the pull is under way).
+	// PullPath is POST on a peer, bearer-guarded: the tracker asks it to fetch xorbs and/or shards (PullRequest, answered 202 once the pulls are under way).
 	PullPath = "/xet-pd/v1/pull"
 	// PeersPath is GET on the tracker, unguarded: the live registry (PeersResponse).
 	PeersPath = "/xet-pd/v1/peers"
-	// LookupPath is POST on the tracker, bearer-guarded: a peer asks which live peers hold xorbs and complete files (LookupRequest, answered by LookupResponse).
+	// LookupPath is POST on the tracker, bearer-guarded: a peer asks which live peers hold xorbs and the shards of files (LookupRequest, answered by LookupResponse).
 	LookupPath = "/xet-pd/v1/lookup"
 	// ShardPathPrefix + file hash is GET on a peer, bearer-guarded: the requester sends PeerHeader and gets the file's ShardResponse, or 404 when the peer has no shard for it.
 	ShardPathPrefix = "/xet-pd/v1/shards/"
@@ -59,14 +59,12 @@ func ValidLabel(s string, maxLen int) bool {
 	return true
 }
 
-// PullRequest is the PullPath body: at least one entry across Xorbs and Shards, or a File; 202 means accepted, the pulls run asynchronously.
+// PullRequest is the PullPath body: at least one entry across Xorbs and Shards; 202 means accepted, the pulls run asynchronously.
 type PullRequest struct {
 	// Xorbs lists hashes of xorbs to pull whole.
 	Xorbs []string `json:"xorbs,omitempty"`
 	// Shards lists hashes of files, in the form of File.Hash, whose ShardResponse the peer fetches.
 	Shards []string `json:"shards,omitempty"`
-	// File, in the form of File.Hash, names a file to pull complete: its shard and every xorb the shard references. Superseded by Xorbs/Shards.
-	File string `json:"file,omitempty"`
 	// Seed marks the copy as a seed copy, which the peer keeps until MinSeeds other live holders have it; it applies to every listed xorb.
 	Seed bool `json:"seed,omitempty"`
 }
@@ -95,7 +93,7 @@ type AnnounceRequest struct {
 	Peer Peer `json:"peer"`
 	// Epoch is drawn at random once per peer start, 1 to 128 of [A-Za-z0-9._-]; a delta under another epoch than the registered one is refused with Resync.
 	Epoch string `json:"epoch"`
-	// Full replaces the registered xorb, shard and file sets: it discards them before the lists apply and (re)registers the peer; a delta applies Add and Remove to the xorbs, AddShards and RemoveShards to the shards, AddFiles and RemoveFiles to the files.
+	// Full replaces the registered xorb and shard sets: it discards them before the lists apply and (re)registers the peer; a delta applies Add and Remove to the xorbs, AddShards and RemoveShards to the shards.
 	Full bool `json:"full,omitempty"`
 	// Add lists xorb hashes the peer holds, 64 hex digits each, lowercased by the tracker; one invalid hash rejects the whole announce.
 	Add []string `json:"add,omitempty"`
@@ -105,10 +103,6 @@ type AnnounceRequest struct {
 	AddShards []File `json:"add_shards,omitempty"`
 	// RemoveShards lists hashes of files whose shard the peer dropped, in the form of File.Hash; it applies after AddShards, so it wins inside one request.
 	RemoveShards []string `json:"remove_shards,omitempty"`
-	// AddFiles lists files the peer holds complete, meaning it holds their shard and every xorb the shard references. Superseded by AddShards/RemoveShards.
-	AddFiles []File `json:"add_files,omitempty"`
-	// RemoveFiles lists hashes of files the peer no longer holds complete, in the form of File.Hash. Superseded by AddShards/RemoveShards.
-	RemoveFiles []string `json:"remove_files,omitempty"`
 }
 
 // AnnounceResponse answers every announce that passed validation (200), a refused delta included; see Resync.
@@ -139,8 +133,6 @@ type PeerStatus struct {
 	Holdings int `json:"holdings"`
 	// Shards counts the shards the peer announced.
 	Shards int `json:"shards"`
-	// Files counts the complete files the peer announced. Superseded by Shards.
-	Files int `json:"files"`
 }
 
 // PeersResponse is the GET PeersPath schema: the live peer registry.

@@ -50,7 +50,7 @@ func lookup(t *testing.T, tr *clustertest.FakeTracker, req apis.LookupRequest) a
 func TestFakeTrackerRecordsAnnounces(t *testing.T) {
 	t.Parallel()
 	tr := clustertest.NewFakeTracker(t)
-	req := apis.AnnounceRequest{Peer: peerA, Epoch: "e1", Full: true, AddFiles: []apis.File{file1}}
+	req := apis.AnnounceRequest{Peer: peerA, Epoch: "e1", Full: true, AddShards: []apis.File{file1}}
 	resp, err := apis.Announce(t.Context(), tr.Client(), tr.URL, "s3cret", req)
 	if err != nil || !reflect.DeepEqual(resp, apis.AnnounceResponse{TTL: 30}) {
 		t.Fatalf("Announce = %+v, %v, want TTL 30", resp, err)
@@ -134,22 +134,9 @@ func TestFakeTrackerLookupExcludesTheAsker(t *testing.T) {
 	x1, x2, unknown := xorbHash(t, "1"), xorbHash(t, "2"), xorbHash(t, "3")
 	tr.Hold(peerA, x1, x2)
 	tr.Hold(peerB, x1)
-	tr.HoldFile(peerA, file1)
-	got := lookup(t, tr, apis.LookupRequest{Peer: "a", Xorbs: []string{x1.String(), x2.String(), unknown.String()}, Files: []string{file1.Hash}})
+	got := lookup(t, tr, apis.LookupRequest{Peer: "a", Xorbs: []string{x1.String(), x2.String(), unknown.String()}})
 	if want := (apis.LookupResponse{Xorbs: map[string][]apis.Peer{x1.String(): {peerB}}}); !reflect.DeepEqual(got, want) {
 		t.Fatalf("Lookup as a = %+v, want %+v", got, want)
-	}
-}
-
-func TestFakeTrackerHoldFileAnswersBothHashes(t *testing.T) {
-	t.Parallel()
-	tr := clustertest.NewFakeTracker(t)
-	tr.HoldFile(peerC, file1)
-	tr.HoldFile(peerB, file1)
-	got := lookup(t, tr, apis.LookupRequest{Peer: "a", SHA256s: []string{file1.SHA256}, Files: []string{file1.Hash}})
-	loc := apis.FileLocation{File: file1, Peers: []apis.Peer{peerC, peerB}}
-	if want := (apis.LookupResponse{SHA256s: map[string]apis.FileLocation{file1.SHA256: loc}, Files: map[string]apis.FileLocation{file1.Hash: loc}}); !reflect.DeepEqual(got, want) {
-		t.Fatalf("Lookup = %+v, want %+v", got, want)
 	}
 }
 
@@ -198,9 +185,8 @@ func TestFakeTrackerForget(t *testing.T) {
 	x := xorbHash(t, "1")
 	tr.Hold(peerA, x)
 	tr.Hold(peerB, x)
-	tr.HoldFile(peerA, file1)
 	tr.Forget("a")
-	got := lookup(t, tr, apis.LookupRequest{Xorbs: []string{x.String()}, Files: []string{file1.Hash}})
+	got := lookup(t, tr, apis.LookupRequest{Xorbs: []string{x.String()}})
 	if want := (apis.LookupResponse{Xorbs: map[string][]apis.Peer{x.String(): {peerB}}}); !reflect.DeepEqual(got, want) {
 		t.Fatalf("Lookup after Forget(a) = %+v, want %+v", got, want)
 	}
@@ -382,7 +368,7 @@ func TestFakePeerServesShards(t *testing.T) {
 func TestFakePeerRecordsPulls(t *testing.T) {
 	t.Parallel()
 	p := clustertest.NewFakePeer(t, "p1")
-	req := apis.PullRequest{File: file1.Hash, Seed: true}
+	req := apis.PullRequest{Shards: []string{file1.Hash}, Seed: true}
 	if err := apis.Pull(t.Context(), p.Client(), p.URL, "s3cret", req); err != nil {
 		t.Fatalf("Pull = %v, want accepted", err)
 	}
@@ -390,10 +376,10 @@ func TestFakePeerRecordsPulls(t *testing.T) {
 		t.Fatalf("Pull(0) = %+v, want %+v with its header", got, req)
 	}
 	p.SetPullStatus(http.StatusServiceUnavailable)
-	if err := apis.Pull(t.Context(), p.Client(), p.URL, "", apis.PullRequest{File: "aa"}); err == nil || !strings.Contains(err.Error(), "503") {
+	if err := apis.Pull(t.Context(), p.Client(), p.URL, "", apis.PullRequest{Xorbs: []string{"aa"}}); err == nil || !strings.Contains(err.Error(), "503") {
 		t.Fatalf("Pull after SetPullStatus(503) = %v, want an error naming the status", err)
 	}
-	if got := p.Pulls(); len(got) != 2 || got[1].Req.File != "aa" {
+	if got := p.Pulls(); len(got) != 2 || !reflect.DeepEqual(got[1].Req.Xorbs, []string{"aa"}) {
 		t.Fatalf("Pulls = %+v, want both pulls in order", got)
 	}
 }
@@ -401,7 +387,7 @@ func TestFakePeerRecordsPulls(t *testing.T) {
 func TestFakePeerRecordsLargePulls(t *testing.T) {
 	t.Parallel()
 	p := clustertest.NewFakePeer(t, "p1")
-	req := apis.PullRequest{File: file1.Hash, Seed: true}
+	req := apis.PullRequest{Seed: true}
 	for i := range 2300 {
 		req.Xorbs = append(req.Xorbs, fmt.Sprintf("%064x", i))
 		req.Shards = append(req.Shards, fmt.Sprintf("f%063x", i))
@@ -414,7 +400,7 @@ func TestFakePeerRecordsLargePulls(t *testing.T) {
 		t.Fatalf("Pull of a %d-byte body = %v, want accepted", len(body), err)
 	}
 	if got := p.Pull(t, 0); !reflect.DeepEqual(got.Req, req) {
-		t.Fatalf("Pull(0) recorded %d xorbs, %d shards, file %q, seed %v; want the whole request", len(got.Req.Xorbs), len(got.Req.Shards), got.Req.File, got.Req.Seed)
+		t.Fatalf("Pull(0) recorded %d xorbs, %d shards, seed %v; want the whole request", len(got.Req.Xorbs), len(got.Req.Shards), got.Req.Seed)
 	}
 }
 
@@ -451,7 +437,7 @@ func TestFakePeerRecordsRequests(t *testing.T) {
 	x := xorbHash(t, "1")
 	fetch(t, http.MethodGet, apis.XorbURL(p.URL, x.String()), "p2")
 	_, _ = apis.GetShard(t.Context(), p.Client(), p.URL, "", "p3", file1.Hash)
-	_ = apis.Pull(t.Context(), p.Client(), p.URL, "", apis.PullRequest{File: file1.Hash})
+	_ = apis.Pull(t.Context(), p.Client(), p.URL, "", apis.PullRequest{Shards: []string{file1.Hash}})
 	got := p.Requests()
 	want := []struct{ method, path, peer string }{
 		{http.MethodGet, apis.XorbPathPrefix + x.String(), "p2"},

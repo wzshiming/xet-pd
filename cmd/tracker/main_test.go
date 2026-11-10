@@ -103,7 +103,7 @@ func TestParseTrackerHelp(t *testing.T) {
 		"[env XET_PD_LISTEN] (default \":8080\")",
 		"[env XET_PD_LOG_FORMAT] (default text)",
 		"seconds a peer stays registered after its last announce [env XET_PD_PEER_TTL] (default 30s)",
-		"seed copies the tracker asks for per complete file [env XET_PD_REPLICAS] (default 2)",
+		"seed copies the tracker asks for per xorb and per shard [env XET_PD_REPLICAS] (default 2)",
 		"other live holders a seed copy needs before a peer may evict it [env XET_PD_MIN_SEEDS] (default 1)",
 		"[env XET_PD_SECRET]", "[env XET_PD_SECRET_FILE]",
 	} {

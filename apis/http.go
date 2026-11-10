@@ -47,7 +47,7 @@ func Authorize(w http.ResponseWriter, r *http.Request, secret string) bool {
 // XorbURL is origin + XorbPathPrefix + hash: where a peer pulls a xorb from a holder and xet clients fetch it as their peer's reconstruction replies direct them.
 func XorbURL(origin, hash string) string { return origin + XorbPathPrefix + hash }
 
-// ShardURL is origin + ShardPathPrefix + fileHash: where a peer fetches a file's ShardResponse from a complete holder.
+// ShardURL is origin + ShardPathPrefix + fileHash: where a peer fetches a file's ShardResponse from a holder of its shard.
 func ShardURL(origin, fileHash string) string { return origin + ShardPathPrefix + fileHash }
 
 // ReadJSON decodes a request body of exactly one JSON value within limit bytes into v; otherwise it answers 413 or 400 and reports false.

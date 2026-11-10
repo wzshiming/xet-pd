@@ -50,28 +50,9 @@ func TestWireConstants(t *testing.T) {
 
 func TestPullRequestWire(t *testing.T) {
 	t.Parallel()
-	in := PullRequest{File: "file-hash"}
-	want := `{"file":"file-hash"}`
-	encoded, err := json.Marshal(in)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(encoded) != want {
-		t.Fatalf("encoded\n got %s\nwant %s", encoded, want)
-	}
-	var out PullRequest
-	if err := json.Unmarshal(encoded, &out); err != nil {
-		t.Fatal(err)
-	}
-	if !reflect.DeepEqual(out, in) {
-		t.Fatalf("round trip\n got %+v\nwant %+v", out, in)
-	}
-}
-
-func TestPullRequestSeedWire(t *testing.T) {
-	t.Parallel()
-	in := PullRequest{File: "file-hash", Seed: true}
-	want := `{"file":"file-hash","seed":true}`
+	// Unkeyed, so a field added or dropped fails to compile here.
+	in := PullRequest{[]string{"aa"}, []string{"f1"}, true}
+	want := `{"xorbs":["aa"],"shards":["f1"],"seed":true}`
 	encoded, err := json.Marshal(in)
 	if err != nil {
 		t.Fatal(err)
@@ -194,16 +175,19 @@ func TestAnnounceRequestWire(t *testing.T) {
 	}
 }
 
-func TestAnnounceRequestFilesWire(t *testing.T) {
+func TestAnnounceRequestEveryFieldWire(t *testing.T) {
 	t.Parallel()
+	// Unkeyed, so a field added or dropped fails to compile here.
 	in := AnnounceRequest{
-		Peer:        Peer{ID: "peer-1", URL: "http://peer-1:8080"},
-		Epoch:       "epoch-1",
-		Add:         []string{"aa"},
-		AddFiles:    []File{{Hash: "f1", SHA256: "s1"}},
-		RemoveFiles: []string{"f2"},
+		Peer{ID: "peer-1", URL: "http://peer-1:8080", Upstream: true},
+		"epoch-1",
+		true,
+		[]string{"aa"},
+		[]string{"cc"},
+		[]File{{Hash: "f1", SHA256: "s1"}},
+		[]string{"f2"},
 	}
-	want := `{"peer":{"id":"peer-1","url":"http://peer-1:8080"},"epoch":"epoch-1","add":["aa"],"add_files":[{"hash":"f1","sha256":"s1"}],"remove_files":["f2"]}`
+	want := `{"peer":{"id":"peer-1","url":"http://peer-1:8080","upstream":true},"epoch":"epoch-1","full":true,"add":["aa"],"remove":["cc"],"add_shards":[{"hash":"f1","sha256":"s1"}],"remove_shards":["f2"]}`
 	got, err := json.Marshal(in)
 	if err != nil {
 		t.Fatal(err)
@@ -331,12 +315,12 @@ func TestPeersResponseWire(t *testing.T) {
 	t.Parallel()
 	expiry := time.Date(2026, 9, 23, 14, 0, 0, 0, time.UTC)
 	in := PeersResponse{Peers: []PeerStatus{
-		{ID: "peer-1", URL: "http://peer-1:8080", Upstream: true, Epoch: "epoch-1", Expiry: expiry, Holdings: 3, Shards: 4, Files: 2},
+		{ID: "peer-1", URL: "http://peer-1:8080", Upstream: true, Epoch: "epoch-1", Expiry: expiry, Holdings: 3, Shards: 4},
 		{ID: "peer-2", URL: "http://peer-2:8080", Epoch: "epoch-2", Expiry: expiry},
 	}}
 	want := `{"peers":[` +
-		`{"id":"peer-1","url":"http://peer-1:8080","upstream":true,"epoch":"epoch-1","expiry":"2026-09-23T14:00:00Z","holdings":3,"shards":4,"files":2},` +
-		`{"id":"peer-2","url":"http://peer-2:8080","epoch":"epoch-2","expiry":"2026-09-23T14:00:00Z","holdings":0,"shards":0,"files":0}]}`
+		`{"id":"peer-1","url":"http://peer-1:8080","upstream":true,"epoch":"epoch-1","expiry":"2026-09-23T14:00:00Z","holdings":3,"shards":4},` +
+		`{"id":"peer-2","url":"http://peer-2:8080","epoch":"epoch-2","expiry":"2026-09-23T14:00:00Z","holdings":0,"shards":0}]}`
 	got, err := json.Marshal(in)
 	if err != nil {
 		t.Fatal(err)

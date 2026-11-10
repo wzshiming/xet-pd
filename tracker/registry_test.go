@@ -528,7 +528,7 @@ func TestSnapshotListsLivePeers(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	const wantJSON = `{"id":"p2","url":"http://p2","upstream":true,"epoch":"e2","expiry":"1970-01-01T00:17:40Z","holdings":2,"shards":1,"files":0}`
+	const wantJSON = `{"id":"p2","url":"http://p2","upstream":true,"epoch":"e2","expiry":"1970-01-01T00:17:40Z","holdings":2,"shards":1}`
 	if string(b) != wantJSON {
 		t.Fatalf("snapshot JSON = %s, want %s", b, wantJSON)
 	}

@@ -409,7 +409,7 @@ func headReady(t *testing.T, resolveURL string) http.Header {
 
 // seeded reports whether the tracker lists n live peers, each with at least files complete files.
 func seeded(d apis.PeersResponse, n, files int) bool {
-	return len(d.Peers) == n && !slices.ContainsFunc(d.Peers, func(p apis.PeerStatus) bool { return p.Files < files })
+	return len(d.Peers) == n && !slices.ContainsFunc(d.Peers, func(p apis.PeerStatus) bool { return p.Shards < files })
 }
 
 // peerStatus returns the tracker's entry for the peer advertising url.

@@ -24,8 +24,8 @@ const (
 )
 
 var (
-	trackerTypes = []string{"xetpd_tracker_peers", "xetpd_tracker_xorbs", "xetpd_tracker_files", "xetpd_tracker_announces_total", "xetpd_tracker_lookups_total", "xetpd_tracker_seed_requests_total"}
-	peerTypes    = []string{"xetpd_peer_xorb_gets_total", "xetpd_peer_pulls_total", "xetpd_peer_announces_total", "xetpd_peer_shard_gets_total", "xetpd_peer_files", "xetpd_peer_xorb_cache_bytes"}
+	trackerTypes = []string{"xetpd_tracker_peers", "xetpd_tracker_xorbs", "xetpd_tracker_shards", "xetpd_tracker_announces_total", "xetpd_tracker_lookups_total", "xetpd_tracker_seed_requests_total"}
+	peerTypes    = []string{"xetpd_peer_xorb_gets_total", "xetpd_peer_pulls_total", "xetpd_peer_announces_total", "xetpd_peer_shard_gets_total", "xetpd_peer_shards", "xetpd_peer_xorb_cache_bytes"}
 )
 
 func TestKind(t *testing.T) {
@@ -83,7 +83,7 @@ func TestKind(t *testing.T) {
 			if err != nil {
 				return err
 			}
-			if s, ok := peerStatus(d, p.url()); !ok || s.Files < 1 || s.Epoch == skip {
+			if s, ok := peerStatus(d, p.url()); !ok || s.Shards < 1 || s.Epoch == skip {
 				return fmt.Errorf("tracker lists %v", holdings(d))
 			}
 			return nil

@@ -168,7 +168,7 @@ func peerStatus(d apis.PeersResponse, url string) (apis.PeerStatus, bool) {
 func holdings(d apis.PeersResponse) []string {
 	var out []string
 	for _, p := range d.Peers {
-		out = append(out, fmt.Sprintf("%s files=%d xorbs=%d", p.URL, p.Files, p.Holdings))
+		out = append(out, fmt.Sprintf("%s files=%d xorbs=%d", p.URL, p.Shards, p.Holdings))
 	}
 	slices.Sort(out)
 	return out

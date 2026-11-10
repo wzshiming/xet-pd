@@ -215,9 +215,6 @@ func (f *FakeTracker) HoldShard(p apis.Peer, file apis.File) {
 	f.holdings = append(f.holdings, holding{key: "sha256:" + file.SHA256, peer: p, file: file}, holding{key: "file:" + file.Hash, peer: p, file: file})
 }
 
-// HoldFile programs p as a complete holder of file, which lookups answer as they answer a HoldShard holder.
-func (f *FakeTracker) HoldFile(p apis.Peer, file apis.File) { f.HoldShard(p, file) }
-
 // Forget removes the peer with ID id from everything Hold and HoldShard programmed.
 func (f *FakeTracker) Forget(id string) {
 	f.mu.Lock()

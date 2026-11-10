@@ -35,7 +35,7 @@ func startCluster(t *testing.T, hub *clustertest.Hub, replicas, minSeeds int, pe
 func holds(t *testing.T, origin, url string, files int) func() bool {
 	return func() bool {
 		s, ok := peerStatus(clustertest.Diag(t, origin), url)
-		return ok && s.Files == files
+		return ok && s.Shards == files
 	}
 }
 
@@ -65,7 +65,7 @@ func TestColdDownloadThroughPeer(t *testing.T) {
 	}
 	clustertest.WaitFor(t, readyTimeout, "the tracker to list peer-1 with the file", func() bool {
 		s, ok := peerStatus(clustertest.Diag(t, tr.URL), peers[0].URL)
-		return ok && s.Files == 1 && s.Holdings >= 1
+		return ok && s.Shards == 1 && s.Holdings >= 1
 	})
 	t.Logf("file %s: %d bytes from one hub CDN GET, fetched from peer-1 at %v", fileHash, len(data), urls)
 }
@@ -138,7 +138,7 @@ func TestPeerLossFailsOver(t *testing.T) {
 	peers[0].kill()
 	clustertest.WaitFor(t, 10*time.Second, "the dead peer to expire, leaving the survivor listed with the file", func() bool {
 		d := clustertest.Diag(t, tr.URL)
-		return len(d.Peers) == 1 && d.Peers[0].URL == peers[1].URL && d.Peers[0].Files == 1
+		return len(d.Peers) == 1 && d.Peers[0].URL == peers[1].URL && d.Peers[0].Shards == 1
 	})
 	fh, v2, out := xetDownload(t, peers[1].URL+modelPath)
 	if fh.String() != fileHash || clustertest.SHA256(out) != clustertest.SHA256(data) {
@@ -177,7 +177,7 @@ func TestAllCopiesEvictedReingests(t *testing.T) {
 		s1, _ := peerStatus(d, peers[0].URL)
 		s2, ok := peerStatus(d, peers[1].URL)
 		held := xorbHashes(t, peers[0].DataDir)
-		return s1.Files == 1 && s1.Holdings == 1 && ok && s2.Holdings == 0 && s2.Files == 0 &&
+		return s1.Shards == 1 && s1.Holdings == 1 && ok && s2.Holdings == 0 && s2.Shards == 0 &&
 			len(held) == 1 && held[0] != xorbsA[0] && len(xorbHashes(t, peers[1].DataDir)) == 0
 	})
 	xorbsB := xorbHashes(t, peers[0].DataDir)

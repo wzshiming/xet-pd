@@ -375,7 +375,7 @@ func TestAnnounceNeverFollowsRedirects(t *testing.T) {
 }
 
 func TestAnnounceRejectsMalformedReply(t *testing.T) {
-	pad := strings.Repeat(" ", apis.MaxReplyBytes-len(`{"ttl":30}`))
+	pad := strings.Repeat(" ", apis.MaxAnnounceReplyBytes-len(`{"ttl":30}`))
 	replies := []string{
 		`{"ttl":30}{}`,                    // trailing value
 		`{"ttl":`,                         // truncated

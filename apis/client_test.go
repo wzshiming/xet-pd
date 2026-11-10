@@ -2,6 +2,7 @@ package apis
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -130,6 +131,24 @@ func TestAnnounce(t *testing.T) {
 	}
 }
 
+func TestAnnounceDecodesAReplyAboveMaxReplyBytes(t *testing.T) {
+	t.Parallel()
+	want := AnnounceResponse{TTL: 30}
+	for i := range 100 {
+		id := fmt.Sprintf("access-%03d", i)
+		want.Upstreams = append(want.Upstreams, Peer{ID: id, URL: "http://" + id + ".xet-pd.svc.cluster.local:8080", Upstream: true})
+	}
+	body, err := json.Marshal(want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv, _ := replying(t, http.StatusOK, string(body))
+	resp, err := Announce(t.Context(), srv.Client(), srv.URL, "", AnnounceRequest{})
+	if err != nil || !reflect.DeepEqual(resp, want) {
+		t.Fatalf("Announce with a %d-byte reply = %d upstreams, %v; want all %d", len(body), len(resp.Upstreams), err, len(want.Upstreams))
+	}
+}
+
 func TestLookup(t *testing.T) {
 	t.Parallel()
 	srv, reqs := replying(t, http.StatusOK, `{"xorbs":{"aa":[{"id":"p2","url":"http://p2"}]}}`)
@@ -234,9 +253,30 @@ func TestCallsDrainTheReply(t *testing.T) {
 	}
 }
 
+// The stall after MaxReplyBytes+1 bytes outlasts the transport's own 50ms drain.
+func TestAnnounceDrainsAFailedReplyAboveMaxReplyBytes(t *testing.T) {
+	t.Parallel()
+	addrs := make(chan string, 2)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		addrs <- r.RemoteAddr
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = io.WriteString(w, strings.Repeat(" ", MaxReplyBytes+1))
+		w.(http.Flusher).Flush()
+		time.Sleep(100 * time.Millisecond)
+		_, _ = io.WriteString(w, "busy\n")
+	}))
+	defer srv.Close()
+	for range 2 {
+		_, _ = Announce(t.Context(), srv.Client(), srv.URL, "", AnnounceRequest{})
+	}
+	if first, second := <-addrs, <-addrs; first != second {
+		t.Errorf("second announce came from %s, first from %s; want the %d-byte failed reply drained and the connection reused", second, first, MaxReplyBytes+6)
+	}
+}
+
 func TestCallsLimitTheReply(t *testing.T) {
 	t.Parallel()
-	for name, limit := range map[string]int{"Announce": MaxReplyBytes, "Lookup": MaxLookupBytes, "GetShard": MaxShardBytes} {
+	for name, limit := range map[string]int{"Announce": MaxAnnounceReplyBytes, "Lookup": MaxLookupBytes, "GetShard": MaxShardBytes} {
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			_, _ = io.WriteString(w, "{}")
 			spaces := []byte(strings.Repeat(" ", 64<<10))

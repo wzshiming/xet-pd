@@ -31,8 +31,10 @@ const (
 	MaxLookupBytes = 32 << 20
 	// MaxShardBytes caps a ShardResponse reply.
 	MaxShardBytes = 64 << 20
-	// MaxReplyBytes caps an announce reply and a pull request body, and how much of a reply is drained before its connection is reused.
+	// MaxReplyBytes caps a pull request body for now, and how much of a pull, lookup or shard reply is drained before its connection is reused.
 	MaxReplyBytes = 4096
+	// MaxAnnounceReplyBytes caps an announce reply and how much of one is drained, above MaxReplyBytes because Upstreams lists every live peer whose Upstream is set.
+	MaxAnnounceReplyBytes = 256 << 10
 	// MaxPullBytes caps a pull request body.
 	MaxPullBytes = 1 << 20
 	// MaxPullBatch caps the Xorbs and Shards entries of one pull request together.

@@ -59,14 +59,14 @@ func DecodeJSON(r io.Reader, limit int64, v any) error {
 // Announce posts req to the tracker's AnnouncePath and decodes its 200 reply.
 func Announce(ctx context.Context, c *http.Client, tracker, secret string, req AnnounceRequest) (AnnounceResponse, error) {
 	var out AnnounceResponse
-	err := exchange(ctx, c, tracker+AnnouncePath, secret, req, MaxReplyBytes, &out)
+	err := exchange(ctx, c, tracker+AnnouncePath, secret, req, MaxAnnounceReplyBytes, MaxAnnounceReplyBytes, &out)
 	return out, err
 }
 
 // Lookup posts req to the tracker's LookupPath and decodes its 200 reply.
 func Lookup(ctx context.Context, c *http.Client, tracker, secret string, req LookupRequest) (LookupResponse, error) {
 	var out LookupResponse
-	err := exchange(ctx, c, tracker+LookupPath, secret, req, MaxLookupBytes, &out)
+	err := exchange(ctx, c, tracker+LookupPath, secret, req, MaxLookupBytes, MaxReplyBytes, &out)
 	return out, err
 }
 
@@ -76,7 +76,7 @@ func Pull(ctx context.Context, c *http.Client, peer, secret string, req PullRequ
 	if err != nil {
 		return err
 	}
-	defer drain(resp)
+	defer drain(resp, MaxReplyBytes)
 	if resp.StatusCode != http.StatusAccepted {
 		return fmt.Errorf("status %s", resp.Status)
 	}
@@ -98,7 +98,7 @@ func GetShard(ctx context.Context, c *http.Client, peer, secret, self, fileHash 
 	if err != nil {
 		return out, err
 	}
-	defer drain(resp)
+	defer drain(resp, MaxReplyBytes)
 	switch resp.StatusCode {
 	case http.StatusOK:
 		err = DecodeJSON(resp.Body, MaxShardBytes, &out)
@@ -110,21 +110,21 @@ func GetShard(ctx context.Context, c *http.Client, peer, secret, self, fileHash 
 	return out, err
 }
 
-// exchange posts body to url and decodes a 200 reply of at most limit bytes into out.
-func exchange(ctx context.Context, c *http.Client, url, secret string, body any, limit int64, out any) error {
+// exchange posts body to url, decodes a 200 reply of at most limit bytes into out and drains up to drainLimit bytes of what is left.
+func exchange(ctx context.Context, c *http.Client, url, secret string, body any, limit, drainLimit int64, out any) error {
 	resp, err := PostJSON(ctx, c, url, secret, body)
 	if err != nil {
 		return err
 	}
-	defer drain(resp)
+	defer drain(resp, drainLimit)
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("status %s", resp.Status)
 	}
 	return DecodeJSON(resp.Body, limit, out)
 }
 
-// drain reads up to MaxReplyBytes of what is left of resp's body, so its connection can be reused, and closes it.
-func drain(resp *http.Response) {
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, MaxReplyBytes))
+// drain reads up to limit bytes of what is left of resp's body, so its connection can be reused, and closes it.
+func drain(resp *http.Response, limit int64) {
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, limit))
 	_ = resp.Body.Close()
 }

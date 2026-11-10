@@ -31,6 +31,9 @@ func TestWireConstants(t *testing.T) {
 	if MaxAnnounceBytes != 32<<20 || MaxLookupBytes != 32<<20 || MaxShardBytes != 64<<20 || MaxReplyBytes != 4096 {
 		t.Fatalf("MaxAnnounceBytes, MaxLookupBytes, MaxShardBytes, MaxReplyBytes = %d, %d, %d, %d", MaxAnnounceBytes, MaxLookupBytes, MaxShardBytes, MaxReplyBytes)
 	}
+	if MaxAnnounceReplyBytes != 256<<10 {
+		t.Fatalf("MaxAnnounceReplyBytes = %d", MaxAnnounceReplyBytes)
+	}
 	if MaxPullBytes != 1<<20 || MaxPullBatch != 256 {
 		t.Fatalf("MaxPullBytes, MaxPullBatch = %d, %d", MaxPullBytes, MaxPullBatch)
 	}

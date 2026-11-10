@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -26,6 +27,13 @@ const modelPath = "/org/repo/resolve/main/model.bin"
 // startNode runs a peer as its node's endpoint, advertised at its own listener, announcing to trackerURL and mirroring upstream.
 func startNode(t *testing.T, trackerURL, upstream string) (*Peer, string) {
 	t.Helper()
+	p, origin, _ := startRecordedNode(t, trackerURL, upstream)
+	return p, origin
+}
+
+// startRecordedNode is startNode recording every request the peer receives.
+func startRecordedNode(t *testing.T, trackerURL, upstream string) (*Peer, string, *recorder) {
+	t.Helper()
 	srv := httptest.NewUnstartedServer(nil)
 	origin := "http://" + srv.Listener.Addr().String()
 	p, err := New(Config{Advertise: origin, Tracker: trackerURL, Upstream: upstream, DataDir: t.TempDir(), Secret: testSecret, Heartbeat: 50 * time.Millisecond})
@@ -33,13 +41,38 @@ func startNode(t *testing.T, trackerURL, upstream string) (*Peer, string) {
 		srv.Close()
 		t.Fatal(err)
 	}
-	srv.Config.Handler = p
+	rec := &recorder{}
+	srv.Config.Handler = rec.wrap(p)
 	srv.Start()
 	t.Cleanup(func() {
 		_ = p.Close()
 		srv.Close()
 	})
-	return p, origin
+	return p, origin, rec
+}
+
+// recorded is a request as a recorder saw it; peer is its apis.PeerHeader.
+type recorded struct{ method, path, peer string }
+
+// recorder records the requests reaching the handlers it wraps.
+type recorder struct {
+	mu   sync.Mutex
+	reqs []recorded
+}
+
+func (rec *recorder) wrap(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rec.mu.Lock()
+		rec.reqs = append(rec.reqs, recorded{r.Method, r.URL.Path, r.Header.Get(apis.PeerHeader)})
+		rec.mu.Unlock()
+		h.ServeHTTP(w, r)
+	})
+}
+
+func (rec *recorder) requests() []recorded {
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	return slices.Clone(rec.reqs)
 }
 
 // send performs one request carrying body without following redirects and returns the response and its body.

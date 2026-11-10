@@ -214,13 +214,24 @@ func TestConfigValidation(t *testing.T) {
 	}
 }
 
-func TestConfigRequiresUpstream(t *testing.T) {
+func TestConfigWithoutUpstreamMakesAnInternalPeer(t *testing.T) {
 	p, err := New(Config{Advertise: "http://seed:8080", Tracker: "http://tracker", DataDir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("New without an upstream = %v, want an internal peer", err)
+	}
+	defer func() { _ = p.Close() }()
+	if got := configOf(p).Upstream; got != "" {
+		t.Fatalf("normalized Upstream = %q, want it left empty", got)
+	}
+}
+
+func TestConfigRejectsUpstreamTokenWithoutUpstream(t *testing.T) {
+	p, err := New(Config{Advertise: "http://seed:8080", Tracker: "http://tracker", UpstreamToken: "tok", DataDir: t.TempDir()})
 	if err == nil {
 		_ = p.Close()
-		t.Fatal("New accepted a config without an upstream")
+		t.Fatal("New accepted an upstream token without an upstream")
 	}
-	if want := "upstream is required"; err.Error() != want {
+	if want := "upstream token needs upstream"; err.Error() != want {
 		t.Fatalf("New error = %q, want %q", err, want)
 	}
 }

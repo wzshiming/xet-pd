@@ -29,7 +29,7 @@ func TestMain(m *testing.M) {
 func TestParsePeerDefaults(t *testing.T) {
 	settings, cfg, err := parse([]string{"-advertise", "http://p:1", "-tracker", "http://t:2"}, clitest.Getenv(), io.Discard)
 	wantSettings := cli.Settings{Listen: ":8081", LogFormat: cli.LogText}
-	want := peer.Config{Advertise: "http://p:1", Tracker: "http://t:2", Upstream: "https://huggingface.co", DataDir: "./xet-pd-peer", XorbCacheSize: 8 << 30, MaxPulls: 8, PullTimeout: 10 * time.Minute, Heartbeat: 10 * time.Second}
+	want := peer.Config{Advertise: "http://p:1", Tracker: "http://t:2", DataDir: "./xet-pd-peer", XorbCacheSize: 8 << 30, MaxPulls: 8, PullTimeout: 10 * time.Minute, Heartbeat: 10 * time.Second}
 	if err != nil || settings != wantSettings || cfg != want {
 		t.Fatalf("parse() = %+v, %+v, %v; want %+v, %+v", settings, cfg, err, wantSettings, want)
 	}
@@ -71,7 +71,6 @@ func TestParsePeerErrors(t *testing.T) {
 	}{
 		{"missing advertise", []string{"-tracker", "http://t:2"}, clitest.Getenv(), "advertise is required"},
 		{"missing tracker", []string{"-advertise", "http://p:1"}, clitest.Getenv(), "tracker is required"},
-		{"empty upstream", append(both, "-upstream", ""), clitest.Getenv(), "upstream is required"},
 		{"positional argument", append(both, "extra"), clitest.Getenv(), `unexpected argument "extra"`},
 		{"bad log format flag", append(both, "-log-format", "yaml"), clitest.Getenv(), `invalid value "yaml" for flag -log-format: expected text or json`},
 		{"bad env int", both, clitest.Getenv("XET_PD_MAX_PULLS", "x"), "XET_PD_MAX_PULLS"},
@@ -95,7 +94,8 @@ func TestParsePeerHelp(t *testing.T) {
 	if !errors.Is(err, flag.ErrHelp) {
 		t.Fatalf("err = %v, want flag.ErrHelp", err)
 	}
-	for _, want := range []string{"Usage: peer [flags]", "-advertise", "[env XET_PD_ADVERTISE]", "-tracker", "[env XET_PD_TRACKER]", "-upstream", "[env HF_ENDPOINT]", `(default "https://huggingface.co")`, "-upstream-token", "[env HF_TOKEN]",
+	for _, want := range []string{"Usage: peer [flags]", "-advertise", "[env XET_PD_ADVERTISE]", "-tracker", "[env XET_PD_TRACKER]", "-upstream",
+		"upstream hub origin; empty makes this peer fetch through the peers that have one [env HF_ENDPOINT]", "-upstream-token", "bearer token for the upstream hub, needs -upstream [env HF_TOKEN]",
 		"-data-dir", "[env XET_PD_DATA_DIR]", "(default 8GiB)", "-pull-timeout", "(default 10m0s)", "[env XET_PD_SECRET]", "-log-format", "[env XET_PD_LOG_FORMAT]", "(default text)"} {
 		if !strings.Contains(help.String(), want) {
 			t.Errorf("help lacks %q:\n%s", want, help.String())
@@ -136,11 +136,16 @@ func TestRunUsage(t *testing.T) {
 		{name: "--help", args: []string{"--help"}, code: 0, stdout: "Usage: peer [flags]"},
 		{name: "missing advertise", args: nil, code: 2, stderr: "peer: advertise is required\nRun \"peer -h\" for flags.\n"},
 		{name: "bad log format", args: []string{"-log-format", "yaml"}, code: 2, stderr: "peer: invalid value \"yaml\" for flag -log-format: expected text or json\nRun \"peer -h\" for flags.\n"},
+		{name: "upstream token without upstream", args: []string{"-listen", "127.0.0.1:0", "-advertise", "http://127.0.0.1:1", "-tracker", "http://127.0.0.1:1", "-upstream-token", "tok", "-data-dir", t.TempDir()},
+			code: 1, stderr: "peer: upstream token needs upstream\n"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			// A command line that starts serving instead of failing returns at the deadline.
+			ctx, cancel := context.WithTimeout(context.Background(), clustertest.WaitTimeout)
+			defer cancel()
 			var stdout, stderr bytes.Buffer
-			if code := command.Run(context.Background(), tt.args, clitest.Getenv(), &stdout, &stderr); code != tt.code {
+			if code := command.Run(ctx, tt.args, clitest.Getenv(), &stdout, &stderr); code != tt.code {
 				t.Fatalf("Run = %d, want %d; stderr %q", code, tt.code, stderr.String())
 			}
 			if (stdout.Len() > 0) != (tt.stdout != "") || !strings.Contains(stdout.String(), tt.stdout) {

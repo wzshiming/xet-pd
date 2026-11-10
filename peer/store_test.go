@@ -65,7 +65,7 @@ func newTracker(t *testing.T) *clustertest.FakeTracker {
 	return tracker
 }
 
-// testFile is a file spanning one xorb per seed, as ingest stores it and a complete holder serves it.
+// testFile is a file spanning one xorb per seed, as ingest stores it and a holder of its shard serves it.
 type testFile struct {
 	file  apis.File
 	hash  xet.FileHash
@@ -73,7 +73,7 @@ type testFile struct {
 	resp  apis.ShardResponse
 }
 
-// makeFile ingests a file of two chunks per seed, one xorb per seed, into a scratch local store and keeps what a complete holder serves for it.
+// makeFile ingests a file of two chunks per seed, one xorb per seed, into a scratch local store and keeps what a holder of its shard serves for it.
 func makeFile(t *testing.T, seeds ...byte) testFile {
 	t.Helper()
 	ctx := context.Background()

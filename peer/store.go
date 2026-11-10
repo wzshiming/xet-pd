@@ -254,7 +254,7 @@ func (s *store) GetShard(ctx context.Context, fileHash xet.FileHash) (*shard.Sha
 	return sh, nil
 }
 
-// GetFileHashBySHA256 resolves digest through the local index, the shard cache, then the shard of a complete holder, which it caches.
+// GetFileHashBySHA256 resolves digest through the local index, the shard cache, then a held shard of a live holder, which it caches.
 func (s *store) GetFileHashBySHA256(ctx context.Context, digest [32]byte) (xet.FileHash, error) {
 	fh, err := s.Storage.GetFileHashBySHA256(ctx, digest)
 	if err == nil || !errors.Is(err, fs.ErrNotExist) {

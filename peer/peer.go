@@ -30,8 +30,8 @@ import (
 type Config struct {
 	Advertise     string        // public origin of this peer, scheme://host[:port]; also the hub's external URL
 	Tracker       string        // tracker origin: announces and lookups go there
-	Upstream      string        // origin of the upstream hub the mirror ingests from
-	UpstreamToken string        // optional bearer token for the upstream hub
+	Upstream      string        // origin of the upstream hub the mirror ingests from; empty mirrors through the access peers the tracker lists
+	UpstreamToken string        // optional bearer token for the upstream hub, only with Upstream
 	DataDir       string        // data directory: data/ the local store, spool/ in-flight pulls, mirror/ the hub mirror
 	XorbCacheSize int64         // bytes of committed xorbs to keep, 0 unlimited; spools are extra
 	MaxPulls      int           // parallel pulls from other peers, default 8
@@ -47,7 +47,7 @@ const (
 	DefaultHeartbeat   = 10 * time.Second
 )
 
-// normalize canonicalizes the origins, rejects a missing upstream or data dir and negative values and fills in the defaults.
+// normalize canonicalizes the origins, rejects an upstream token without an upstream, a missing data dir and negative values and fills in the defaults.
 func (c *Config) normalize() error {
 	var err error
 	if c.Advertise, err = apis.Origin(c.Advertise); err != nil {
@@ -56,11 +56,13 @@ func (c *Config) normalize() error {
 	if c.Tracker, err = apis.Origin(c.Tracker); err != nil {
 		return fmt.Errorf("tracker: %w", err)
 	}
-	if c.Upstream == "" {
-		return errors.New("upstream is required")
-	}
-	if c.Upstream, err = apis.Origin(c.Upstream); err != nil {
-		return fmt.Errorf("upstream: %w", err)
+	switch {
+	case c.Upstream != "":
+		if c.Upstream, err = apis.Origin(c.Upstream); err != nil {
+			return fmt.Errorf("upstream: %w", err)
+		}
+	case c.UpstreamToken != "":
+		return errors.New("upstream token needs upstream")
 	}
 	if c.DataDir == "" {
 		return errors.New("data dir is required")
@@ -125,32 +127,12 @@ func New(cfg Config) (*Peer, error) {
 		return nil, err
 	}
 	transport := http.DefaultTransport.(*http.Transport).Clone()
-	mir, err := mirror.NewMirror(mirror.WithStorage(st), mirror.WithCacheDir(filepath.Join(cfg.DataDir, "mirror")), mirror.WithTransport(transport))
-	if err != nil {
-		_ = st.Close()
-		return nil, err
-	}
-	provider := client.StaticUpstreamProvider(cfg.Upstream, cfg.UpstreamToken)
-	hub := hf.NewHandler(
-		hf.WithMirror(mir),
-		hf.WithUpstreamProvider(provider),
-		hf.WithExternalURL(cfg.Advertise),
-		hf.WithMinter(hf.MinterFunc(func(_ *http.Request, req hf.TokenRequest) (string, int64, error) {
-			if req.Permission != auth.Read {
-				return "", 0, auth.ErrForbidden // answered here, never delegated to the upstream
-			}
-			return issuer.Sign(auth.Grant{Permission: auth.Read, File: req.File})
-		})),
-		hf.WithNext(hf.NewUpstreamProxy(provider)),
-	)
 	ctx, cancel := context.WithCancel(context.Background())
 	p := &Peer{
-		cfg:   cfg,
-		id:    id,
-		epoch: hex.EncodeToString(nonce[:]),
-		st:    st,
-		// No authorizer: the CAS serves the clients of its own node.
-		cas:       server.NewHandler(server.WithStorage(st), server.WithNext(hub)),
+		cfg:       cfg,
+		id:        id,
+		epoch:     hex.EncodeToString(nonce[:]),
+		st:        st,
 		transport: transport,
 		ctx:       ctx,
 		cancel:    cancel,
@@ -163,6 +145,31 @@ func New(cfg Config) (*Peer, error) {
 	p.metrics.reg.MustRegister(peerState{p})
 	p.ann = &announcer{p: p, control: control, wake: make(chan struct{}, 1), full: true}
 	p.ann.minSeeds.Store(1)
+	provider := client.StaticUpstreamProvider(cfg.Upstream, cfg.UpstreamToken)
+	var upstream http.RoundTripper = transport
+	if cfg.Upstream == "" {
+		provider, upstream = accessUpstream{p.ann}, peerTransport{base: transport, id: id}
+	}
+	mir, err := mirror.NewMirror(mirror.WithStorage(st), mirror.WithCacheDir(filepath.Join(cfg.DataDir, "mirror")), mirror.WithTransport(upstream))
+	if err != nil {
+		cancel()
+		_ = st.Close()
+		return nil, err
+	}
+	hub := hf.NewHandler(
+		hf.WithMirror(mir),
+		hf.WithUpstreamProvider(provider),
+		hf.WithExternalURL(cfg.Advertise),
+		hf.WithMinter(hf.MinterFunc(func(_ *http.Request, req hf.TokenRequest) (string, int64, error) {
+			if req.Permission != auth.Read {
+				return "", 0, auth.ErrForbidden // answered here, never delegated to the upstream
+			}
+			return issuer.Sign(auth.Grant{Permission: auth.Read, File: req.File})
+		})),
+		hf.WithNext(hf.NewUpstreamProxy(provider)),
+	)
+	// No authorizer: the CAS serves the clients of its own node.
+	p.cas = server.NewHandler(server.WithStorage(st), server.WithNext(hub))
 	st.onStored, st.onRead, st.onIdle, st.onShard, st.onLost = p.admit, p.touch, p.retryEviction, p.holdShard, p.lost
 	p.mux = p.routes()
 	if err := p.restore(); err != nil {

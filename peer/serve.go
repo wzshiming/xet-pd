@@ -51,7 +51,7 @@ func (p *Peer) servePublic(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "read-only peer", http.StatusForbidden)
 		return
 	}
-	p.cas.ServeHTTP(w, r)
+	p.cas.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), repoKey{}, repoOf(r.URL.Path))))
 }
 
 func (p *Peer) serveReadyz(w http.ResponseWriter, _ *http.Request) {

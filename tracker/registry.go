@@ -1,9 +1,6 @@
 package tracker
 
 import (
-	"cmp"
-	"encoding/binary"
-	"hash/fnv"
 	"maps"
 	"slices"
 	"strings"
@@ -18,13 +15,23 @@ type peerState struct {
 	epoch  string
 	expiry time.Time
 	xorbs  map[string]struct{}
-	files  map[string]string // file hash -> SHA-256
+	shards map[string]string // file hash -> SHA-256
 }
 
-type ranked struct {
-	apis.Peer
-	holder bool
-	score  uint64
+// object is a xorb, or with shard set the shard of a file, named by its hash.
+type object struct {
+	shard bool
+	hash  string
+}
+
+// holds reports whether p announced o.
+func (p *peerState) holds(o object) bool {
+	if o.shard {
+		_, ok := p.shards[o.hash]
+		return ok
+	}
+	_, ok := p.xorbs[o.hash]
+	return ok
 }
 
 type registry struct {
@@ -40,19 +47,19 @@ func newRegistry(ttl time.Duration, minSeeds int) *registry {
 	return &registry{ttl: ttl, minSeeds: minSeeds, now: time.Now, peers: map[string]*peerState{}, sha256s: map[string]string{}}
 }
 
-// announce applies req and lists the files whose live complete holders it changed.
-func (r *registry) announce(req apis.AnnounceRequest) (apis.AnnounceResponse, []string) {
+// announce applies req and lists the objects whose live holders it changed.
+func (r *registry) announce(req apis.AnnounceRequest) (apis.AnnounceResponse, []object) {
 	now := r.now()
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	changed := map[string]struct{}{}
-	// forget drops sha's entry for file once no live peer holds file.
+	changed := map[object]struct{}{}
+	// forget drops sha's entry for file once no live peer holds file's shard.
 	forget := func(file, sha string) {
 		if r.sha256s[sha] != file {
 			return
 		}
 		for _, q := range r.peers {
-			if _, ok := q.files[file]; ok && now.Before(q.expiry) {
+			if _, ok := q.shards[file]; ok && now.Before(q.expiry) {
 				return
 			}
 		}
@@ -60,8 +67,11 @@ func (r *registry) announce(req apis.AnnounceRequest) (apis.AnnounceResponse, []
 	}
 	drop := func(p *peerState) {
 		delete(r.peers, p.ID)
-		for f, sha := range p.files {
-			changed[f] = struct{}{}
+		for h := range p.xorbs {
+			changed[object{hash: h}] = struct{}{}
+		}
+		for f, sha := range p.shards {
+			changed[object{shard: true, hash: f}] = struct{}{}
 			forget(f, sha)
 		}
 	}
@@ -78,107 +88,130 @@ func (r *registry) announce(req apis.AnnounceRequest) (apis.AnnounceResponse, []
 		}
 		if !req.Full {
 			resp.Resync = true
+			resp.Upstreams = r.upstreamsAt(now)
 			return resp, slices.Collect(maps.Keys(changed))
 		}
-		p = &peerState{Peer: req.Peer, epoch: req.Epoch, xorbs: map[string]struct{}{}, files: map[string]string{}}
+		p = &peerState{Peer: req.Peer, epoch: req.Epoch, xorbs: map[string]struct{}{}, shards: map[string]string{}}
 		r.peers[req.Peer.ID] = p
 	}
 	p.expiry = now.Add(r.ttl)
+	held := map[object]bool{} // whether p held each object req names before req applies
+	for _, h := range slices.Concat(req.Add, req.Remove) {
+		o := object{hash: h}
+		held[o] = p.holds(o)
+	}
+	for _, f := range req.AddShards {
+		o := object{shard: true, hash: f.Hash}
+		held[o] = p.holds(o)
+	}
+	for _, h := range req.RemoveShards {
+		o := object{shard: true, hash: h}
+		held[o] = p.holds(o)
+	}
 	for _, h := range req.Add {
 		p.xorbs[h] = struct{}{}
 	}
 	for _, h := range req.Remove {
 		delete(p.xorbs, h)
 	}
-	held := map[string]bool{} // whether p held each file req names before req applies
-	for _, f := range req.AddFiles {
-		_, held[f.Hash] = p.files[f.Hash]
+	for _, f := range req.AddShards {
+		p.shards[f.Hash] = f.SHA256
 	}
-	for _, h := range req.RemoveFiles {
-		_, held[h] = p.files[h]
-	}
-	for _, f := range req.AddFiles {
-		p.files[f.Hash] = f.SHA256
-	}
-	for _, h := range req.RemoveFiles {
-		sha := p.files[h]
-		delete(p.files, h)
+	for _, h := range req.RemoveShards {
+		sha := p.shards[h]
+		delete(p.shards, h)
 		forget(h, sha)
 	}
-	for _, f := range req.AddFiles {
-		if p.files[f.Hash] == f.SHA256 {
+	for _, f := range req.AddShards {
+		if p.shards[f.Hash] == f.SHA256 {
 			r.sha256s[f.SHA256] = f.Hash
 		}
 	}
-	for f, was := range held {
-		if _, is := p.files[f]; is != was {
-			changed[f] = struct{}{}
+	for o, was := range held {
+		if p.holds(o) != was {
+			changed[o] = struct{}{}
 		}
 	}
+	resp.Upstreams = r.upstreamsAt(now)
 	return resp, slices.Collect(maps.Keys(changed))
 }
 
-// rank lists live peers best first for hash, ties broken by ID; holder marks the holders of xorb hash.
-func (r *registry) rank(hash string) []ranked {
+// upstreams lists the live peers whose Upstream is set, sorted by ID.
+func (r *registry) upstreams() []apis.Peer {
+	now := r.now()
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	return r.order(hash)
+	return r.upstreamsAt(now)
 }
 
-// order is rank with r.mu held.
-func (r *registry) order(hash string) []ranked {
-	now := r.now()
-	list := make([]ranked, 0, len(r.peers))
+// upstreamsAt is upstreams with r.mu held.
+func (r *registry) upstreamsAt(now time.Time) []apis.Peer {
+	var out []apis.Peer
 	for _, p := range r.peers {
-		if !now.Before(p.expiry) {
-			continue
+		if p.Upstream && now.Before(p.expiry) {
+			out = append(out, p.Peer)
 		}
-		_, holder := p.xorbs[hash]
-		// The score is the rendezvous weight of the peer for hash; the length prefix keeps the pair unambiguous.
-		h := fnv.New64a()
-		h.Write(binary.BigEndian.AppendUint64(nil, uint64(len(hash))))
-		h.Write([]byte(hash))
-		h.Write([]byte(p.ID))
-		list = append(list, ranked{Peer: p.Peer, holder: holder, score: h.Sum64()})
 	}
-	slices.SortFunc(list, func(a, b ranked) int {
-		return cmp.Or(cmp.Compare(b.score, a.score), strings.Compare(a.ID, b.ID))
-	})
-	return list
+	slices.SortFunc(out, func(a, b apis.Peer) int { return strings.Compare(a.ID, b.ID) })
+	return out
 }
 
-// locate lists the live complete holders of file but asker in rank order, with the SHA-256 the best of them announced.
+// live lists the live peers.
+func (r *registry) live() []apis.Peer {
+	now := r.now()
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := make([]apis.Peer, 0, len(r.peers))
+	for _, p := range r.peers {
+		if now.Before(p.expiry) {
+			out = append(out, p.Peer)
+		}
+	}
+	return out
+}
+
+// holders lists the live holders of o in rank order.
+func (r *registry) holders(o object) []apis.Peer {
+	now := r.now()
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.holdersAt(o, now)
+}
+
+// holdersAt is holders with r.mu held.
+func (r *registry) holdersAt(o object, now time.Time) []apis.Peer {
+	var out []apis.Peer
+	for _, p := range r.peers {
+		if now.Before(p.expiry) && p.holds(o) {
+			out = append(out, p.Peer)
+		}
+	}
+	return apis.Rank(o.hash, out)
+}
+
+// locate lists the live holders of file's shard but asker in rank order, with the SHA-256 the best of them announced.
 func (r *registry) locate(file, asker string) apis.FileLocation {
+	now := r.now()
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	var loc apis.FileLocation
-	for _, p := range r.order(file) {
-		if sha, ok := r.peers[p.ID].files[file]; ok && p.ID != asker {
-			if loc.Peers == nil {
-				loc.File = apis.File{Hash: file, SHA256: sha}
-			}
-			loc.Peers = append(loc.Peers, p.Peer)
+	for _, p := range r.holdersAt(object{shard: true, hash: file}, now) {
+		if p.ID == asker {
+			continue
 		}
+		if loc.Peers == nil {
+			loc.File = apis.File{Hash: file, SHA256: r.peers[p.ID].shards[file]}
+		}
+		loc.Peers = append(loc.Peers, p)
 	}
 	return loc
-}
-
-// fileHolders lists the live complete holders of file in rank order.
-func (r *registry) fileHolders(file string) []apis.Peer {
-	return r.locate(file, "").Peers
 }
 
 // lookup answers req with the live holders of each key but the asker, leaving out keys none remains for.
 func (r *registry) lookup(req apis.LookupRequest) apis.LookupResponse {
 	resp := apis.LookupResponse{Xorbs: map[string][]apis.Peer{}, SHA256s: map[string]apis.FileLocation{}, Files: map[string]apis.FileLocation{}}
 	for _, h := range req.Xorbs {
-		var peers []apis.Peer
-		for _, p := range r.rank(h) {
-			if p.holder && p.ID != req.Peer {
-				peers = append(peers, p.Peer)
-			}
-		}
-		if peers != nil {
+		if peers := slices.DeleteFunc(r.holders(object{hash: h}), func(p apis.Peer) bool { return p.ID == req.Peer }); len(peers) > 0 {
 			resp.Xorbs[h] = peers
 		}
 	}
@@ -208,7 +241,7 @@ func (r *registry) snapshot() []apis.PeerStatus {
 	out := make([]apis.PeerStatus, 0, len(r.peers))
 	for _, p := range r.peers {
 		if now.Before(p.expiry) {
-			out = append(out, apis.PeerStatus{ID: p.ID, URL: p.URL, Epoch: p.epoch, Expiry: p.expiry, Holdings: len(p.xorbs), Files: len(p.files)})
+			out = append(out, apis.PeerStatus{ID: p.ID, URL: p.URL, Upstream: p.Upstream, Epoch: p.epoch, Expiry: p.expiry, Holdings: len(p.xorbs), Shards: len(p.shards)})
 		}
 	}
 	r.mu.RUnlock()
@@ -216,12 +249,12 @@ func (r *registry) snapshot() []apis.PeerStatus {
 	return out
 }
 
-// stats counts the live peers and the distinct xorbs and complete files they hold.
-func (r *registry) stats() (peers, xorbs, files int) {
+// stats counts the live peers and the distinct xorbs and shards they hold.
+func (r *registry) stats() (peers, xorbs, shards int) {
 	now := r.now()
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	xs, fs := map[string]struct{}{}, map[string]struct{}{}
+	xs, ss := map[string]struct{}{}, map[string]struct{}{}
 	for _, p := range r.peers {
 		if !now.Before(p.expiry) {
 			continue
@@ -230,9 +263,9 @@ func (r *registry) stats() (peers, xorbs, files int) {
 		for h := range p.xorbs {
 			xs[h] = struct{}{}
 		}
-		for f := range p.files {
-			fs[f] = struct{}{}
+		for f := range p.shards {
+			ss[f] = struct{}{}
 		}
 	}
-	return peers, len(xs), len(fs)
+	return peers, len(xs), len(ss)
 }

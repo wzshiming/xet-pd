@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -44,13 +45,13 @@ func TestAnnounceRegistersCanonicalInventory(t *testing.T) {
 	reg := trackerRegistry(tr)
 	upper := strings.ToUpper(testHash)
 	file := apis.File{Hash: strings.ToUpper(seedFile.Hash), SHA256: strings.ToUpper(seedFile.SHA256)}
-	status, body, resp := post(t, srv, announceJSON(t, apis.AnnounceRequest{Peer: apis.Peer{ID: "p1", URL: "http://127.0.0.1:1/"}, Epoch: "e1", Full: true, Add: []string{upper}, AddFiles: []apis.File{file}}))
+	status, body, resp := post(t, srv, announceJSON(t, apis.AnnounceRequest{Peer: apis.Peer{ID: "p1", URL: "http://127.0.0.1:1/"}, Epoch: "e1", Full: true, Add: []string{upper}, AddShards: []apis.File{file}}))
 	if status != http.StatusOK || resp.Resync || resp.TTL != int64(ttl/time.Second) {
 		t.Fatalf("full announce = %d %q %+v, want ttl %d", status, body, resp, int64(ttl/time.Second))
 	}
 	d := clustertest.Diag(t, srv.URL)
-	if len(d.Peers) != 1 || d.Peers[0].ID != "p1" || d.Peers[0].URL != "http://127.0.0.1:1" || d.Peers[0].Epoch != "e1" || d.Peers[0].Holdings != 1 || d.Peers[0].Files != 1 {
-		t.Fatalf("registry = %+v, want canonical origin, one holding and one file", d.Peers)
+	if len(d.Peers) != 1 || d.Peers[0].ID != "p1" || d.Peers[0].URL != "http://127.0.0.1:1" || d.Peers[0].Epoch != "e1" || d.Peers[0].Holdings != 1 || d.Peers[0].Shards != 1 {
+		t.Fatalf("registry = %+v, want canonical origin, one holding and one shard", d.Peers)
 	}
 	if holders := xorbHolders(reg, testHash); len(holders) != 1 || holders[0].URL != "http://127.0.0.1:1" {
 		t.Fatalf("holders of the lowercase hash = %v", holders)
@@ -58,9 +59,9 @@ func TestAnnounceRegistersCanonicalInventory(t *testing.T) {
 	if loc := reg.lookup(apis.LookupRequest{SHA256s: []string{seedFile.SHA256}}).SHA256s[seedFile.SHA256]; loc.File != seedFile || len(loc.Peers) != 1 {
 		t.Fatalf("location by the lowercase SHA-256 = %+v, want the lowercase file held by p1", loc)
 	}
-	status, _, resp = post(t, srv, announceJSON(t, apis.AnnounceRequest{Peer: apis.Peer{ID: "p1", URL: "http://127.0.0.1:1"}, Epoch: "e1", Remove: []string{upper}, RemoveFiles: []string{file.Hash}}))
-	if status != http.StatusOK || resp.Resync || len(xorbHolders(reg, testHash)) != 0 || len(reg.fileHolders(seedFile.Hash)) != 0 {
-		t.Fatalf("delta remove = %d %+v, holders %v and %v", status, resp, xorbHolders(reg, testHash), reg.fileHolders(seedFile.Hash))
+	status, _, resp = post(t, srv, announceJSON(t, apis.AnnounceRequest{Peer: apis.Peer{ID: "p1", URL: "http://127.0.0.1:1"}, Epoch: "e1", Remove: []string{upper}, RemoveShards: []string{file.Hash}}))
+	if status != http.StatusOK || resp.Resync || len(xorbHolders(reg, testHash)) != 0 || len(shardHolders(reg, seedFile.Hash)) != 0 {
+		t.Fatalf("delta remove = %d %+v, holders %v and %v", status, resp, xorbHolders(reg, testHash), shardHolders(reg, seedFile.Hash))
 	}
 	status, _, resp = post(t, srv, announceJSON(t, apis.AnnounceRequest{Peer: apis.Peer{ID: "p1", URL: "http://127.0.0.1:1"}, Epoch: "e2", Add: []string{testHash}}))
 	if status != http.StatusOK || !resp.Resync || len(clustertest.Diag(t, srv.URL).Peers) != 0 {
@@ -72,15 +73,24 @@ func TestAnnounceRegistersCanonicalInventory(t *testing.T) {
 	}
 }
 
-func TestAnnounceReplyCarriesMinSeeds(t *testing.T) {
+func TestAnnounceReplyCarriesUpstreamsAndMinSeeds(t *testing.T) {
 	_, srv := newTestTracker(t, func(cfg *Config) { cfg.MinSeeds = 2 })
-	req := apis.AnnounceRequest{Peer: apis.Peer{ID: "p1", URL: "http://127.0.0.1:1"}, Epoch: "e", Full: true}
-	if status, body, resp := post(t, srv, announceJSON(t, req)); status != http.StatusOK || resp.MinSeeds != 2 || !strings.Contains(body, `"min_seeds":2`) {
-		t.Fatalf("full announce = %d %q, want min_seeds 2", status, body)
+	access1 := apis.Peer{ID: "p1", URL: "http://127.0.0.1:1", Upstream: true}
+	access3 := apis.Peer{ID: "p3", URL: "http://127.0.0.1:3", Upstream: true}
+	internal := apis.Peer{ID: "p2", URL: "http://127.0.0.1:2"}
+	for _, p := range []apis.Peer{access3, internal, access1} {
+		if status, body, _ := post(t, srv, announceJSON(t, apis.AnnounceRequest{Peer: p, Epoch: "e", Full: true})); status != http.StatusOK {
+			t.Fatalf("full announce of %s = %d %q", p.ID, status, body)
+		}
 	}
-	req.Full, req.Epoch = false, "other"
-	if status, body, resp := post(t, srv, announceJSON(t, req)); status != http.StatusOK || !resp.Resync || resp.MinSeeds != 2 {
-		t.Fatalf("resync = %d %q, want min_seeds 2", status, body)
+	want := []apis.Peer{access1, access3}
+	req := apis.AnnounceRequest{Peer: internal, Epoch: "e"}
+	if status, body, resp := post(t, srv, announceJSON(t, req)); status != http.StatusOK || resp.Resync || resp.MinSeeds != 2 || !slices.Equal(resp.Upstreams, want) || !strings.Contains(body, `"min_seeds":2`) {
+		t.Fatalf("heartbeat = %d %q, want min_seeds 2 and upstreams %v", status, body, want)
+	}
+	req.Epoch = "other"
+	if status, body, resp := post(t, srv, announceJSON(t, req)); status != http.StatusOK || !resp.Resync || resp.MinSeeds != 2 || !slices.Equal(resp.Upstreams, want) {
+		t.Fatalf("resync = %d %q, want min_seeds 2 and upstreams %v", status, body, want)
 	}
 }
 
@@ -88,9 +98,9 @@ func TestAnnounceRejectsInvalidRequestsAtomically(t *testing.T) {
 	tr, srv := newTestTracker(t, nil)
 	reg := trackerRegistry(tr)
 	peer := apis.Peer{ID: "p1", URL: "http://127.0.0.1:1"}
-	valid := apis.AnnounceRequest{Peer: peer, Epoch: "e", Full: true, Add: []string{testHash}, AddFiles: []apis.File{seedFile}}
-	withFiles := func(remove []string, add ...apis.File) string {
-		return announceJSON(t, apis.AnnounceRequest{Peer: peer, Epoch: "e", Full: true, AddFiles: add, RemoveFiles: remove})
+	valid := apis.AnnounceRequest{Peer: peer, Epoch: "e", Full: true, Add: []string{testHash}, AddShards: []apis.File{seedFile}}
+	withShards := func(remove []string, add ...apis.File) string {
+		return announceJSON(t, apis.AnnounceRequest{Peer: peer, Epoch: "e", Full: true, AddShards: add, RemoveShards: remove})
 	}
 	tests := []struct {
 		name   string
@@ -121,14 +131,6 @@ func TestAnnounceRejectsInvalidRequestsAtomically(t *testing.T) {
 		{"non-hex hash", announceJSON(t, apis.AnnounceRequest{Peer: peer, Epoch: "e", Full: true, Add: []string{strings.Repeat("zz", 32)}}), http.StatusBadRequest},
 		{"one bad hash among good", announceJSON(t, apis.AnnounceRequest{Peer: peer, Epoch: "e", Full: true, Add: []string{testHash, "abc"}}), http.StatusBadRequest},
 		{"bad remove hash", announceJSON(t, apis.AnnounceRequest{Peer: peer, Epoch: "e", Full: true, Add: []string{testHash}, Remove: []string{"abc"}}), http.StatusBadRequest},
-		{"short file hash", withFiles(nil, apis.File{Hash: "abc", SHA256: seedFile.SHA256}), http.StatusBadRequest},
-		{"non-hex file hash", withFiles(nil, apis.File{Hash: strings.Repeat("zz", 32), SHA256: seedFile.SHA256}), http.StatusBadRequest},
-		{"one bad file among good", withFiles(nil, seedFile, apis.File{Hash: "abc", SHA256: seedFile.SHA256}), http.StatusBadRequest},
-		{"missing sha256", withFiles(nil, apis.File{Hash: seedFile.Hash}), http.StatusBadRequest},
-		{"short sha256", withFiles(nil, apis.File{Hash: seedFile.Hash, SHA256: "abc"}), http.StatusBadRequest},
-		{"long sha256", withFiles(nil, apis.File{Hash: seedFile.Hash, SHA256: seedFile.SHA256 + "00"}), http.StatusBadRequest},
-		{"non-hex sha256", withFiles(nil, apis.File{Hash: seedFile.Hash, SHA256: strings.Repeat("zz", 32)}), http.StatusBadRequest},
-		{"bad remove file hash", withFiles([]string{"abc"}, seedFile), http.StatusBadRequest},
 		{"oversize", `{"peer":{"id":"` + strings.Repeat("p", 33<<20) + `"}}`, http.StatusRequestEntityTooLarge},
 	}
 	for _, tt := range tests {
@@ -140,7 +142,21 @@ func TestAnnounceRejectsInvalidRequestsAtomically(t *testing.T) {
 			t.Fatalf("%s: error echoes request data: %q", tt.name, body)
 		}
 	}
-	if d := clustertest.Diag(t, srv.URL); len(d.Peers) != 0 || len(xorbHolders(reg, testHash)) != 0 || len(reg.fileHolders(seedFile.Hash)) != 0 {
+	for _, tt := range []struct{ name, body string }{
+		{"short shard hash", withShards(nil, apis.File{Hash: "abc", SHA256: seedFile.SHA256})},
+		{"non-hex shard hash", withShards(nil, apis.File{Hash: strings.Repeat("zz", 32), SHA256: seedFile.SHA256})},
+		{"one bad shard among good", withShards(nil, seedFile, apis.File{Hash: "abc", SHA256: seedFile.SHA256})},
+		{"missing sha256", withShards(nil, apis.File{Hash: seedFile.Hash})},
+		{"short sha256", withShards(nil, apis.File{Hash: seedFile.Hash, SHA256: "abc"})},
+		{"long sha256", withShards(nil, apis.File{Hash: seedFile.Hash, SHA256: seedFile.SHA256 + "00"})},
+		{"non-hex sha256", withShards(nil, apis.File{Hash: seedFile.Hash, SHA256: strings.Repeat("zz", 32)})},
+		{"bad remove shard hash", withShards([]string{"abc"}, seedFile)},
+	} {
+		if status, body, _ := post(t, srv, tt.body); status != http.StatusBadRequest || body != "invalid shard\n" {
+			t.Fatalf("%s: = %d %q, want 400 %q", tt.name, status, body, "invalid shard\n")
+		}
+	}
+	if d := clustertest.Diag(t, srv.URL); len(d.Peers) != 0 || len(xorbHolders(reg, testHash)) != 0 || len(shardHolders(reg, seedFile.Hash)) != 0 {
 		t.Fatalf("registry changed by invalid announces: %+v", d.Peers)
 	}
 }

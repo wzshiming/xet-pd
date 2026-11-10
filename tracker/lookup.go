@@ -8,7 +8,7 @@ import (
 	"github.com/wzshiming/xet-pd/apis"
 )
 
-// serveLookup answers which live peers other than the asker hold the requested xorbs and complete files.
+// serveLookup answers which live peers other than the asker hold the requested xorbs and file shards.
 func (tr *Tracker) serveLookup(w http.ResponseWriter, r *http.Request) {
 	if !apis.Authorize(w, r, tr.secret) {
 		return

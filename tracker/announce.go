@@ -13,7 +13,7 @@ import (
 	"github.com/wzshiming/xet-pd/apis"
 )
 
-// serveAnnounce registers a peer inventory and notes the files whose holders changed; the registry changes only once the whole request validated.
+// serveAnnounce registers a peer inventory and notes the objects whose holders changed; the registry changes only once the whole request validated.
 func (tr *Tracker) serveAnnounce(w http.ResponseWriter, r *http.Request) {
 	if !apis.Authorize(w, r, tr.secret) {
 		tr.metrics.announce("rejected")
@@ -50,20 +50,26 @@ func canonicalAnnounce(req *apis.AnnounceRequest) error {
 		return fmt.Errorf("peer url: %w", err)
 	}
 	req.Peer.URL = u
-	for i := range req.AddFiles {
-		f := &req.AddFiles[i]
+	for i := range req.AddShards {
+		f := &req.AddShards[i]
 		if f.Hash, err = fileHash(f.Hash); err != nil {
-			return err
+			return errInvalidShard
 		}
 		if f.SHA256, err = sha256Hex(f.SHA256); err != nil {
-			return err
+			return errInvalidShard
 		}
 	}
-	return errors.Join(canonical(req.Add, xorbHash), canonical(req.Remove, xorbHash), canonical(req.RemoveFiles, fileHash))
+	if canonical(req.RemoveShards, fileHash) != nil {
+		return errInvalidShard
+	}
+	return errors.Join(canonical(req.Add, xorbHash), canonical(req.Remove, xorbHash))
 }
 
 // errInvalidFile rejects a file hash or SHA-256 without echoing it.
 var errInvalidFile = errors.New("invalid file")
+
+// errInvalidShard rejects an announced shard's file hash or SHA-256 without echoing it.
+var errInvalidShard = errors.New("invalid shard")
 
 // canonical rewrites each hash in list to the form parse returns.
 func canonical(list []string, parse func(string) (string, error)) error {

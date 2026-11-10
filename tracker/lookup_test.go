@@ -78,7 +78,7 @@ func TestLookupBodyLimit(t *testing.T) {
 func TestLookupAnswerShape(t *testing.T) {
 	_, srv := newTestTracker(t, func(cfg *Config) { cfg.PeerTTL = time.Hour })
 	for _, id := range []string{"p1", "p2"} {
-		req := apis.AnnounceRequest{Peer: apis.Peer{ID: id, URL: "http://" + id}, Epoch: "e", Full: true, Add: []string{testHash}, AddFiles: []apis.File{seedFile}}
+		req := apis.AnnounceRequest{Peer: apis.Peer{ID: id, URL: "http://" + id}, Epoch: "e", Full: true, Add: []string{testHash}, AddShards: []apis.File{seedFile}}
 		if status, body, _ := post(t, srv, announceJSON(t, req)); status != http.StatusOK {
 			t.Fatalf("announce of %s = %d %q", id, status, body)
 		}

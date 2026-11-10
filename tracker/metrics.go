@@ -61,8 +61,9 @@ func (m *trackerMetrics) handler() http.Handler {
 var (
 	descSeedsInFlight = prometheus.NewDesc("xetpd_tracker_seed_requests_in_flight", "Seed pull requests in flight.", nil, nil)
 	descPeers         = prometheus.NewDesc("xetpd_tracker_peers", "Live peers.", nil, nil)
+	descUpstreamPeers = prometheus.NewDesc("xetpd_tracker_upstream_peers", "Live peers that reach the external hub.", nil, nil)
 	descXorbs         = prometheus.NewDesc("xetpd_tracker_xorbs", "Distinct xorbs with at least one live holder.", nil, nil)
-	descFiles         = prometheus.NewDesc("xetpd_tracker_files", "Distinct complete files with at least one live holder.", nil, nil)
+	descShards        = prometheus.NewDesc("xetpd_tracker_shards", "Distinct shards with at least one live holder.", nil, nil)
 )
 
 // trackerState reports at scrape time what the tracker tracks anyway.
@@ -72,12 +73,14 @@ func (s trackerState) Describe(ch chan<- *prometheus.Desc) { prometheus.Describe
 
 // Collect holds no lock across a send.
 func (s trackerState) Collect(ch chan<- prometheus.Metric) {
-	peers, xorbs, files := s.tr.reg.stats()
+	peers, xorbs, shards := s.tr.reg.stats()
+	upstreams := len(s.tr.reg.upstreams())
 	gauge := func(d *prometheus.Desc, v int) {
 		ch <- prometheus.MustNewConstMetric(d, prometheus.GaugeValue, float64(v))
 	}
 	gauge(descSeedsInFlight, len(s.tr.seeder.sem))
 	gauge(descPeers, peers)
+	gauge(descUpstreamPeers, upstreams)
 	gauge(descXorbs, xorbs)
-	gauge(descFiles, files)
+	gauge(descShards, shards)
 }

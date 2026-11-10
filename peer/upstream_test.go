@@ -48,10 +48,46 @@ func listing(peers []apis.Peer) *announcer {
 
 func TestAccessUpstreamWithoutAccessPeersFails(t *testing.T) {
 	for _, peers := range [][]apis.Peer{nil, {}} {
-		base, token, err := accessUpstream{listing(peers)}.Resolve(context.Background(), auth.Read)
+		base, token, err := (&accessUpstream{ann: listing(peers)}).Resolve(context.Background(), auth.Read)
 		if !errors.Is(err, errNoUpstream) || base != "" || token != "" {
 			t.Fatalf("Resolve with upstreams %#v = %q, %q, %v; want %v", peers, base, token, err, errNoUpstream)
 		}
+	}
+}
+
+func TestAccessUpstreamRanksTheLastListWhileNoneIsListed(t *testing.T) {
+	peers := []apis.Peer{
+		{ID: "p1", URL: "http://p1", Upstream: true}, {ID: "p2", URL: "http://p2", Upstream: true}, {ID: "p3", URL: "http://p3", Upstream: true},
+		{ID: "p4", URL: "http://p4", Upstream: true}, {ID: "p5", URL: "http://p5", Upstream: true},
+	}
+	ann := listing(peers)
+	up := &accessUpstream{ann: ann}
+	if _, _, err := up.Resolve(context.Background(), auth.Read); err != nil {
+		t.Fatal(err)
+	}
+	ann.lastUpstreams.Store(&[]apis.Peer{})
+	for _, repo := range []string{"org/repo", "org/other", "user/model"} {
+		base, token, err := up.Resolve(context.WithValue(context.Background(), repoKey{}, repo), auth.Read)
+		if want := apis.Rank(repo, peers)[0].URL; err != nil || base != want || token != "" {
+			t.Fatalf("Resolve(%q) with none listed after %v = %q, %q, %v; want the last list's first %q", repo, peers, base, token, err, want)
+		}
+	}
+}
+
+func TestAccessUpstreamKeepsTheLatestListItSaw(t *testing.T) {
+	x, y := apis.Peer{ID: "x", URL: "http://x.test", Upstream: true}, apis.Peer{ID: "y", URL: "http://y.test", Upstream: true}
+	ann := listing([]apis.Peer{x})
+	up := &accessUpstream{ann: ann}
+	if base, _, err := up.Resolve(context.Background(), auth.Read); err != nil || base != x.URL {
+		t.Fatalf("Resolve with x listed = %q, %v; want %q", base, err, x.URL)
+	}
+	ann.lastUpstreams.Store(&[]apis.Peer{y})
+	if base, _, err := up.Resolve(context.Background(), auth.Read); err != nil || base != y.URL {
+		t.Fatalf("Resolve with y listed = %q, %v; want %q", base, err, y.URL)
+	}
+	ann.lastUpstreams.Store(&[]apis.Peer{})
+	if base, _, err := up.Resolve(context.Background(), auth.Read); err != nil || base != y.URL {
+		t.Fatalf("Resolve with none listed after x, then y = %q, %v; want y's %q", base, err, y.URL)
 	}
 }
 
@@ -60,7 +96,7 @@ func TestAccessUpstreamPicksTheRankFirstOfTheRepository(t *testing.T) {
 		{ID: "p1", URL: "http://p1", Upstream: true}, {ID: "p2", URL: "http://p2", Upstream: true}, {ID: "p3", URL: "http://p3", Upstream: true},
 		{ID: "p4", URL: "http://p4", Upstream: true}, {ID: "p5", URL: "http://p5", Upstream: true},
 	}
-	up := accessUpstream{listing(peers)}
+	up := &accessUpstream{ann: listing(peers)}
 	for _, repo := range []string{"org/repo", "org/other", "user/model", ""} {
 		for _, perm := range []auth.Permission{auth.Read, auth.Write} {
 			base, token, err := up.Resolve(context.WithValue(context.Background(), repoKey{}, repo), perm)
@@ -79,7 +115,7 @@ func TestAccessUpstreamFollowsTheTrackerReplies(t *testing.T) {
 	x, y := apis.Peer{ID: "x", URL: "http://x.test", Upstream: true}, apis.Peer{ID: "y", URL: "http://y.test", Upstream: true}
 	fake := clustertest.NewFakeTracker(t)
 	p, _ := newTestPeer(t, fake.URL, func(c *Config) { c.Upstream, c.Heartbeat = "", 20*time.Millisecond })
-	up := accessUpstream{p.ann}
+	up := &accessUpstream{ann: p.ann}
 	ctx := context.WithValue(context.Background(), repoKey{}, "org/repo")
 	resolves := func(what string, ok func(base string, err error) bool) {
 		t.Helper()
@@ -93,7 +129,10 @@ func TestAccessUpstreamFollowsTheTrackerReplies(t *testing.T) {
 	fake.SetUpstreams(y)
 	resolves("a resolve to y after a reply listing y", func(base string, err error) bool { return err == nil && base == y.URL })
 	fake.SetUpstreams()
-	resolves("errNoUpstream after a reply listing none", func(_ string, err error) bool { return errors.Is(err, errNoUpstream) })
+	awaitUpstreams(t, p)
+	if base, _, err := up.Resolve(ctx, auth.Read); err != nil || base != y.URL {
+		t.Fatalf("Resolve after a reply listing none = %q, %v; want the last listed %q", base, err, y.URL)
+	}
 }
 
 // startTracker serves a real tracker requiring testSecret and returns its origin.
@@ -292,7 +331,8 @@ func TestInternalPeerWithoutAccessPeers(t *testing.T) {
 	hub.Set(fresh, clustertest.RandomData(102, 64<<10))
 	trackerURL := startTracker(t, tracker.Config{Replicas: 1, PeerTTL: time.Second})
 	pb, b := startNode(t, trackerURL, "")
-	client := &http.Client{Timeout: clustertest.WaitTimeout}
+	// A cold GET probes a gone access peer for about 5 s before it fails.
+	client := &http.Client{Timeout: 3 * clustertest.WaitTimeout}
 	get := func(path string) (int, []byte) {
 		t.Helper()
 		resp, err := client.Get(b + path)
@@ -306,15 +346,24 @@ func TestInternalPeerWithoutAccessPeers(t *testing.T) {
 		}
 		return resp.StatusCode, body
 	}
-	unavailable := func(when string) {
-		t.Helper()
-		if code, body := get(fresh); code != http.StatusBadGateway || string(body) != errNoUpstream.Error()+"\n" {
-			t.Fatalf("GET %s %s = %d %q, want 502 %q", fresh, when, code, body, errNoUpstream)
-		}
-	}
 	clustertest.WaitFor(t, clustertest.WaitTimeout, "the internal peer's first announce", pb.ann.ready.Load)
-	unavailable("with no access peer")
-	pa, a := startNode(t, trackerURL, hub.URL)
+	if code, body := get(fresh); code != http.StatusBadGateway || string(body) != errNoUpstream.Error()+"\n" {
+		t.Fatalf("GET %s before any access peer = %d %q, want 502 %q", fresh, code, body, errNoUpstream)
+	}
+	// Not startNode: the access peer's listener has to close with it.
+	srv := httptest.NewUnstartedServer(nil)
+	a := "http://" + srv.Listener.Addr().String()
+	pa, err := New(Config{Advertise: a, Tracker: trackerURL, Upstream: hub.URL, DataDir: t.TempDir(), Secret: testSecret, Heartbeat: 50 * time.Millisecond})
+	if err != nil {
+		srv.Close()
+		t.Fatal(err)
+	}
+	srv.Config.Handler = pa
+	srv.Start()
+	t.Cleanup(func() {
+		_ = pa.Close()
+		srv.Close()
+	})
 	awaitUpstreams(t, pb, a)
 	if code, body := get(cached); code != http.StatusOK || !bytes.Equal(body, data) {
 		t.Fatalf("GET %s through the access peer = %d, %d bytes; want the hub's %d", cached, code, len(body), len(data))
@@ -322,7 +371,20 @@ func TestInternalPeerWithoutAccessPeers(t *testing.T) {
 	waitReady(t, b+cached)
 	clustertest.WaitFor(t, clustertest.WaitTimeout, "the tracker to list the access peer with the shard", func() bool { return listed(t, trackerURL, pa, true) })
 	_ = pa.Close()
+	srv.Close()
 	awaitUpstreams(t, pb)
-	unavailable("once the access peer expired")
+	cdn, _ := hub.CDN()
+	if code, body := get(cached); code != http.StatusOK || !bytes.Equal(body, data) {
+		t.Fatalf("GET %s once the access peer expired = %d, %d bytes; want the cached %d", cached, code, len(body), len(data))
+	}
+	if gets, _ := hub.CDN(); gets != cdn {
+		t.Fatalf("hub CDN gets %d -> %d: the cached file was fetched again", cdn, gets)
+	}
+	start := time.Now()
+	code, body := get(fresh)
+	if code < 500 || code > 599 {
+		t.Fatalf("GET %s once the access peer expired = %d %q, want a 5xx", fresh, code, body)
+	}
+	t.Logf("GET %s once the access peer expired = %d %q after %v", fresh, code, body, time.Since(start))
 	settled(t, pb)
 }

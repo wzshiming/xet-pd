@@ -6,13 +6,14 @@ import (
 	"net/http"
 	"slices"
 	"strings"
+	"sync/atomic"
 
 	"github.com/wzshiming/xet/auth"
 
 	"github.com/wzshiming/xet-pd/apis"
 )
 
-// errNoUpstream fails the resolves of an internal peer while the tracker lists no access peer.
+// errNoUpstream fails the resolves of an internal peer until it has seen the tracker list an access peer.
 var errNoUpstream = errors.New("no live peer has an upstream")
 
 // repoKey is the context key under which servePublic puts the repository of a request.
@@ -34,15 +35,22 @@ func repoOf(path string) string {
 }
 
 // accessUpstream is the upstream of an internal peer: the access peer apis.Rank puts first for the repository, "" outside a request.
-type accessUpstream struct{ ann *announcer }
+type accessUpstream struct {
+	ann  *announcer
+	last atomic.Pointer[[]apis.Peer] // the last non-empty list Resolve saw, ranked while none is listed so cached files stay servable
+}
 
-func (u accessUpstream) Resolve(ctx context.Context, _ auth.Permission) (string, string, error) {
-	repo, _ := ctx.Value(repoKey{}).(string)
-	peers := apis.Rank(repo, u.ann.upstreams())
-	if len(peers) == 0 {
+func (u *accessUpstream) Resolve(ctx context.Context, _ auth.Permission) (string, string, error) {
+	peers := u.ann.upstreams()
+	if len(peers) > 0 {
+		u.last.Store(&peers)
+	} else if last := u.last.Load(); last != nil {
+		peers = *last
+	} else {
 		return "", "", errNoUpstream
 	}
-	return peers[0].URL, "", nil
+	repo, _ := ctx.Value(repoKey{}).(string)
+	return apis.Rank(repo, peers)[0].URL, "", nil
 }
 
 // peerTransport sends id as apis.PeerHeader on every request without one, so an access peer answers from its own copies.

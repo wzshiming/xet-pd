@@ -148,7 +148,7 @@ func New(cfg Config) (*Peer, error) {
 	provider := client.StaticUpstreamProvider(cfg.Upstream, cfg.UpstreamToken)
 	var upstream http.RoundTripper = transport
 	if cfg.Upstream == "" {
-		provider, upstream = accessUpstream{p.ann}, peerTransport{base: transport, id: id}
+		provider, upstream = &accessUpstream{ann: p.ann}, peerTransport{base: transport, id: id}
 	}
 	mir, err := mirror.NewMirror(mirror.WithStorage(st), mirror.WithCacheDir(filepath.Join(cfg.DataDir, "mirror")), mirror.WithTransport(upstream))
 	if err != nil {

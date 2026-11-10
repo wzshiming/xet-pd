@@ -29,14 +29,15 @@ spec:
       automountServiceAccountToken: false
       nodeSelector:
         kubernetes.io/os: linux
-      # Internal peers take every node without the xet-pd/upstream label and fetch through the access peers.
+      # Internal peers take every node not labelled xet-pd/upstream=true and fetch through the access peers.
       affinity:
         nodeAffinity:
           requiredDuringSchedulingIgnoredDuringExecution:
             nodeSelectorTerms:
               - matchExpressions:
                   - key: xet-pd/upstream
-                    operator: DoesNotExist
+                    operator: NotIn
+                    values: ["true"]
       terminationGracePeriodSeconds: 30
       securityContext:
         runAsNonRoot: true

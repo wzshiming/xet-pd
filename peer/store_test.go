@@ -17,6 +17,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -64,7 +65,7 @@ func newTracker(t *testing.T) *clustertest.FakeTracker {
 	return tracker
 }
 
-// testFile is a file spanning one xorb per seed, as ingest stores it and a complete holder serves it.
+// testFile is a file spanning one xorb per seed, as ingest stores it and a holder of its shard serves it.
 type testFile struct {
 	file  apis.File
 	hash  xet.FileHash
@@ -72,7 +73,7 @@ type testFile struct {
 	resp  apis.ShardResponse
 }
 
-// makeFile ingests a file of two chunks per seed, one xorb per seed, into a scratch local store and keeps what a complete holder serves for it.
+// makeFile ingests a file of two chunks per seed, one xorb per seed, into a scratch local store and keeps what a holder of its shard serves for it.
 func makeFile(t *testing.T, seeds ...byte) testFile {
 	t.Helper()
 	ctx := context.Background()
@@ -222,14 +223,47 @@ func TestPutXorbStoresBytesAndOffsetsThenReports(t *testing.T) {
 	}
 }
 
-func TestPutShardReportsItsFiles(t *testing.T) {
+// Every read tries the local copy first, so reads missing a xorb race its commit.
+func TestPutXorbSurvivesConcurrentLocalMisses(t *testing.T) {
+	st := newTestStore(t, t.TempDir(), "http://tracker.test")
+	hash, body := clustertest.MakeXorb(t, 58, 2, 8<<10)
+	ctx := context.Background()
+	for i := range 500 {
+		stop := make(chan struct{})
+		var wg sync.WaitGroup
+		for range 4 {
+			wg.Go(func() {
+				for {
+					select {
+					case <-stop:
+						return
+					default:
+					}
+					if rs, err := st.openLocal(ctx, hash); err == nil {
+						_ = rs.Close()
+					}
+				}
+			})
+		}
+		_, err := st.PutXorb(ctx, hash, bytes.NewReader(body))
+		close(stop)
+		wg.Wait()
+		if err != nil {
+			t.Fatalf("commit %d: PutXorb while reads miss the xorb = %v", i, err)
+		}
+		if err := st.DeleteXorb(ctx, hash); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestPutShardReportsItsShards(t *testing.T) {
 	st := newTestStore(t, t.TempDir(), "http://tracker.test")
 	ev := watch(st)
 	tf := makeFile(t, 5, 6)
 	ingest(t, st, tf)
-	files := ev.knownFiles()
-	if len(files) != 1 || files[0].file != tf.file || !slices.Equal(sortedXorbs(files[0].xorbs), tf.xorbHashes()) {
-		t.Fatalf("onFile calls = %+v, want one for %+v over %v", files, tf.file, tf.xorbHashes())
+	if shards := ev.knownShards(); !slices.Equal(shards, []apis.File{tf.file}) {
+		t.Fatalf("onShard calls = %+v, want one for %+v", shards, tf.file)
 	}
 }
 
@@ -248,14 +282,14 @@ func TestFetchedFileWithoutSHA256IsNotReported(t *testing.T) {
 	offsets := maps.Clone(intact.resp.Offsets)
 	maps.Copy(offsets, bare.resp.Offsets)
 	holder.ServeShard(intact.file, apis.ShardResponse{Shard: data, Offsets: offsets})
-	tracker.HoldFile(holder.Peer(), intact.file)
+	tracker.HoldShard(holder.Peer(), intact.file)
 	st := newTestStore(t, t.TempDir(), tracker.URL)
 	ev := watch(st)
 	if _, err := st.GetFileHashBySHA256(context.Background(), digestOf(t, intact.file)); err != nil {
 		t.Fatal(err)
 	}
-	if files := ev.knownFiles(); len(files) != 1 || files[0].file != intact.file {
-		t.Fatalf("onFile calls = %+v, want only %+v", files, intact.file)
+	if shards := ev.knownShards(); !slices.Equal(shards, []apis.File{intact.file}) {
+		t.Fatalf("onShard calls = %+v, want only %+v", shards, intact.file)
 	}
 }
 
@@ -301,7 +335,7 @@ func TestGetFileHashBySHA256FetchesShardOfCompleteHolder(t *testing.T) {
 	tracker, holder := newTracker(t), newHolder(t, "holder")
 	tf := makeFile(t, 11, 12)
 	holder.ServeShard(tf.file, tf.resp)
-	tracker.HoldFile(holder.Peer(), tf.file)
+	tracker.HoldShard(holder.Peer(), tf.file)
 	tracker.Hold(holder.Peer(), tf.xorbHashes()...)
 	st := newTestStore(t, t.TempDir(), tracker.URL)
 	ctx := context.Background()
@@ -338,11 +372,11 @@ func TestShardOfAnotherSHA256IsRefused(t *testing.T) {
 	honest.ServeShard(tf.file, tf.resp)
 	st := newTestStore(t, t.TempDir(), tracker.URL)
 	ctx := context.Background()
-	tracker.HoldFile(liar.Peer(), tf.file)
+	tracker.HoldShard(liar.Peer(), tf.file)
 	if _, err := st.GetFileHashBySHA256(ctx, digestOf(t, tf.file)); !errors.Is(err, fs.ErrNotExist) {
 		t.Fatalf("GetFileHashBySHA256 with only a mismatching shard = %v, want fs.ErrNotExist", err)
 	}
-	tracker.HoldFile(honest.Peer(), tf.file)
+	tracker.HoldShard(honest.Peer(), tf.file)
 	if fh, err := st.GetFileHashBySHA256(ctx, digestOf(t, tf.file)); err != nil || fh != tf.hash {
 		t.Fatalf("GetFileHashBySHA256 past the mismatching shard = %s, %v, want %s", fh, err, tf.hash)
 	}
@@ -415,11 +449,11 @@ func TestShardResponseNeedsOffsetsOfEveryXorb(t *testing.T) {
 	}
 }
 
-func TestInventoryListsLocalXorbsAndKnownFilesAcrossReopen(t *testing.T) {
+func TestInventoryListsLocalXorbsAndKnownShardsAcrossReopen(t *testing.T) {
 	tracker, holder := newTracker(t), newHolder(t, "holder")
 	ingested, fetched := makeFile(t, 18, 19), makeFile(t, 20)
 	holder.ServeShard(fetched.file, fetched.resp)
-	tracker.HoldFile(holder.Peer(), fetched.file)
+	tracker.HoldShard(holder.Peer(), fetched.file)
 	dir := t.TempDir()
 	st := newTestStore(t, dir, tracker.URL)
 	ctx := context.Background()
@@ -427,9 +461,8 @@ func TestInventoryListsLocalXorbsAndKnownFilesAcrossReopen(t *testing.T) {
 	if _, err := st.GetFileHashBySHA256(ctx, digestOf(t, fetched.file)); err != nil {
 		t.Fatal(err)
 	}
-	wantFiles := map[apis.File][]xet.XorbHash{ingested.file: ingested.xorbHashes(), fetched.file: fetched.xorbHashes()}
 	for i, st := range []*store{st, newTestStore(t, dir, tracker.URL)} {
-		xorbs, files, err := st.inventory(ctx)
+		xorbs, shards, err := st.inventory(ctx)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -443,15 +476,8 @@ func TestInventoryListsLocalXorbsAndKnownFilesAcrossReopen(t *testing.T) {
 		if !slices.Equal(sortedXorbs(gotXorbs), ingested.xorbHashes()) {
 			t.Fatalf("open %d: inventory xorbs = %v, want the local %v", i, gotXorbs, ingested.xorbHashes())
 		}
-		gotFiles := map[apis.File][]xet.XorbHash{}
-		for _, f := range files {
-			if _, dup := gotFiles[f.File]; dup {
-				t.Fatalf("open %d: inventory lists %+v twice", i, f.File)
-			}
-			gotFiles[f.File] = sortedXorbs(f.Xorbs)
-		}
-		if !maps.EqualFunc(gotFiles, wantFiles, slices.Equal[[]xet.XorbHash]) {
-			t.Fatalf("open %d: inventory files = %v, want %v", i, gotFiles, wantFiles)
+		if want := sortedFiles(ingested.file, fetched.file); !slices.Equal(sortedFiles(shards...), want) {
+			t.Fatalf("open %d: inventory shards = %+v, want each of %+v once", i, shards, want)
 		}
 	}
 }
@@ -465,12 +491,12 @@ func TestInventorySkipsUndecodableLocalShard(t *testing.T) {
 		t.Fatal(err)
 	}
 	warned := captureWarnings(t)
-	xorbs, files, err := st.inventory(context.Background())
+	xorbs, shards, err := st.inventory(context.Background())
 	if err != nil {
 		t.Fatalf("inventory with an undecodable local shard = %v", err)
 	}
-	if len(files) != 1 || files[0].File != intact.file {
-		t.Fatalf("inventory files = %+v, want only %+v", files, intact.file)
+	if !slices.Equal(shards, []apis.File{intact.file}) {
+		t.Fatalf("inventory shards = %+v, want only %+v", shards, intact.file)
 	}
 	if len(xorbs) != len(intact.xorbs)+len(broken.xorbs) {
 		t.Fatalf("inventory lists %d xorbs, want all %d local ones", len(xorbs), len(intact.xorbs)+len(broken.xorbs))
@@ -494,7 +520,7 @@ func TestRestartSkipsCachedFileWithoutSHA256(t *testing.T) {
 	offsets := maps.Clone(intact.resp.Offsets)
 	maps.Copy(offsets, bare.resp.Offsets)
 	holder.ServeShard(intact.file, apis.ShardResponse{Shard: data, Offsets: offsets})
-	tracker.HoldFile(holder.Peer(), intact.file)
+	tracker.HoldShard(holder.Peer(), intact.file)
 	dir := t.TempDir()
 	st := newTestStore(t, dir, tracker.URL)
 	ctx := context.Background()
@@ -509,16 +535,16 @@ func TestRestartSkipsCachedFileWithoutSHA256(t *testing.T) {
 		}
 	}
 	_ = st.Close()
-	_, files, err := newTestStore(t, dir, tracker.URL).inventory(ctx)
+	_, shards, err := newTestStore(t, dir, tracker.URL).inventory(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(files) != 1 || files[0].File != intact.file {
-		t.Errorf("inventory files after reopen = %+v, want only %+v", files, intact.file)
+	if !slices.Equal(shards, []apis.File{intact.file}) {
+		t.Errorf("inventory shards after reopen = %+v, want only %+v", shards, intact.file)
 	}
 	newTestPeer(t, tracker.URL, func(c *Config) { c.DataDir, c.Heartbeat, c.Secret = dir, time.Hour, testSecret })
-	if got := tracker.Announce(t, 0).Req; !got.Full || !slices.Equal(got.AddFiles, []apis.File{intact.file}) {
-		t.Fatalf("startup announce = %+v, want Full with only %+v", got, intact.file)
+	if got := tracker.Announce(t, 0).Req; !got.Full || !slices.Equal(got.AddShards, []apis.File{intact.file}) {
+		t.Fatalf("startup announce = %+v, want Full with only the shard of %+v", got, intact.file)
 	}
 }
 
@@ -761,7 +787,7 @@ func TestChunkOffsetsComeFromSidecarBeforeAnyPull(t *testing.T) {
 	tracker, holder := newTracker(t), newHolder(t, "holder")
 	tf := makeFile(t, 26)
 	holder.ServeShard(tf.file, tf.resp)
-	tracker.HoldFile(holder.Peer(), tf.file)
+	tracker.HoldShard(holder.Peer(), tf.file)
 	st := newTestStore(t, t.TempDir(), tracker.URL)
 	ctx := context.Background()
 	if _, err := st.GetFileHashBySHA256(ctx, digestOf(t, tf.file)); err != nil {
@@ -799,7 +825,7 @@ func TestInvalidHolderOffsetsAreNotPersisted(t *testing.T) {
 			h := tf.xorbHashes()[0]
 			holder.ServeShard(tf.file, apis.ShardResponse{Shard: tf.resp.Shard, Offsets: map[string][]uint64{h.String(): bad}})
 			holder.ServeXorb(h, tf.xorbs[h])
-			tracker.HoldFile(holder.Peer(), tf.file)
+			tracker.HoldShard(holder.Peer(), tf.file)
 			tracker.Hold(holder.Peer(), h)
 			st := newTestStore(t, t.TempDir(), tracker.URL)
 			ctx := context.Background()
@@ -827,7 +853,7 @@ func TestFetchedShardWritesOffsetsOnlyForItsXorbs(t *testing.T) {
 	resp := apis.ShardResponse{Shard: remote.resp.Shard, Offsets: maps.Clone(remote.resp.Offsets)}
 	resp.Offsets[ownX.String()], resp.Offsets[stray.String()] = []uint64{100, 200, 300}, []uint64{100, 200, 300}
 	holder.ServeShard(remote.file, resp)
-	tracker.HoldFile(holder.Peer(), remote.file)
+	tracker.HoldShard(holder.Peer(), remote.file)
 	st := newTestStore(t, t.TempDir(), tracker.URL)
 	ingest(t, st, own)
 	if _, err := st.GetFileHashBySHA256(context.Background(), digestOf(t, remote.file)); err != nil {
@@ -848,7 +874,7 @@ func TestFetchedShardKeepsLocalOffsetsOfItsXorbs(t *testing.T) {
 			tf := makeFile(t, 48)
 			h := tf.xorbHashes()[0]
 			holder.ServeShard(tf.file, apis.ShardResponse{Shard: tf.resp.Shard, Offsets: map[string][]uint64{h.String(): {100, 200, 300}}})
-			tracker.HoldFile(holder.Peer(), tf.file)
+			tracker.HoldShard(holder.Peer(), tf.file)
 			st := newTestStore(t, t.TempDir(), tracker.URL)
 			ctx := context.Background()
 			if _, err := st.PutXorb(ctx, h, bytes.NewReader(tf.xorbs[h])); err != nil {
@@ -874,7 +900,7 @@ func TestFetchedShardWritesOffsetsUnderWriterLock(t *testing.T) {
 	tf := makeFile(t, 49)
 	h := tf.xorbHashes()[0]
 	holder.ServeShard(tf.file, tf.resp)
-	tracker.HoldFile(holder.Peer(), tf.file)
+	tracker.HoldShard(holder.Peer(), tf.file)
 	st := newTestStore(t, t.TempDir(), tracker.URL)
 	unlock := st.lockWriter(h)
 	done := make(chan error, 1)
@@ -928,11 +954,11 @@ func TestChunkOffsetsPullPastUnusableSidecar(t *testing.T) {
 	}
 }
 
-func TestPullFileMakesFileComplete(t *testing.T) {
+func TestEnsureShardFetchesOnlyTheShardOnce(t *testing.T) {
 	tracker, holder := newTracker(t), newHolder(t, "holder")
 	tf := makeFile(t, 28, 29)
 	holder.ServeShard(tf.file, tf.resp)
-	tracker.HoldFile(holder.Peer(), tf.file)
+	tracker.HoldShard(holder.Peer(), tf.file)
 	for hash, body := range tf.xorbs {
 		holder.ServeXorb(hash, body)
 		tracker.Hold(holder.Peer(), hash)
@@ -940,23 +966,30 @@ func TestPullFileMakesFileComplete(t *testing.T) {
 	st := newTestStore(t, t.TempDir(), tracker.URL)
 	ev := watch(st)
 	ctx := context.Background()
-	if err := st.pullFile(ctx, tf.file.Hash); err != nil {
-		t.Fatal(err)
+	if sh, err := st.ensureShard(ctx, tf.hash); err != nil || sh.File(tf.hash) == nil {
+		t.Fatalf("ensureShard = %v, want the file's shard", err)
 	}
-	for hash, body := range tf.xorbs {
-		if !bytes.Equal(localBytes(t, st, hash), body) {
-			t.Fatalf("xorb %s not stored as the holder serves it", hash)
+	for _, h := range tf.xorbHashes() {
+		if got, err := sidecarOffsets(st, h); err != nil || !slices.Equal(got, tf.resp.Offsets[h.String()]) {
+			t.Fatalf("sidecar of %s = %v, %v, want the holder's offsets", h, got, err)
 		}
 	}
-	if files := ev.knownFiles(); len(files) != 1 || files[0].file != tf.file || !slices.Equal(sortedXorbs(files[0].xorbs), tf.xorbHashes()) {
-		t.Fatalf("onFile calls = %+v, want one for %+v over %v", files, tf.file, tf.xorbHashes())
+	if shards := ev.knownShards(); !slices.Equal(shards, []apis.File{tf.file}) {
+		t.Fatalf("onShard calls = %+v, want one for %+v", shards, tf.file)
 	}
 	n := len(tracker.Lookups())
-	if _, err := st.GetShard(ctx, tf.hash); err != nil {
-		t.Fatalf("GetShard of the pulled file = %v", err)
+	if sh, err := st.ensureShard(ctx, tf.hash); err != nil || sh.File(tf.hash) == nil {
+		t.Fatalf("ensureShard of the cached shard = %v, want it", err)
 	}
 	if m := len(tracker.Lookups()); m != n {
-		t.Fatalf("GetShard of the pulled file looked up %d times, want none", m-n)
+		t.Fatalf("ensureShard of the cached shard looked up %d times, want none", m-n)
+	}
+	if reqs := holder.Requests(); len(reqs) != 1 || reqs[0].Path != apis.ShardPathPrefix+tf.file.Hash {
+		t.Fatalf("holder requests = %+v, want the one shard GET and no xorb GET", reqs)
+	}
+	unknown := makeFile(t, 30)
+	if _, err := st.ensureShard(ctx, unknown.hash); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("ensureShard of a shard nobody holds = %v, want fs.ErrNotExist", err)
 	}
 }
 
@@ -964,7 +997,7 @@ func TestGetShardBySHA256NeedsEveryXorbHeld(t *testing.T) {
 	tracker, holder := newTracker(t), newHolder(t, "holder")
 	tf := makeFile(t, 30)
 	holder.ServeShard(tf.file, tf.resp)
-	tracker.HoldFile(holder.Peer(), tf.file)
+	tracker.HoldShard(holder.Peer(), tf.file)
 	st := newTestStore(t, t.TempDir(), tracker.URL)
 	ctx := context.Background()
 	if _, err := st.GetShardBySHA256(ctx, digestOf(t, tf.file)); !errors.Is(err, fs.ErrNotExist) {

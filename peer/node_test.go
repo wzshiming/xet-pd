@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -19,28 +20,19 @@ import (
 
 	"github.com/wzshiming/xet-pd/apis"
 	"github.com/wzshiming/xet-pd/internal/clustertest"
-	"github.com/wzshiming/xet-pd/tracker"
 )
 
 const modelPath = "/org/repo/resolve/main/model.bin"
 
-// startTracker serves a real tracker requiring testSecret that asks for no seed copies, so peers pull only on demand.
-func startTracker(t *testing.T) string {
-	t.Helper()
-	tr, err := tracker.New(tracker.Config{Secret: testSecret, Replicas: 1})
-	if err != nil {
-		t.Fatal(err)
-	}
-	srv := httptest.NewServer(tr)
-	t.Cleanup(func() {
-		srv.Close()
-		_ = tr.Close()
-	})
-	return srv.URL
-}
-
 // startNode runs a peer as its node's endpoint, advertised at its own listener, announcing to trackerURL and mirroring upstream.
 func startNode(t *testing.T, trackerURL, upstream string) (*Peer, string) {
+	t.Helper()
+	p, origin, _ := startRecordedNode(t, trackerURL, upstream)
+	return p, origin
+}
+
+// startRecordedNode is startNode recording every request the peer receives.
+func startRecordedNode(t *testing.T, trackerURL, upstream string) (*Peer, string, *recorder) {
 	t.Helper()
 	srv := httptest.NewUnstartedServer(nil)
 	origin := "http://" + srv.Listener.Addr().String()
@@ -49,13 +41,38 @@ func startNode(t *testing.T, trackerURL, upstream string) (*Peer, string) {
 		srv.Close()
 		t.Fatal(err)
 	}
-	srv.Config.Handler = p
+	rec := &recorder{}
+	srv.Config.Handler = rec.wrap(p)
 	srv.Start()
 	t.Cleanup(func() {
 		_ = p.Close()
 		srv.Close()
 	})
-	return p, origin
+	return p, origin, rec
+}
+
+// recorded is a request as a recorder saw it; peer is its apis.PeerHeader.
+type recorded struct{ method, path, peer string }
+
+// recorder records the requests reaching the handlers it wraps.
+type recorder struct {
+	mu   sync.Mutex
+	reqs []recorded
+}
+
+func (rec *recorder) wrap(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rec.mu.Lock()
+		rec.reqs = append(rec.reqs, recorded{r.Method, r.URL.Path, r.Header.Get(apis.PeerHeader)})
+		rec.mu.Unlock()
+		h.ServeHTTP(w, r)
+	})
+}
+
+func (rec *recorder) requests() []recorded {
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	return slices.Clone(rec.reqs)
 }
 
 // send performs one request carrying body without following redirects and returns the response and its body.
@@ -109,12 +126,12 @@ func fetchURLs(t *testing.T, origin, fileHash string) []string {
 	return urls
 }
 
-func TestColdResolveIngestsOnceAndAnnouncesTheFile(t *testing.T) {
+func TestColdResolveIngestsOnceAndAnnouncesTheShard(t *testing.T) {
 	data := clustertest.RandomData(97, 256<<10)
 	hub := clustertest.NewHub(t)
 	hub.Set(modelPath, data)
-	trackerURL := startTracker(t)
-	_, a := startNode(t, trackerURL, hub.URL)
+	tracker := newTracker(t)
+	_, a := startNode(t, tracker.URL, hub.URL)
 	if resp, got, err := do(t, http.MethodGet, a+modelPath); err != nil || resp.StatusCode != http.StatusOK || !bytes.Equal(got, data) {
 		t.Fatalf("cold GET = %d, %d bytes, %v; want the hub's %d bytes", resp.StatusCode, len(got), err, len(data))
 	}
@@ -127,9 +144,9 @@ func TestColdResolveIngestsOnceAndAnnouncesTheFile(t *testing.T) {
 			t.Fatalf("fetch url %s, want one on the peer itself %s", u, a)
 		}
 	}
-	clustertest.WaitFor(t, clustertest.WaitTimeout, "the tracker to list the peer with the file", func() bool {
-		peers := clustertest.Diag(t, trackerURL).Peers
-		return len(peers) == 1 && peers[0].URL == a && peers[0].Files == 1
+	file := apis.File{Hash: fileHash, SHA256: clustertest.SHA256(data)}
+	tracker.FindAnnounce(t, 0, func(x clustertest.Announce) bool {
+		return x.Req.Peer.URL == a && slices.Contains(x.Req.AddShards, file)
 	})
 }
 
@@ -137,15 +154,23 @@ func TestWarmResolveOnASecondPeerPullsFromTheFirst(t *testing.T) {
 	data := clustertest.RandomData(98, 256<<10)
 	hub := clustertest.NewHub(t)
 	hub.Set(modelPath, data)
-	trackerURL := startTracker(t)
-	_, a := startNode(t, trackerURL, hub.URL)
+	tracker := newTracker(t)
+	pa, a := startNode(t, tracker.URL, hub.URL)
 	fileHash := waitReady(t, a+modelPath)
-	clustertest.WaitFor(t, clustertest.WaitTimeout, "the tracker to list the first peer with the file", func() bool {
-		peers := clustertest.Diag(t, trackerURL).Peers
-		return len(peers) == 1 && peers[0].Files == 1
-	})
+	file := apis.File{Hash: fileHash, SHA256: clustertest.SHA256(data)}
+	tracker.FindAnnounce(t, 0, func(x clustertest.Announce) bool { return slices.Contains(x.Req.AddShards, file) })
+	// The tracker answers lookups with what the first peer announced, as a real one would.
+	first := apis.Peer{ID: peerID(pa), URL: a}
+	tracker.HoldShard(first, file)
+	for _, u := range fetchURLs(t, a, fileHash) {
+		h, err := xet.ParseXorbHash(strings.TrimPrefix(u, a+apis.XorbPathPrefix))
+		if err != nil {
+			t.Fatal(err)
+		}
+		tracker.Hold(first, h)
+	}
 	cdn, _ := hub.CDN()
-	pb, b := startNode(t, trackerURL, hub.URL)
+	pb, b := startNode(t, tracker.URL, hub.URL)
 	if got := waitReady(t, b+modelPath); got != fileHash {
 		t.Fatalf("second peer resolves the file as %s, want %s", got, fileHash)
 	}
@@ -185,15 +210,14 @@ func TestWarmResolveOnASecondPeerPullsFromTheFirst(t *testing.T) {
 		}
 		clustertest.WaitFor(t, clustertest.WaitTimeout, "the second peer to keep "+h.String(), admitted(pb, h))
 	}
-	clustertest.WaitFor(t, clustertest.WaitTimeout, "the tracker to list both peers with the file", func() bool {
-		peers := clustertest.Diag(t, trackerURL).Peers
-		return len(peers) == 2 && peers[0].Files == 1 && peers[1].Files == 1
+	tracker.FindAnnounce(t, 0, func(x clustertest.Announce) bool {
+		return x.Req.Peer.URL == b && slices.Contains(x.Req.AddShards, file)
 	})
 	if v := clustertest.Scrape(t, a)[`xetpd_peer_xorb_gets_total{requester="peer",status="200"}`]; v < 1 {
 		t.Fatalf("first peer served %v xorb GETs to peers, want the second peer's pull", v)
 	}
-	if v := clustertest.Scrape(t, trackerURL)["xetpd_tracker_lookups_total"]; v < 1 {
-		t.Fatalf("tracker answered %v lookups, want the second peer's", v)
+	if !slices.ContainsFunc(tracker.Lookups(), func(l clustertest.Lookup) bool { return l.Req.Peer == peerID(pb) }) {
+		t.Fatal("the tracker answered no lookup of the second peer")
 	}
 	if gets, _ := hub.CDN(); gets != cdn {
 		t.Fatalf("hub CDN gets %d -> %d after the download", cdn, gets)

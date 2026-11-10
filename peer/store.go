@@ -62,7 +62,7 @@ type store struct {
 	// hooks, set once by the owner before concurrent use and run outside s.mu
 	onStored func(hash xet.XorbHash, size int64, inserted bool) // bytes and offsets durable, still pinned
 	onRead   func(hash xet.XorbHash)                            // a local copy was opened
-	onFile   func(file apis.File, xorbs []xet.XorbHash)         // a shard describing file was stored
+	onShard  func(file apis.File)                               // a shard describing file was stored or fetched
 	onIdle   func()                                             // some xorb lost its last pin
 	onLost   func(hash xet.XorbHash)                            // a read of hash found no local bytes
 }
@@ -209,24 +209,28 @@ func (s *store) knownShard(ctx context.Context, fileHash xet.FileHash) (*shard.S
 	return sh, f, nil
 }
 
-// GetShard fetches an unknown file's shard from a complete holder, and fails with fs.ErrNotExist while a xorb of the file is neither local nor held by a live peer, so the mirror re-ingests it.
-func (s *store) GetShard(ctx context.Context, fileHash xet.FileHash) (*shard.Shard, error) {
-	sh, f, err := s.knownShard(ctx, fileHash)
-	if errors.Is(err, fs.ErrNotExist) {
-		var resp apis.LookupResponse
-		if resp, err = s.lookup(ctx, apis.LookupRequest{Files: []string{fileHash.String()}}); err == nil {
-			loc := resp.Files[fileHash.String()]
-			sh, err = s.fetchShard(ctx, apis.File{Hash: fileHash.String(), SHA256: loc.SHA256}, loc.Peers)
-		}
-		if err == nil {
-			f = sh.File(fileHash)
-		}
+// ensureShard returns the shard of fileHash known here, else fetches and caches it from the best of its holders that serves it; fs.ErrNotExist when none does.
+func (s *store) ensureShard(ctx context.Context, fileHash xet.FileHash) (*shard.Shard, error) {
+	sh, _, err := s.knownShard(ctx, fileHash)
+	if !errors.Is(err, fs.ErrNotExist) {
+		return sh, err
 	}
+	resp, err := s.lookup(ctx, apis.LookupRequest{Files: []string{fileHash.String()}})
+	if err != nil {
+		return nil, err
+	}
+	loc := resp.Files[fileHash.String()]
+	return s.fetchShard(ctx, apis.File{Hash: fileHash.String(), SHA256: loc.SHA256}, loc.Peers)
+}
+
+// GetShard ensures the shard of fileHash, and fails with fs.ErrNotExist while a xorb of the file is neither local nor held by a live peer, so the mirror re-ingests it.
+func (s *store) GetShard(ctx context.Context, fileHash xet.FileHash) (*shard.Shard, error) {
+	sh, err := s.ensureShard(ctx, fileHash)
 	if err != nil {
 		return nil, err
 	}
 	var remote []string
-	for _, h := range xorbsOf(f) {
+	for _, h := range xorbsOf(sh.File(fileHash)) {
 		ok, err := s.Storage.HasXorb(ctx, h)
 		if err != nil {
 			return nil, err
@@ -250,7 +254,7 @@ func (s *store) GetShard(ctx context.Context, fileHash xet.FileHash) (*shard.Sha
 	return sh, nil
 }
 
-// GetFileHashBySHA256 resolves digest through the local index, the shard cache, then the shard of a complete holder, which it caches.
+// GetFileHashBySHA256 resolves digest through the local index, the shard cache, then a held shard of a live holder, which it caches.
 func (s *store) GetFileHashBySHA256(ctx context.Context, digest [32]byte) (xet.FileHash, error) {
 	fh, err := s.Storage.GetFileHashBySHA256(ctx, digest)
 	if err == nil || !errors.Is(err, fs.ErrNotExist) {
@@ -326,14 +330,14 @@ func (s *store) fetchShard(ctx context.Context, file apis.File, holders []apis.P
 	return nil, fmt.Errorf("no holder served the shard of file %s: %w", file.Hash, fs.ErrNotExist)
 }
 
-// report hands onFile every file sh describes with a SHA-256; the tracker refuses announces of the others.
+// report hands onShard every file sh describes with a SHA-256; the tracker refuses announces of the others.
 func (s *store) report(sh *shard.Shard) {
-	if s.onFile == nil {
+	if s.onShard == nil {
 		return
 	}
 	for i := range sh.Files {
 		if sh.Files[i].MetadataExt != nil {
-			s.onFile(fileOf(&sh.Files[i]), xorbsOf(&sh.Files[i]))
+			s.onShard(fileOf(&sh.Files[i]))
 		}
 	}
 }
@@ -369,34 +373,6 @@ func (s *store) GetXorbChunkOffsets(ctx context.Context, hash xet.XorbHash) ([]u
 	return s.localOffsets(ctx, hash)
 }
 
-// pullFile makes the file complete here: its shard known and every xorb it references local, pulled whether or not anyone reads it.
-func (s *store) pullFile(ctx context.Context, fileHash string) error {
-	fh, err := xet.ParseFileHash(fileHash)
-	if err != nil {
-		return err
-	}
-	sh, err := s.GetShard(ctx, fh)
-	if err != nil {
-		return err
-	}
-	var pulls []*pull
-	for _, h := range xorbsOf(sh.File(fh)) {
-		f, aerr := s.acquire(h, true)
-		if f != nil {
-			pulls = append(pulls, f)
-		}
-		if err == nil {
-			err = aerr
-		}
-	}
-	for _, f := range pulls {
-		if werr := f.wait(ctx); err == nil {
-			err = werr
-		}
-	}
-	return err
-}
-
 // shardResponse is what this peer serves for fileHash: the shard, footerless, and the offsets of every xorb of the file; fs.ErrNotExist when a xorb has neither local bytes nor a sidecar.
 func (s *store) shardResponse(ctx context.Context, fileHash xet.FileHash) (apis.ShardResponse, error) {
 	sh, f, err := s.knownShard(ctx, fileHash)
@@ -413,14 +389,8 @@ func (s *store) shardResponse(ctx context.Context, fileHash xet.FileHash) (apis.
 	return resp, err
 }
 
-// fileEntry is a known file and the xorbs it references.
-type fileEntry struct {
-	File  apis.File
-	Xorbs []xet.XorbHash
-}
-
 // inventory lists the local xorbs oldest first and, once each, the files a local or cached shard describes with a SHA-256, as report does; a local shard that fails to load is skipped.
-func (s *store) inventory(ctx context.Context) ([]inventory.Xorb, []fileEntry, error) {
+func (s *store) inventory(ctx context.Context) ([]inventory.Xorb, []apis.File, error) {
 	xorbs, err := inventory.Scan(ctx, s.Storage)
 	if err != nil {
 		return nil, nil, err
@@ -435,13 +405,13 @@ func (s *store) inventory(ctx context.Context) ([]inventory.Xorb, []fileEntry, e
 	if err != nil {
 		return nil, nil, err
 	}
-	var files []fileEntry
+	var files []apis.File
 	seen := map[xet.FileHash]bool{}
 	add := func(sh *shard.Shard, hashes []xet.FileHash) {
 		for _, fh := range hashes {
 			if f := sh.File(fh); f != nil && f.MetadataExt != nil && !seen[fh] {
 				seen[fh] = true
-				files = append(files, fileEntry{fileOf(f), xorbsOf(f)})
+				files = append(files, fileOf(f))
 			}
 		}
 	}
@@ -476,6 +446,10 @@ func (s *store) PutXorb(ctx context.Context, hash xet.XorbHash, r io.Reader) (bo
 	}
 	// Record the offsets of the committed local bytes and their size; the hash does not bind their packing.
 	f, err := s.Storage.GetXorbReadSeekCloser(ctx, hash)
+	if errors.Is(err, fs.ErrNotExist) {
+		// The local store shares one open per hash, so a read that missed before the commit can fail this one; the pin keeps the bytes.
+		f, err = s.Storage.GetXorbReadSeekCloser(ctx, hash)
+	}
 	if err != nil {
 		return false, err
 	}

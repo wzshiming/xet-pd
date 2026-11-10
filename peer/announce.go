@@ -3,12 +3,11 @@ package peer
 import (
 	"context"
 	"log/slog"
+	"maps"
 	"net/http"
 	"slices"
 	"sync/atomic"
 	"time"
-
-	"github.com/wzshiming/xet"
 
 	"github.com/wzshiming/xet-pd/apis"
 )
@@ -23,15 +22,17 @@ type announcer struct {
 	ready    atomic.Bool   // the tracker took an announce without asking to resync; never cleared
 	minSeeds atomic.Int64  // MinSeeds of the last successful reply carrying a positive one, 1 until then
 
+	lastUpstreams atomic.Pointer[[]apis.Peer] // Upstreams of the last successful reply, nil before it
+
 	// Only run touches these.
 	acked                holdings // inventory the tracker confirmed
 	full, failed, warned bool     // full: the next request carries the whole inventory
 }
 
-// holdings is what an announce reports: the cached xorbs and the complete files, by hash.
+// holdings is what an announce reports: the cached xorbs and the known shards, by hash.
 type holdings struct {
-	xorbs map[string]struct{}
-	files map[string]apis.File
+	xorbs  map[string]struct{}
+	shards map[string]apis.File
 }
 
 // run announces at start, on every inventory change and on every heartbeat until p.ctx ends.
@@ -53,6 +54,7 @@ func (a *announcer) run() {
 		} else {
 			a.failed = false
 			a.acked, a.full = snap, out.Resync
+			a.lastUpstreams.Store(&out.Upstreams)
 			if out.MinSeeds > 0 && a.minSeeds.Swap(int64(out.MinSeeds)) != int64(out.MinSeeds) {
 				p.kickEviction()
 			}
@@ -80,7 +82,7 @@ func (a *announcer) run() {
 	}
 }
 
-// snapshot copies the cached xorbs and the complete files under p.mu.
+// snapshot copies the cached xorbs and the known shards under p.mu.
 func (a *announcer) snapshot() holdings {
 	p := a.p
 	p.mu.Lock()
@@ -89,14 +91,9 @@ func (a *announcer) snapshot() holdings {
 	case <-a.wake: // changes before this snapshot are covered by it
 	default:
 	}
-	snap := holdings{xorbs: make(map[string]struct{}, p.xorbs.Len()), files: map[string]apis.File{}}
+	snap := holdings{xorbs: make(map[string]struct{}, p.xorbs.Len()), shards: maps.Clone(p.shards)}
 	for e := range p.xorbs.Oldest() {
 		snap.xorbs[e.Key.String()] = struct{}{}
-	}
-	for h, f := range p.files {
-		if !slices.ContainsFunc(f.Xorbs, func(x xet.XorbHash) bool { return p.xorbs.Get(x) == nil }) {
-			snap.files[h] = f.File
-		}
 	}
 	return snap
 }
@@ -104,12 +101,12 @@ func (a *announcer) snapshot() holdings {
 // request announces snap whole when full, else as its delta from acked.
 func (a *announcer) request(snap holdings) apis.AnnounceRequest {
 	p := a.p
-	req := apis.AnnounceRequest{Peer: apis.Peer{ID: p.id, URL: p.cfg.Advertise}, Epoch: p.epoch, Full: a.full}
+	req := apis.AnnounceRequest{Peer: apis.Peer{ID: p.id, URL: p.cfg.Advertise, Upstream: p.cfg.Upstream != ""}, Epoch: p.epoch, Full: a.full}
 	req.Add, req.Remove = delta(snap.xorbs, a.acked.xorbs, a.full)
 	var added []string
-	added, req.RemoveFiles = delta(snap.files, a.acked.files, a.full)
+	added, req.RemoveShards = delta(snap.shards, a.acked.shards, a.full)
 	for _, h := range added {
-		req.AddFiles = append(req.AddFiles, snap.files[h])
+		req.AddShards = append(req.AddShards, snap.shards[h])
 	}
 	return req
 }
@@ -136,6 +133,14 @@ func (a *announcer) post(req apis.AnnounceRequest) (apis.AnnounceResponse, error
 	ctx, cancel := context.WithTimeout(a.p.ctx, announceTimeout)
 	defer cancel()
 	return apis.Announce(ctx, a.control, a.p.cfg.Tracker, a.p.cfg.Secret, req)
+}
+
+// upstreams returns a copy of the Upstreams of the last successful reply, none before the first.
+func (a *announcer) upstreams() []apis.Peer {
+	if ups := a.lastUpstreams.Load(); ups != nil {
+		return slices.Clone(*ups)
+	}
+	return nil
 }
 
 // kick wakes the announcer without blocking; safe under p.mu and after Close.

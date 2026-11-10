@@ -39,8 +39,8 @@ func parse(args []string, getenv func(string) string, help io.Writer) (cli.Setti
 	fs.LogFormatVar(&s.LogFormat)
 	fs.StringVar(&cfg.Advertise, "advertise", "", "public origin of this peer, scheme://host[:port] (required)", "XET_PD_ADVERTISE")
 	fs.StringVar(&cfg.Tracker, "tracker", "", "tracker origin, scheme://host[:port] (required)", "XET_PD_TRACKER")
-	fs.StringVar(&cfg.Upstream, "upstream", "https://huggingface.co", "upstream hub origin", "HF_ENDPOINT")
-	fs.StringVar(&cfg.UpstreamToken, "upstream-token", "", "bearer token for the upstream hub", "HF_TOKEN")
+	fs.StringVar(&cfg.Upstream, "upstream", "", "upstream hub origin; empty makes this peer fetch through the peers that have one", "HF_ENDPOINT")
+	fs.StringVar(&cfg.UpstreamToken, "upstream-token", "", "bearer token for the upstream hub, needs -upstream", "HF_TOKEN")
 	fs.StringVar(&cfg.DataDir, "data-dir", "./xet-pd-peer", "data directory", "XET_PD_DATA_DIR")
 	fs.SizeVar(&cfg.XorbCacheSize, "xorb-cache-size", 8<<30, "bytes of local xorbs kept, 0 unlimited", "XET_PD_XORB_CACHE_SIZE")
 	fs.IntVar(&cfg.MaxPulls, "max-pulls", peer.DefaultMaxPulls, "parallel pulls from other peers", "XET_PD_MAX_PULLS")
@@ -55,8 +55,6 @@ func parse(args []string, getenv func(string) string, help io.Writer) (cli.Setti
 		return cli.Settings{}, peer.Config{}, errors.New("advertise is required")
 	case cfg.Tracker == "":
 		return cli.Settings{}, peer.Config{}, errors.New("tracker is required")
-	case cfg.Upstream == "":
-		return cli.Settings{}, peer.Config{}, errors.New("upstream is required")
 	}
 	var err error
 	cfg.Secret, err = fs.ResolveSecret(*secret, *secretFile, getenv)

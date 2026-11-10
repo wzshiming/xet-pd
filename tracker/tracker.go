@@ -1,4 +1,4 @@
-// Package tracker implements the xet-pd tracker: an in-memory record of which live peers hold which xorbs and complete files, answering lookups and asking peers to seed files.
+// Package tracker implements the xet-pd tracker: an in-memory record of which live peers hold which xorbs and shards, answering lookups and asking peers to seed each of them.
 package tracker
 
 import (
@@ -16,7 +16,7 @@ import (
 type Config struct {
 	Secret   string        // bearer token of announces, lookups and pull requests
 	PeerTTL  time.Duration // announce validity, default 30s, at least 1s
-	Replicas int           // complete holders asked for per file, default 2
+	Replicas int           // live holders asked for per xorb and per shard, default 2
 	MinSeeds int           // other live holders a seed copy needs before a peer may evict it, default 1
 }
 

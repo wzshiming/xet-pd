@@ -1,4 +1,4 @@
-// Command tracker runs the xet-pd tracker: it records which live peers hold which xorbs and complete files and asks peers to seed.
+// Command tracker runs the xet-pd tracker: it records which live peers hold which xorbs and shards and asks peers to seed each of them.
 package main
 
 import (
@@ -37,7 +37,7 @@ func parse(args []string, getenv func(string) string, help io.Writer) (cli.Setti
 	fs.StringVar(&s.Listen, "listen", ":8080", "listen address", "XET_PD_LISTEN")
 	fs.LogFormatVar(&s.LogFormat)
 	fs.DurationVar(&cfg.PeerTTL, "peer-ttl", tracker.DefaultPeerTTL, "seconds a peer stays registered after its last announce", "XET_PD_PEER_TTL")
-	fs.IntVar(&cfg.Replicas, "replicas", tracker.DefaultReplicas, "seed copies the tracker asks for per complete file", "XET_PD_REPLICAS")
+	fs.IntVar(&cfg.Replicas, "replicas", tracker.DefaultReplicas, "seed copies the tracker asks for per xorb and per shard", "XET_PD_REPLICAS")
 	fs.IntVar(&cfg.MinSeeds, "min-seeds", tracker.DefaultMinSeeds, "other live holders a seed copy needs before a peer may evict it", "XET_PD_MIN_SEEDS")
 	secret, secretFile := fs.SecretFlags()
 	if err := fs.Parse(args, getenv, help); err != nil {

@@ -34,7 +34,7 @@ const (
 	stopTimeout   = 15 * time.Second // SIGTERM to exit
 	readyTimeout  = 20 * time.Second // process start, registration, control round trips
 	ingestTimeout = 60 * time.Second // hub ingest of one fixture file
-	seedTimeout   = 60 * time.Second // the tracker seeding a complete file to another peer
+	seedTimeout   = 60 * time.Second // the tracker seeding xorbs and shards to another peer
 )
 
 var binDir string // holds the race-instrumented tracker and peer binaries TestMain builds
@@ -281,13 +281,16 @@ type peerProc struct {
 	DataDir string
 }
 
-// startPeer runs a peer mirroring upstream on a reserved loopback port it also advertises, retrying if the port is taken meanwhile.
+// startPeer runs a peer on a reserved loopback port it also advertises, retrying if the port is taken meanwhile; a non-empty upstream makes it an access peer mirroring that hub, an empty one an internal peer.
 func startPeer(t *testing.T, trackerURL, upstream, secret string, flags []string, env ...string) *peerProc {
 	t.Helper()
 	for attempt := 1; ; attempt++ {
 		addr, dir := reserveAddr(t), t.TempDir()
-		args := append([]string{"-listen", addr, "-advertise", "http://" + addr, "-tracker", trackerURL, "-upstream", upstream, "-data-dir", dir}, flags...)
-		p := startProc(t, "peer", "peer "+addr, args, append(secretEnv(secret), env...)...)
+		args := []string{"-listen", addr, "-advertise", "http://" + addr, "-tracker", trackerURL, "-data-dir", dir}
+		if upstream != "" {
+			args = append(args, "-upstream", upstream)
+		}
+		p := startProc(t, "peer", "peer "+addr, append(args, flags...), append(secretEnv(secret), env...)...)
 		err := p.awaitHealthy("http://" + addr)
 		if err == nil {
 			return &peerProc{proc: p, URL: "http://" + addr, DataDir: dir}
@@ -407,9 +410,29 @@ func headReady(t *testing.T, resolveURL string) http.Header {
 	return hdr
 }
 
-// seeded reports whether the tracker lists n live peers, each with at least files complete files.
-func seeded(d apis.PeersResponse, n, files int) bool {
-	return len(d.Peers) == n && !slices.ContainsFunc(d.Peers, func(p apis.PeerStatus) bool { return p.Files < files })
+// seeded reports whether the tracker lists n live peers, each with at least xorbs xorbs and shards shards.
+func seeded(d apis.PeersResponse, n, xorbs, shards int) bool {
+	return len(d.Peers) == n && !slices.ContainsFunc(d.Peers, func(p apis.PeerStatus) bool { return p.Holdings < xorbs || p.Shards < shards })
+}
+
+// awaitAccess waits until the tracker lists access with an upstream and internal announced twice since: the reply to the first lists access and is applied before the second goes out.
+func awaitAccess(t *testing.T, trackerURL string, access, internal *peerProc) {
+	t.Helper()
+	var expiry time.Time
+	announces := -1
+	clustertest.WaitFor(t, readyTimeout, internal.URL+" to learn the access peer "+access.URL, func() bool {
+		d := clustertest.Diag(t, trackerURL)
+		a, _ := peerStatus(d, access.URL)
+		s, ok := peerStatus(d, internal.URL)
+		if !a.Upstream || !ok {
+			return false
+		}
+		if !s.Expiry.Equal(expiry) {
+			expiry = s.Expiry
+			announces++
+		}
+		return announces == 2
+	})
 }
 
 // peerStatus returns the tracker's entry for the peer advertising url.

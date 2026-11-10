@@ -3,6 +3,7 @@ package tracker
 import (
 	"io"
 	"net/http"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -134,11 +135,14 @@ func TestMetricsEndpoint(t *testing.T) {
 	}
 	for _, typ := range []string{
 		"announces_total counter", "lookups_total counter", "seed_requests_total counter",
-		"seed_requests_in_flight gauge", "peers gauge", "xorbs gauge", "files gauge",
+		"seed_requests_in_flight gauge", "peers gauge", "upstream_peers gauge", "xorbs gauge", "shards gauge",
 	} {
 		if !strings.Contains("\n"+text, "\n# TYPE xetpd_tracker_"+typ+"\n") {
 			t.Fatalf("GET /metrics lacks # TYPE xetpd_tracker_%s", typ)
 		}
+	}
+	if strings.Contains(text, "xetpd_tracker_files") {
+		t.Fatal("GET /metrics still exports xetpd_tracker_files")
 	}
 	m := clustertest.Scrape(t, srv.URL)
 	if _, ok := m["go_goroutines"]; !ok {
@@ -147,7 +151,7 @@ func TestMetricsEndpoint(t *testing.T) {
 	for _, key := range []string{
 		`xetpd_tracker_announces_total{result="ok"}`, `xetpd_tracker_announces_total{result="resync"}`, `xetpd_tracker_announces_total{result="rejected"}`,
 		"xetpd_tracker_lookups_total", `xetpd_tracker_seed_requests_total{result="ok"}`, `xetpd_tracker_seed_requests_total{result="error"}`,
-		"xetpd_tracker_seed_requests_in_flight", "xetpd_tracker_peers", "xetpd_tracker_xorbs", "xetpd_tracker_files",
+		"xetpd_tracker_seed_requests_in_flight", "xetpd_tracker_peers", "xetpd_tracker_upstream_peers", "xetpd_tracker_xorbs", "xetpd_tracker_shards",
 	} {
 		if v, ok := m[key]; !ok || v != 0 {
 			t.Fatalf("fresh %s = %v (present %v), want a visible 0", key, v, ok)
@@ -157,8 +161,8 @@ func TestMetricsEndpoint(t *testing.T) {
 	auth := []string{"Authorization", "Bearer " + secret}
 	other := strings.Repeat("ef", 32)
 	for _, req := range []apis.AnnounceRequest{
-		{Peer: apis.Peer{ID: "p1", URL: "http://127.0.0.1:1"}, Epoch: "e", Full: true, Add: []string{testHash}, AddFiles: []apis.File{seedFile}},
-		{Peer: apis.Peer{ID: "p2", URL: "http://127.0.0.1:2"}, Epoch: "e", Full: true, Add: []string{testHash, other}, AddFiles: []apis.File{seedFile}},
+		{Peer: apis.Peer{ID: "p1", URL: "http://127.0.0.1:1", Upstream: true}, Epoch: "e", Full: true, Add: []string{testHash}, AddShards: []apis.File{seedFile}},
+		{Peer: apis.Peer{ID: "p2", URL: "http://127.0.0.1:2"}, Epoch: "e", Full: true, Add: []string{testHash, other}, AddShards: []apis.File{seedFile}},
 		{Peer: apis.Peer{ID: "p3", URL: "http://127.0.0.1:3"}, Epoch: "e", Add: []string{testHash}},
 	} {
 		if status, body, _ := post(t, srv, announceJSON(t, req), auth...); status != http.StatusOK {
@@ -178,8 +182,9 @@ func TestMetricsEndpoint(t *testing.T) {
 		`xetpd_tracker_announces_total{result="rejected"}`: 1,
 		"xetpd_tracker_lookups_total":                      1,
 		"xetpd_tracker_peers":                              2,
+		"xetpd_tracker_upstream_peers":                     1,
 		"xetpd_tracker_xorbs":                              2,
-		"xetpd_tracker_files":                              1,
+		"xetpd_tracker_shards":                             1,
 	} {
 		if m[key] != want {
 			t.Fatalf("after two Full announces, a delta from an unknown peer, a malformed one and a lookup: %s = %v, want %v", key, m[key], want)
@@ -190,8 +195,8 @@ func TestMetricsEndpoint(t *testing.T) {
 	}
 }
 
-// An announce that completes a file wakes seeding at once; the pull outcome is counted.
-func TestAnnounceSeedsCompleteFile(t *testing.T) {
+// An announce that adds a xorb or a shard wakes seeding at once; the pull outcome is counted.
+func TestAnnounceWakesSeeding(t *testing.T) {
 	const secret = "s3cret"
 	tr, srv := newTestTracker(t, func(cfg *Config) { cfg.Secret, cfg.PeerTTL = secret, time.Hour })
 	auth := []string{"Authorization", "Bearer " + secret}
@@ -202,12 +207,14 @@ func TestAnnounceSeedsCompleteFile(t *testing.T) {
 			t.Fatalf("announce of %s = %d %q", req.Peer.ID, status, body)
 		}
 	}
+	var all []apis.Peer
 	for _, p := range peers {
 		announce(apis.AnnounceRequest{Peer: p.Peer(), Epoch: "e", Full: true})
+		all = append(all, p.Peer())
 	}
-	ranking := trackerRegistry(tr).rank(seedFile.Hash)
+	ranking := apis.Rank(testHash, all)
 	top, holder := peers[ranking[0].ID], peers[ranking[len(ranking)-1].ID]
-	announce(apis.AnnounceRequest{Peer: holder.Peer(), Epoch: "e", AddFiles: []apis.File{seedFile}})
+	announce(apis.AnnounceRequest{Peer: holder.Peer(), Epoch: "e", Add: []string{testHash}})
 	clustertest.WaitFor(t, time.Second, "a seed pull at the top-ranked non-holder", func() bool { return len(top.Pulls()) == 1 })
 	settle(t, trackerSeeder(tr))
 	for id, p := range peers {
@@ -219,7 +226,7 @@ func TestAnnounceSeedsCompleteFile(t *testing.T) {
 			t.Fatalf("%s saw %d pulls, want %d", id, len(p.Pulls()), want)
 		}
 	}
-	if got := top.Pulls()[0]; got.Req != (apis.PullRequest{File: seedFile.Hash, Seed: true}) || got.Header.Get("Authorization") != "Bearer "+secret {
+	if got := top.Pulls()[0]; !reflect.DeepEqual(got.Req, apis.PullRequest{Xorbs: []string{testHash}, Seed: true}) || got.Header.Get("Authorization") != "Bearer "+secret {
 		t.Fatalf("pull = %+v with Authorization %q", got.Req, got.Header.Get("Authorization"))
 	}
 	if n := clustertest.Scrape(t, srv.URL)[`xetpd_tracker_seed_requests_total{result="ok"}`]; n != 1 {
@@ -228,7 +235,7 @@ func TestAnnounceSeedsCompleteFile(t *testing.T) {
 	for _, p := range peers {
 		p.SetPullStatus(http.StatusInternalServerError)
 	}
-	announce(apis.AnnounceRequest{Peer: holder.Peer(), Epoch: "e", AddFiles: []apis.File{{Hash: strings.Repeat("12", 32), SHA256: strings.Repeat("34", 32)}}})
+	announce(apis.AnnounceRequest{Peer: holder.Peer(), Epoch: "e", AddShards: []apis.File{seedFile}})
 	clustertest.WaitFor(t, clustertest.WaitTimeout, "a refused seed pull counted", func() bool {
 		return clustertest.Scrape(t, srv.URL)[`xetpd_tracker_seed_requests_total{result="error"}`] == 1
 	})

@@ -13,19 +13,24 @@ import (
 	"github.com/wzshiming/xet-pd/internal/clustertest"
 )
 
-// The fixture of e2e/hf_cli_test.go, a pinned public xet-backed file on huggingface.co; test files of another package cannot be imported.
-const (
-	hfUpstream = "https://huggingface.co"
-	hfRepo     = "hf-internal-testing/tiny-random-LlamaForCausalLM"
-	hfFile     = "model.safetensors"
-	hfRevision = "9fb191250dd56d0ba7ec9785a025ed29c03d5998"
-	hfFileSHA  = "49c20f32c6c597480fcaec5df2f86c645eabea765cbea1e67886dbae45e5c992"
-	hfFileSize = 4131280
+const hfUpstream = "https://huggingface.co"
+
+// fixture is a pinned public xet-backed file on huggingface.co.
+type fixture struct {
+	repo, file, revision, sha string
+	size                      int
+}
+
+var (
+	// model is the fixture of e2e/hf_cli_test.go; test files of another package cannot be imported.
+	model = fixture{"hf-internal-testing/tiny-random-LlamaForCausalLM", "model.safetensors", "9fb191250dd56d0ba7ec9785a025ed29c03d5998", "49c20f32c6c597480fcaec5df2f86c645eabea765cbea1e67886dbae45e5c992", 4131280}
+	// inner is another file of that commit, first asked for through the internal peer.
+	inner = fixture{"hf-internal-testing/tiny-random-LlamaForCausalLM", "tokenizer.model", "9fb191250dd56d0ba7ec9785a025ed29c03d5998", "9e556afd44213b6bd1be2b850ebbbd98f5481437a8021afaf58ee7fb1818d347", 499723}
 )
 
 var (
-	trackerTypes = []string{"xetpd_tracker_peers", "xetpd_tracker_xorbs", "xetpd_tracker_files", "xetpd_tracker_announces_total", "xetpd_tracker_lookups_total", "xetpd_tracker_seed_requests_total"}
-	peerTypes    = []string{"xetpd_peer_xorb_gets_total", "xetpd_peer_pulls_total", "xetpd_peer_announces_total", "xetpd_peer_shard_gets_total", "xetpd_peer_files", "xetpd_peer_xorb_cache_bytes"}
+	trackerTypes = []string{"xetpd_tracker_peers", "xetpd_tracker_upstream_peers", "xetpd_tracker_xorbs", "xetpd_tracker_shards", "xetpd_tracker_announces_total", "xetpd_tracker_lookups_total", "xetpd_tracker_seed_requests_total"}
+	peerTypes    = []string{"xetpd_peer_xorb_gets_total", "xetpd_peer_pulls_total", "xetpd_peer_announces_total", "xetpd_peer_shard_gets_total", "xetpd_peer_shards", "xetpd_peer_xorb_cache_bytes"}
 )
 
 func TestKind(t *testing.T) {
@@ -56,10 +61,9 @@ func TestKind(t *testing.T) {
 
 	var (
 		workers       []string
-		first, second string // the workers the Jobs run on: cold on first, warm and restart on second
+		first, second string // the node labelled for the access peer and the internal peer's node
 		tracker       string
 		peers         map[string]pod // by node
-		cold          counts
 		summary       []string
 	)
 	passed := true
@@ -75,15 +79,15 @@ func TestKind(t *testing.T) {
 			f(t)
 		}) && passed
 	}
-	// listed waits until the tracker lists the peer of pod p with a complete file, under an epoch other than skip.
-	listed := func(t *testing.T, timeout time.Duration, p pod, skip string) {
+	// listed waits until the tracker lists the peer of pod p with at least xorbs xorbs and shards shards, under an epoch other than skip.
+	listed := func(t *testing.T, timeout time.Duration, p pod, xorbs, shards int, skip string) {
 		t.Helper()
-		c.eventually(t, timeout, "the tracker to list "+p.name+" with a complete file", func() error {
+		c.eventually(t, timeout, fmt.Sprintf("the tracker to list %s with %d xorbs and %d shards", p.name, xorbs, shards), func() error {
 			d, err := c.peers(t.Context(), tracker)
 			if err != nil {
 				return err
 			}
-			if s, ok := peerStatus(d, p.url()); !ok || s.Files < 1 || s.Epoch == skip {
+			if s, ok := peerStatus(d, p.url()); !ok || s.Holdings < xorbs || s.Shards < shards || s.Epoch == skip {
 				return fmt.Errorf("tracker lists %v", holdings(d))
 			}
 			return nil
@@ -121,8 +125,9 @@ func TestKind(t *testing.T) {
 		c.must(t, loadTimeout, "kind", "load", "docker-image", trackerImage, peerImage, hfImage, "--name", clusterName)
 	})
 	step("deploy", 5*time.Second, func(t *testing.T) {
+		c.kubectl(t, "label", "node", first, upstreamLabel+"=true", "--overwrite")
 		c.kubectl(t, "apply", "-k", c.overlay)
-		for _, workload := range []string{"deploy/xet-pd-tracker", "ds/xet-pd-peer"} {
+		for _, workload := range []string{"deploy/xet-pd-tracker", "ds/xet-pd-peer-upstream", "ds/xet-pd-peer"} {
 			c.must(t, rolloutTimeout+callTimeout, "kubectl", "-n", namespace, "rollout", "status", workload, "--timeout="+rolloutTimeout.String())
 		}
 	})
@@ -132,30 +137,24 @@ func TestKind(t *testing.T) {
 			t.Fatalf("tracker pods %v, want one on a worker of %v", trackers, workers)
 		}
 		tracker = trackers[0].name
-		peers = map[string]pod{}
-		for _, p := range c.pods(t, peerSelector) {
-			peers[p.node] = p
+		access, internal := c.pods(t, accessSelector), c.pods(t, peerSelector)
+		if len(access) != 1 || access[0].node != first || len(internal) != 1 || internal[0].node != second {
+			t.Fatalf("access peer pods %v and internal peer pods %v, want one on %s and one on %s", access, internal, first, second)
 		}
-		if len(peers) != 2 || peers[first].name == "" || peers[second].name == "" {
-			t.Fatalf("peer pods by node %v, want one on each of %v", peers, workers)
-		}
-		want := []string{peers[first].url(), peers[second].url()}
-		slices.Sort(want)
-		c.eventually(t, peersTimeout, "both peers registered", func() error {
+		peers = map[string]pod{first: access[0], second: internal[0]}
+		c.eventually(t, peersTimeout, "both peers registered, the one on "+first+" with an upstream", func() error {
 			d, err := c.peers(t.Context(), tracker)
 			if err != nil {
 				return err
 			}
-			var urls []string
-			for _, p := range d.Peers {
-				urls = append(urls, p.URL)
-			}
-			if slices.Sort(urls); !slices.Equal(urls, want) {
-				return fmt.Errorf("tracker lists peers %v, want %v", urls, want)
+			a, okA := peerStatus(d, peers[first].url())
+			i, okI := peerStatus(d, peers[second].url())
+			if len(d.Peers) != 2 || !okA || !okI || !a.Upstream || i.Upstream {
+				return fmt.Errorf("tracker lists %v", holdings(d))
 			}
 			return nil
 		})
-		summary = append(summary, fmt.Sprintf("tracker %s on %s; peer pods by node %v", tracker, trackers[0].node, peers))
+		summary = append(summary, fmt.Sprintf("tracker %s on %s; access peer %s on %s, internal peer %s on %s", tracker, trackers[0].node, peers[first].name, first, peers[second].name, second))
 	})
 	step("smoke", time.Second, func(t *testing.T) {
 		c.raw(t, tracker, trackerPort, "/readyz")
@@ -164,8 +163,10 @@ func TestKind(t *testing.T) {
 		}
 		text := c.raw(t, tracker, trackerPort, "/metrics")
 		declared := checkTypes(t, "tracker", text, trackerTypes)
-		if live := sample(t, clustertest.ParseMetrics(t, text), "xetpd_tracker_peers"); live != 2 {
-			t.Errorf("tracker peers gauge %v, want 2", live)
+		m := clustertest.ParseMetrics(t, text)
+		live, upstreams := sample(t, m, "xetpd_tracker_peers"), sample(t, m, "xetpd_tracker_upstream_peers")
+		if live != 2 || upstreams != 1 {
+			t.Errorf("tracker gauges: %v peers, %v upstream peers; want 2 and 1", live, upstreams)
 		}
 		announced := map[string]float64{}
 		for i, node := range workers {
@@ -178,26 +179,23 @@ func TestKind(t *testing.T) {
 				t.Errorf("peer on %s announced ok %v times, want some", node, announced[node])
 			}
 		}
-		summary = append(summary, fmt.Sprintf("smoke: /readyz 200 on the tracker and both peers; TYPE %v; peer announces ok by node %v", declared, announced))
+		summary = append(summary, fmt.Sprintf("smoke: /readyz 200 on the tracker and both peers; TYPE %v; tracker gauges %v peers, %v upstream peers; peer announces ok by node %v", declared, live, upstreams, announced))
 	})
-	// A cold resolve carries no xet headers while the peer ingests, so hf downloads plain bytes from its node's peer: no pull there shows the Job reached it.
+	// A cold resolve carries no xet headers while the peer ingests, so hf streams plain bytes and the access peer may count no client xorb GET: its holdings show the Job reached it.
 	step("cold", 3*time.Second, func(t *testing.T) {
-		log := c.job(t, "hf-cold", first)
-		listed(t, filesTimeout, peers[first], "")
-		cold = c.count(t, tracker, peers)
-		if cold.pulled[first] != 0 {
-			t.Errorf("peer on %s pulled %v times, want the file from its own ingest", first, cold.pulled[first])
-		}
-		if cold.client[second] != 0 {
-			t.Errorf("peer on %s answered %v client xorb GETs, want none", second, cold.client[second])
+		log := c.job(t, "hf-cold", first, model)
+		listed(t, filesTimeout, peers[first], 1, 1, "")
+		s := c.count(t, tracker, peers)
+		if s.pulled[first] != 0 || s.client[second] != 0 {
+			t.Errorf("pulls ok on %s %v, client xorb GETs on %s %v; want the access peer's own ingest and nothing asked of %s", first, s.pulled[first], second, s.client[second], second)
 		}
 		if t.Failed() {
 			t.Logf("hf-cold log:\n%s", log)
 		}
-		summary = append(summary, "cold: hf-cold on "+first+": "+cold.String())
+		summary = append(summary, "cold: hf-cold on "+first+": "+s.String())
 	})
 	step("seed", time.Second, func(t *testing.T) {
-		listed(t, seedTimeout, peers[second], "")
+		listed(t, seedTimeout, peers[second], 1, 1, "")
 		s := c.count(t, tracker, peers)
 		if s.seeds < 1 || s.pulled[second] < 1 || s.relayed[first] < 1 {
 			t.Errorf("seed requests ok %v, pulls ok on %s %v, peer xorb GETs answered on %s %v; want the tracker's seed of %s pulled from %s",
@@ -205,21 +203,29 @@ func TestKind(t *testing.T) {
 		}
 		summary = append(summary, "seed: "+s.String())
 	})
-	// kind counts no upstream bytes, so the peer counters show the copy on the second worker came from the first.
 	step("warm", 3*time.Second, func(t *testing.T) {
-		log := c.job(t, "hf-warm", second)
+		before := c.count(t, tracker, peers)
+		log := c.job(t, "hf-warm", second, model)
 		s := c.count(t, tracker, peers)
-		if s.client[second] <= 0 || s.client[first] != cold.client[first] {
-			t.Errorf("client xorb GETs on %s %v, on %s %v -> %v; want the Job's on its own node only", second, s.client[second], first, cold.client[first], s.client[first])
-		}
-		if s.lookups < 1 || s.shards[first] < 1 || s.relayed[first] < 1 || s.pulled[second] < 1 {
-			t.Errorf("tracker lookups %v, shard gets on %s %v, peer xorb GETs answered on %s %v, pulls ok on %s %v; want the copy on %s pulled from %s",
-				s.lookups, first, s.shards[first], first, s.relayed[first], second, s.pulled[second], second, first)
+		if s.client[second] < 1 || s.client[first] != before.client[first] {
+			t.Errorf("client xorb GETs on %s %v, on %s %v -> %v; want the Job's on its own node only", second, s.client[second], first, before.client[first], s.client[first])
 		}
 		if t.Failed() {
 			t.Logf("hf-warm log:\n%s", log)
 		}
 		summary = append(summary, "warm: hf-warm on "+second+": "+s.String())
+	})
+	// The internal peer has no upstream, so the Job succeeds only through the access peer, which ingests the file while the internal peer chunks it again.
+	step("cold-inner", 3*time.Second, func(t *testing.T) {
+		log := c.job(t, "hf-cold-inner", second, inner)
+		for _, node := range workers {
+			listed(t, filesTimeout, peers[node], 2, 2, "")
+		}
+		s := c.count(t, tracker, peers)
+		if t.Failed() {
+			t.Logf("hf-cold-inner log:\n%s", log)
+		}
+		summary = append(summary, fmt.Sprintf("cold-inner: hf-cold-inner of %s on %s: %s", inner.file, second, s))
 	})
 	step("restart", 15*time.Second, func(t *testing.T) {
 		old := peers[second]
@@ -239,16 +245,16 @@ func TestKind(t *testing.T) {
 			return fmt.Errorf("no peer pod replaced %s", old.name)
 		})
 		c.must(t, rolloutTimeout+callTimeout, "kubectl", "-n", namespace, "wait", "--for=condition=Ready", "pod/"+peers[second].name, "--timeout="+rolloutTimeout.String())
-		listed(t, filesTimeout, peers[second], before.Epoch)
-		log := c.job(t, "hf-restart", second)
+		listed(t, filesTimeout, peers[second], 2, 2, before.Epoch)
+		log := c.job(t, "hf-restart", second, model)
 		s := c.count(t, tracker, peers)
-		if s.client[second] <= 0 {
+		if s.client[second] < 1 {
 			t.Errorf("restarted peer on %s answered %v client xorb GETs, want the Job's", second, s.client[second])
 		}
 		if t.Failed() {
 			t.Logf("hf-restart log:\n%s", log)
 		}
-		summary = append(summary, fmt.Sprintf("restart: %s replaced %s and restored its files; hf-restart on %s: %s", peers[second].name, old.name, second, s))
+		summary = append(summary, fmt.Sprintf("restart: %s replaced %s and restored its xorbs and shards; hf-restart on %s: %s", peers[second].name, old.name, second, s))
 	})
 	if keep {
 		summary = append(summary, "cluster kept; kind export kubeconfig --name "+clusterName+" reaches it")

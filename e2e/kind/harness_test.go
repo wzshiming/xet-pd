@@ -32,8 +32,12 @@ const (
 	taintKey    = "xetpd-e2e"
 
 	trackerSelector = "app.kubernetes.io/name=xet-pd-tracker"
+	accessSelector  = "app.kubernetes.io/name=xet-pd-peer-upstream"
 	peerSelector    = "app.kubernetes.io/name=xet-pd-peer"
 	jobSelector     = "app.kubernetes.io/part-of=xet-pd-e2e"
+
+	// upstreamLabel set to true puts an access peer on a node and keeps the internal peer off it.
+	upstreamLabel = "xet-pd/upstream"
 
 	trackerImage = "xet-pd-tracker:kind"
 	peerImage    = "xet-pd-peer:kind"
@@ -51,7 +55,7 @@ const (
 	loadTimeout    = 5 * time.Minute
 	rolloutTimeout = 5 * time.Minute
 	peersTimeout   = 60 * time.Second // both peers registered with the tracker
-	filesTimeout   = 60 * time.Second // a complete file listed by the tracker once its holder announced it
+	filesTimeout   = 60 * time.Second // a file's xorbs and shard listed by the tracker once a holder announced them
 	seedTimeout    = 60 * time.Second // the tracker's seed of the other peer
 	restartTimeout = 3 * time.Minute  // a deleted peer pod replaced and running
 	jobTimeout     = 4 * time.Minute
@@ -164,11 +168,11 @@ func peerStatus(d apis.PeersResponse, url string) (apis.PeerStatus, bool) {
 	return d.Peers[i], true
 }
 
-// holdings renders each live peer as its URL with the complete files and xorbs it announced, sorted.
+// holdings renders each live peer as its URL with whether it has an upstream and the xorbs and shards it announced, sorted.
 func holdings(d apis.PeersResponse) []string {
 	var out []string
 	for _, p := range d.Peers {
-		out = append(out, fmt.Sprintf("%s files=%d xorbs=%d", p.URL, p.Files, p.Holdings))
+		out = append(out, fmt.Sprintf("%s upstream=%t xorbs=%d shards=%d", p.URL, p.Upstream, p.Holdings, p.Shards))
 	}
 	slices.Sort(out)
 	return out
@@ -236,6 +240,7 @@ func (c *cluster) dump(t testing.TB) {
 		{"get", "pods", "-A", "-o", "wide"},
 		{"get", "events", "-A", "--sort-by=.lastTimestamp"},
 		{"-n", namespace, "logs", "deploy/xet-pd-tracker", "--tail=50"},
+		{"-n", namespace, "logs", "-l", accessSelector, "--prefix", "--tail=50"},
 		{"-n", namespace, "logs", "-l", peerSelector, "--prefix", "--tail=50"},
 		{"get", "nodes", "-o", "wide"},
 	} {
@@ -317,11 +322,11 @@ spec:
 
 var jobTemplate = template.Must(template.New("job").Parse(jobYAML))
 
-// job runs the hf Job name on node to completion and returns its log, which must show the fixture's digest.
-func (c *cluster) job(t testing.TB, name, node string) string {
+// job runs the hf Job name on node to download f and returns its log, which must show the digest of f.
+func (c *cluster) job(t testing.TB, name, node string, f fixture) string {
 	t.Helper()
 	var spec strings.Builder
-	data := map[string]any{"Name": name, "Node": node, "Image": hfImage, "Port": peerPort, "Repo": hfRepo, "File": hfFile, "Revision": hfRevision, "SHA": hfFileSHA, "Size": hfFileSize}
+	data := map[string]any{"Name": name, "Node": node, "Image": hfImage, "Port": peerPort, "Repo": f.repo, "File": f.file, "Revision": f.revision, "SHA": f.sha, "Size": f.size}
 	if err := jobTemplate.Execute(&spec, data); err != nil {
 		t.Fatal(err)
 	}
@@ -345,8 +350,8 @@ func (c *cluster) job(t testing.TB, name, node string) string {
 			switch cond.Type {
 			case "Complete":
 				log := c.kubectl(t, "-n", "default", "logs", "job/"+name)
-				if !strings.Contains(log, hfFileSHA+"  /work/out/"+hfFile) {
-					t.Fatalf("job %s log lacks the fixture digest:\n%s", name, log)
+				if !strings.Contains(log, f.sha+"  /work/out/"+f.file) {
+					t.Fatalf("job %s log lacks the digest of %s:\n%s", name, f.file, log)
 				}
 				return log
 			case "Failed":
@@ -380,14 +385,15 @@ func (c *cluster) jobReport(t testing.TB, name string) string {
 
 // counts is what the assertions read after a step.
 type counts struct {
-	peers   apis.PeersResponse
-	live    float64            // xetpd_tracker_peers
-	lookups float64            // xetpd_tracker_lookups_total
-	seeds   float64            // xetpd_tracker_seed_requests_total{result="ok"}
-	client  map[string]float64 // xorb GETs a peer answered clients with 2xx, by node
-	relayed map[string]float64 // xorb GETs a peer answered other peers with 2xx, by node
-	pulled  map[string]float64 // xetpd_peer_pulls_total{result="ok"}, by node
-	shards  map[string]float64 // xetpd_peer_shard_gets_total{status="200"}, by node
+	peers     apis.PeersResponse
+	live      float64            // xetpd_tracker_peers
+	upstreams float64            // xetpd_tracker_upstream_peers
+	lookups   float64            // xetpd_tracker_lookups_total
+	seeds     float64            // xetpd_tracker_seed_requests_total{result="ok"}
+	client    map[string]float64 // xorb GETs a peer answered clients with 2xx, by node
+	relayed   map[string]float64 // xorb GETs a peer answered other peers with 2xx, by node
+	pulled    map[string]float64 // xetpd_peer_pulls_total{result="ok"}, by node
+	shards    map[string]float64 // xetpd_peer_shard_gets_total{status="200"}, by node
 }
 
 // count reads the tracker and the peer pods given by node.
@@ -399,14 +405,15 @@ func (c *cluster) count(t testing.TB, tracker string, peers map[string]pod) coun
 	}
 	m := clustertest.ParseMetrics(t, c.raw(t, tracker, trackerPort, "/metrics"))
 	s := counts{
-		peers:   d,
-		live:    sample(t, m, "xetpd_tracker_peers"),
-		lookups: sample(t, m, "xetpd_tracker_lookups_total"),
-		seeds:   sample(t, m, `xetpd_tracker_seed_requests_total{result="ok"}`),
-		client:  map[string]float64{},
-		relayed: map[string]float64{},
-		pulled:  map[string]float64{},
-		shards:  map[string]float64{},
+		peers:     d,
+		live:      sample(t, m, "xetpd_tracker_peers"),
+		upstreams: sample(t, m, "xetpd_tracker_upstream_peers"),
+		lookups:   sample(t, m, "xetpd_tracker_lookups_total"),
+		seeds:     sample(t, m, `xetpd_tracker_seed_requests_total{result="ok"}`),
+		client:    map[string]float64{},
+		relayed:   map[string]float64{},
+		pulled:    map[string]float64{},
+		shards:    map[string]float64{},
 	}
 	for node, p := range peers {
 		pm := clustertest.ParseMetrics(t, c.raw(t, p.name, peerPort, "/metrics"))
@@ -425,8 +432,8 @@ func (c *cluster) count(t testing.TB, tracker string, peers map[string]pod) coun
 }
 
 func (s counts) String() string {
-	return fmt.Sprintf("peers %v; tracker peers gauge %v, lookups %v, seed requests ok %v; by node: client xorb 2xx %v, peer xorb 2xx %v, pulls ok %v, shard gets 200 %v",
-		holdings(s.peers), s.live, s.lookups, s.seeds, s.client, s.relayed, s.pulled, s.shards)
+	return fmt.Sprintf("peers %v; tracker peers gauge %v, upstream peers %v, lookups %v, seed requests ok %v; by node: client xorb 2xx %v, peer xorb 2xx %v, pulls ok %v, shard gets 200 %v",
+		holdings(s.peers), s.live, s.upstreams, s.lookups, s.seeds, s.client, s.relayed, s.pulled, s.shards)
 }
 
 // sample returns the value of key and fails t when the exposition lacks it.
@@ -483,7 +490,7 @@ func preflight(t *testing.T) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodHead, hfUpstream+"/"+hfRepo+"/resolve/"+hfRevision+"/"+hfFile, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodHead, hfUpstream+"/"+model.repo+"/resolve/"+model.revision+"/"+model.file, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

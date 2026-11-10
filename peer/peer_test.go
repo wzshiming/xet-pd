@@ -144,7 +144,7 @@ func TestStartupFullAnnouncesSeededInventory(t *testing.T) {
 		c.DataDir, c.Heartbeat, c.Secret = dir, time.Hour, "s3cret"
 	})
 	first := tracker.Announce(t, 0)
-	want := apis.AnnounceRequest{Peer: apis.Peer{ID: peerID(p), URL: "http://seed.test"}, Epoch: peerEpoch(p), Full: true, Add: hashes(a, b)}
+	want := apis.AnnounceRequest{Peer: apis.Peer{ID: peerID(p), URL: "http://seed.test", Upstream: true}, Epoch: peerEpoch(p), Full: true, Add: hashes(a, b)}
 	if got := first.Req; !slices.Equal(got.Add, want.Add) || got.Peer != want.Peer || got.Epoch != want.Epoch || !got.Full || len(got.Remove) != 0 {
 		t.Fatalf("startup announce = %+v, want %+v", got, want)
 	}
@@ -214,13 +214,24 @@ func TestConfigValidation(t *testing.T) {
 	}
 }
 
-func TestConfigRequiresUpstream(t *testing.T) {
+func TestConfigWithoutUpstreamMakesAnInternalPeer(t *testing.T) {
 	p, err := New(Config{Advertise: "http://seed:8080", Tracker: "http://tracker", DataDir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("New without an upstream = %v, want an internal peer", err)
+	}
+	defer func() { _ = p.Close() }()
+	if got := configOf(p).Upstream; got != "" {
+		t.Fatalf("normalized Upstream = %q, want it left empty", got)
+	}
+}
+
+func TestConfigRejectsUpstreamTokenWithoutUpstream(t *testing.T) {
+	p, err := New(Config{Advertise: "http://seed:8080", Tracker: "http://tracker", UpstreamToken: "tok", DataDir: t.TempDir()})
 	if err == nil {
 		_ = p.Close()
-		t.Fatal("New accepted a config without an upstream")
+		t.Fatal("New accepted an upstream token without an upstream")
 	}
-	if want := "upstream is required"; err.Error() != want {
+	if want := "upstream token needs upstream"; err.Error() != want {
 		t.Fatalf("New error = %q, want %q", err, want)
 	}
 }
@@ -445,7 +456,7 @@ func TestMetricsEndpoint(t *testing.T) {
 	}
 	for _, typ := range []string{
 		"xorb_gets_total counter", "pulls_total counter", "announces_total counter", "restore_dropped_total counter", "shard_gets_total counter",
-		"files gauge", "xorb_cache_bytes gauge", "xorb_cache_entries gauge", "xorb_cache_limit_bytes gauge", "pulls_in_flight gauge", "cooldowns gauge",
+		"shards gauge", "xorb_cache_bytes gauge", "xorb_cache_entries gauge", "xorb_cache_limit_bytes gauge", "pulls_in_flight gauge", "cooldowns gauge",
 	} {
 		if !strings.Contains("\n"+string(text), "\n# TYPE xetpd_peer_"+typ+"\n") {
 			t.Fatalf("GET /metrics lacks # TYPE xetpd_peer_%s", typ)
@@ -462,7 +473,7 @@ func TestMetricsEndpoint(t *testing.T) {
 		`xetpd_peer_xorb_gets_total{requester="peer",status="200"}`, `xetpd_peer_xorb_gets_total{requester="peer",status="206"}`, `xetpd_peer_xorb_gets_total{requester="peer",status="404"}`,
 		`xetpd_peer_pulls_total{result="ok"}`, `xetpd_peer_pulls_total{result="not_found"}`, `xetpd_peer_pulls_total{result="canceled"}`, `xetpd_peer_pulls_total{result="timeout"}`, `xetpd_peer_pulls_total{result="error"}`,
 		`xetpd_peer_shard_gets_total{status="200"}`, `xetpd_peer_shard_gets_total{status="404"}`,
-		"xetpd_peer_restore_dropped_total", "xetpd_peer_files", "xetpd_peer_xorb_cache_bytes", "xetpd_peer_xorb_cache_entries", "xetpd_peer_pulls_in_flight", "xetpd_peer_cooldowns",
+		"xetpd_peer_restore_dropped_total", "xetpd_peer_shards", "xetpd_peer_xorb_cache_bytes", "xetpd_peer_xorb_cache_entries", "xetpd_peer_pulls_in_flight", "xetpd_peer_cooldowns",
 	} {
 		if v, ok := m[key]; !ok || v != 0 {
 			t.Fatalf("fresh %s = %v (present %v), want a visible 0", key, v, ok)
@@ -506,7 +517,7 @@ func TestMetricsEndpoint(t *testing.T) {
 	pullAndSettle(t, p, srv, cold, coldBody)
 	awaitSamples(t, srv, map[string]float64{`xetpd_peer_pulls_total{result="ok"}`: 1, "xetpd_peer_pulls_in_flight": 0})
 	ingest(t, storeOf(p), makeFile(t, 55))
-	awaitSamples(t, srv, map[string]float64{"xetpd_peer_files": 1})
+	awaitSamples(t, srv, map[string]float64{"xetpd_peer_shards": 1})
 }
 
 type result struct {
@@ -847,14 +858,14 @@ func TestUpstreamFailures(t *testing.T) {
 	})
 }
 
-func TestPullRequestPullsTheFileAsProtectedSeed(t *testing.T) {
+func TestPullBatchPullsXorbsAsSeedsAndFetchesShards(t *testing.T) {
 	tf := makeFile(t, 90, 91)
 	xs := tf.xorbHashes()
 	other, otherBody := clustertest.MakeXorb(t, 92, 2, 8<<10)
 	tracker, holder := newTracker(t), newHolder(t, "holder")
 	tracker.SetReply(replyMinSeeds(1))
 	holder.ServeShard(tf.file, tf.resp)
-	tracker.HoldFile(holder.Peer(), tf.file)
+	tracker.HoldShard(holder.Peer(), tf.file)
 	for h, body := range tf.xorbs {
 		holder.ServeXorb(h, body)
 		tracker.Hold(holder.Peer(), h)
@@ -862,37 +873,98 @@ func TestPullRequestPullsTheFileAsProtectedSeed(t *testing.T) {
 	p, srv := newTestPeer(t, tracker.URL, func(c *Config) {
 		c.Secret, c.Heartbeat, c.XorbCacheSize = testSecret, time.Hour, int64(len(tf.xorbs[xs[0]])+len(tf.xorbs[xs[1]]))
 	})
-	payload := `{"file":"` + tf.file.Hash + `","seed":true}`
-	for _, tt := range []struct {
-		auth, payload string
-		want          int
-	}{
-		{"", payload, http.StatusUnauthorized},
-		{"Bearer wrong", payload, http.StatusUnauthorized},
-		{"Bearer " + testSecret, `{"file":"zz","seed":true}`, http.StatusBadRequest},
-		{"Bearer " + testSecret, `{"hash":"` + xs[0].String() + `"}`, http.StatusBadRequest},
-		{"Bearer " + testSecret, payload + `{}`, http.StatusBadRequest},
-		{"Bearer " + testSecret, payload + strings.Repeat(" ", apis.MaxReplyBytes+1-len(payload)), http.StatusRequestEntityTooLarge},
-	} {
-		if resp, body := send(t, http.MethodPost, srv.URL+apis.PullPath, tt.payload, "Authorization", tt.auth); resp.StatusCode != tt.want {
-			t.Fatalf("pull with %q of %.70q = %d %q, want %d", tt.auth, tt.payload, resp.StatusCode, body, tt.want)
-		}
-	}
-	if n, m := len(holder.Requests()), len(tracker.Lookups()); n != 0 || m != 0 {
-		t.Fatalf("holder requests and lookups before an accepted pull = %d and %d, want none", n, m)
-	}
+	payload := `{"xorbs":["` + xs[0].String() + `","` + xs[1].String() + `"],"shards":["` + tf.file.Hash + `"],"seed":true}`
 	if resp, body := send(t, http.MethodPost, srv.URL+apis.PullPath, payload, "Authorization", "Bearer "+testSecret); resp.StatusCode != http.StatusAccepted {
 		t.Fatalf("pull = %d %q, want 202", resp.StatusCode, body)
 	}
 	for _, h := range xs {
 		clustertest.WaitFor(t, clustertest.WaitTimeout, "the pull of "+h.String(), admitted(p, h))
 	}
+	tracker.FindAnnounce(t, 0, func(a clustertest.Announce) bool { return slices.Contains(a.Req.AddShards, tf.file) })
+	var paths []string
+	for _, r := range holder.Requests() {
+		paths = append(paths, r.Path)
+	}
+	if want := []string{apis.ShardPathPrefix + tf.file.Hash, apis.XorbPathPrefix + xs[0].String(), apis.XorbPathPrefix + xs[1].String()}; !slices.Equal(slices.Sorted(slices.Values(paths)), slices.Sorted(slices.Values(want))) {
+		t.Fatalf("holder requests = %v, want %v", paths, want)
+	}
 	// With no other holder left, the seed copies outlast a younger xorb over the cap.
 	tracker.Forget("holder")
 	commitDirect(t, p, other, otherBody)
 	clustertest.WaitFor(t, clustertest.WaitTimeout, "the cache back under its cap", func() bool { return usage(p) <= configOf(p).XorbCacheSize })
 	if !stored(t, p, xs[0]) || !stored(t, p, xs[1]) || stored(t, p, other) {
-		t.Fatal("want the seed file's xorbs kept and the younger xorb evicted")
+		t.Fatal("want the seed xorbs kept and the younger xorb evicted")
+	}
+}
+
+func TestPullOfAShardAloneFetchesNoXorb(t *testing.T) {
+	tf := makeFile(t, 95, 96)
+	tracker, holder := newTracker(t), newHolder(t, "holder")
+	holder.ServeShard(tf.file, tf.resp)
+	tracker.HoldShard(holder.Peer(), tf.file)
+	for h, body := range tf.xorbs {
+		holder.ServeXorb(h, body)
+		tracker.Hold(holder.Peer(), h)
+	}
+	_, srv := newTestPeer(t, tracker.URL, func(c *Config) { c.Secret, c.Heartbeat = testSecret, time.Hour })
+	auth := "Bearer " + testSecret
+	if resp, body := send(t, http.MethodPost, srv.URL+apis.PullPath, `{"shards":["`+tf.file.Hash+`"]}`, "Authorization", auth); resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("pull = %d %q, want 202", resp.StatusCode, body)
+	}
+	added, _ := tracker.FindAnnounce(t, 0, func(a clustertest.Announce) bool { return len(a.Req.AddShards) > 0 })
+	if !slices.Equal(added.Req.AddShards, []apis.File{tf.file}) || len(added.Req.Add) != 0 {
+		t.Fatalf("announce after the pull = %+v, want only the shard of %+v", added.Req, tf.file)
+	}
+	if resp, body := send(t, http.MethodGet, srv.URL+apis.ShardPathPrefix+tf.file.Hash, "", "Authorization", auth); resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET of the pulled shard = %d %q, want 200 from the cache", resp.StatusCode, body)
+	}
+	if reqs := holder.Requests(); len(reqs) != 1 || reqs[0].Path != apis.ShardPathPrefix+tf.file.Hash {
+		t.Fatalf("holder requests = %+v, want only the shard GET", reqs)
+	}
+}
+
+func TestPullRouteValidatesTheBatch(t *testing.T) {
+	captureWarnings(t) // the accepted batch fails in the background
+	tracker := newTracker(t)
+	p, srv := newTestPeer(t, tracker.URL, func(c *Config) { c.Secret, c.Heartbeat = testSecret, time.Hour })
+	entries := func(n int) string {
+		list := make([]string, n)
+		for i := range list {
+			list[i] = fmt.Sprintf(`"%064x"`, i)
+		}
+		return "[" + strings.Join(list, ",") + "]"
+	}
+	valid := `{"xorbs":` + entries(200) + `}`
+	auth := "Bearer " + testSecret
+	for _, tt := range []struct {
+		name, auth, payload string
+		want                int
+		body                string
+	}{
+		{"no secret", "", valid, http.StatusUnauthorized, "unauthorized\n"},
+		{"wrong secret", "Bearer wrong", valid, http.StatusUnauthorized, "unauthorized\n"},
+		{"empty", auth, `{}`, http.StatusBadRequest, "empty pull\n"},
+		{"legacy file", auth, `{"file":"` + strings.Repeat("ab", 32) + `","seed":true}`, http.StatusBadRequest, "empty pull\n"},
+		{"too many", auth, `{"xorbs":` + entries(200) + `,"shards":` + entries(apis.MaxPullBatch-199) + `}`, http.StatusBadRequest, "too many entries\n"},
+		{"invalid xorb", auth, `{"xorbs":["zz"]}`, http.StatusBadRequest, "invalid hash\n"},
+		{"invalid shard", auth, `{"xorbs":` + entries(1) + `,"shards":["zz"]}`, http.StatusBadRequest, "invalid hash\n"},
+		{"trailing data", auth, valid + `{}`, http.StatusBadRequest, ""},
+		{"oversized", auth, valid + strings.Repeat(" ", apis.MaxPullBytes+1-len(valid)), http.StatusRequestEntityTooLarge, ""},
+	} {
+		resp, body := send(t, http.MethodPost, srv.URL+apis.PullPath, tt.payload, "Authorization", tt.auth)
+		if resp.StatusCode != tt.want || (tt.body != "" && body != tt.body) {
+			t.Fatalf("%s pull = %d %q, want %d %q", tt.name, resp.StatusCode, body, tt.want, tt.body)
+		}
+	}
+	if n := len(tracker.Lookups()); n != 0 {
+		t.Fatalf("lookups after refused pulls = %d, want none", n)
+	}
+	if resp, body := send(t, http.MethodPost, srv.URL+apis.PullPath, valid+strings.Repeat(" ", 300<<10-len(valid)), "Authorization", auth); resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("pull of 300 KiB with 200 entries = %d %q, want 202", resp.StatusCode, body)
+	}
+	_ = p.Close()
+	if resp, body := send(t, http.MethodPost, srv.URL+apis.PullPath, valid, "Authorization", auth); resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("pull after Close = %d %q, want 503", resp.StatusCode, body)
 	}
 }
 

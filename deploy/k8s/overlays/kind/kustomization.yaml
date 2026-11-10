@@ -20,3 +20,6 @@ secretGenerator:
 patches:
   - path: tracker-patch.yaml
   - path: peer-patch.yaml
+    target:
+      kind: DaemonSet
+      labelSelector: app.kubernetes.io/part-of=xet-pd

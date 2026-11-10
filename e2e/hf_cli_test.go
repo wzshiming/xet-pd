@@ -42,33 +42,31 @@ const (
 	hfTimeout  = 3 * time.Minute // one hf download
 )
 
-// TestHFCLI runs the real hf CLI against two peers mirroring huggingface.co: cold through peer-1 tunnels the origin, warm through peer-2 with a fresh cache pulls the bytes from peer-1.
+// TestHFCLI runs the real hf CLI against an access peer mirroring huggingface.co and an internal peer mirroring through it: cold through the internal peer has the access peer fetch the origin once, warm through the access peer with a fresh cache stays off the origin.
 func TestHFCLI(t *testing.T) {
 	hfPath := hfBinary(t)
 	preflight(t)
 	origin := newOriginProxy(t)
 	guard := newRefuser(t)
 	secret := testSecret(t)
-	// One replica keeps the tracker from seeding, so peer-2 pulls on demand during the warm run.
+	// One replica keeps the tracker from seeding, so peer-2 holds the file only from its own ingest through peer-1.
 	tr := startTracker(t, secret, []string{"-replicas", "1"})
-	var peers []*peerProc
-	for range 2 {
-		peers = append(peers, startPeer(t, tr.URL, hfUpstream, secret, []string{"-heartbeat", "100ms"},
-			"HTTPS_PROXY="+origin.URL, "HTTP_PROXY="+origin.URL, "https_proxy="+origin.URL, "http_proxy="+origin.URL))
-	}
-	clustertest.WaitFor(t, readyTimeout, "both peers to register", func() bool { return len(clustertest.Diag(t, tr.URL).Peers) == 2 })
+	flags := []string{"-heartbeat", "100ms"}
+	access := startPeer(t, tr.URL, hfUpstream, secret, flags, proxyEnv(origin.URL)...)
+	internal := startPeer(t, tr.URL, "", secret, flags, proxyEnv(guard.URL)...)
+	awaitAccess(t, tr.URL, access, internal)
 
-	coldPath, coldLog := runHF(t, hfPath, peers[0].URL, guard.URL)
+	coldPath, coldLog := runHF(t, hfPath, internal.URL, guard.URL)
 	if d, n := fileDigest(t, coldPath); d != hfFileSHA || n != hfFileSize {
 		t.Fatalf("cold download: sha256 %s, %d bytes; want %s, %d", d, n, hfFileSHA, hfFileSize)
 	}
-	clustertest.WaitFor(t, ingestTimeout, "peer-1 to announce the ingested file", holds(t, tr.URL, peers[0].URL, 1))
 	coldBytes := origin.bytes.Load()
-	if coldBytes < hfFileSize/2 {
-		t.Errorf("cold run tunneled %d origin bytes, want at least %d", coldBytes, hfFileSize/2)
+	if coldBytes < hfFileSize/2 || coldBytes > hfFileSize+hfFileSize/4 {
+		t.Errorf("cold run tunneled %d origin bytes, want about the file's %d, fetched once", coldBytes, hfFileSize)
 	}
+	clustertest.WaitFor(t, ingestTimeout, "peer-2 to announce its copy", holds(t, tr.URL, internal.URL, 1, 1))
 
-	warmPath, warmLog := runHF(t, hfPath, peers[1].URL, guard.URL)
+	warmPath, warmLog := runHF(t, hfPath, access.URL, guard.URL)
 	if d, n := fileDigest(t, warmPath); d != hfFileSHA || n != hfFileSize {
 		t.Fatalf("warm download: sha256 %s, %d bytes; want %s, %d", d, n, hfFileSHA, hfFileSize)
 	}
@@ -76,22 +74,28 @@ func TestHFCLI(t *testing.T) {
 	if limit := max(int64(256<<10), coldBytes/5); warmBytes >= limit {
 		t.Errorf("warm run tunneled %d origin bytes, want under %d", warmBytes, limit)
 	}
-	relayed := metric(t, peers[0].URL, `xetpd_peer_xorb_gets_total{requester="peer",status="200"}`)
-	if relayed < 1 {
-		t.Errorf("peer-1 served %v xorb GETs to peers, want peer-2's pulls", relayed)
-	}
 	// A cold resolve carries no xet headers while the peer ingests, so only the warm run goes through Xet Storage.
 	if !strings.Contains(warmLog, "Downloading file from Xet Storage") {
 		t.Errorf("warm hf log does not announce Xet Storage:\n%s", warmLog)
 	}
 	if hosts := guard.seen(); len(hosts) != 0 {
-		t.Errorf("hf reached beyond loopback: %v", hosts)
+		t.Errorf("hf or peer-2 reached beyond loopback: %v", hosts)
 	}
-	if strings.Contains(coldLog+warmLog, secret) {
-		t.Error("hf output echoes the secret")
+	for _, out := range []string{coldLog, warmLog, tr.stdout.String(), tr.stderr.String(), access.stdout.String(), access.stderr.String(), internal.stdout.String(), internal.stderr.String()} {
+		if strings.Contains(out, secret) {
+			t.Error("output echoes the secret")
+		}
 	}
-	clustertest.WaitFor(t, readyTimeout, "peer-2 to announce the pulled file", func() bool { return seeded(clustertest.Diag(t, tr.URL), 2, 1) })
-	t.Logf("origin bytes cold %d, warm %d; peer-1 served %v xorb GETs to peer-2\nwarm hf stderr:\n%s", coldBytes, warmBytes, relayed, warmLog)
+	t.Logf("origin bytes cold %d, warm %d; tracker lists %+v\nwarm hf stderr:\n%s", coldBytes, warmBytes, clustertest.Diag(t, tr.URL).Peers, warmLog)
+}
+
+// proxyEnv points every proxy variable at proxy.
+func proxyEnv(proxy string) []string {
+	var env []string
+	for _, key := range []string{"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"} {
+		env = append(env, key+"="+proxy, strings.ToLower(key)+"="+proxy)
+	}
+	return env
 }
 
 // hfBinary finds hf and skips unless hf_xet is installed in its Python environment.
@@ -185,9 +189,7 @@ func runHF(t *testing.T, hfPath, endpoint, refuser string) (string, string) {
 		"HF_DEBUG=1", // the CLI forces info verbosity otherwise
 		"HF_HUB_ETAG_TIMEOUT=60", "HF_HUB_DOWNLOAD_TIMEOUT=60",
 	}
-	for _, key := range []string{"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"} {
-		env = append(env, key+"="+refuser, strings.ToLower(key)+"="+refuser)
-	}
+	env = append(env, proxyEnv(refuser)...)
 	ctx, cancel := context.WithTimeout(t.Context(), hfTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, hfPath, "download", hfRepo, hfFile, "--revision", hfRevision, "--local-dir", local)

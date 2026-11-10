@@ -131,7 +131,7 @@ func (f *FakePeer) servePull(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req apis.PullRequest
-	if !apis.ReadJSON(w, r, apis.MaxReplyBytes, &req) {
+	if !apis.ReadJSON(w, r, apis.MaxPullBytes, &req) {
 		return
 	}
 	f.mu.Lock()

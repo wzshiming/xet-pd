@@ -31,6 +31,12 @@ func TestWireConstants(t *testing.T) {
 	if MaxAnnounceBytes != 32<<20 || MaxLookupBytes != 32<<20 || MaxShardBytes != 64<<20 || MaxReplyBytes != 4096 {
 		t.Fatalf("MaxAnnounceBytes, MaxLookupBytes, MaxShardBytes, MaxReplyBytes = %d, %d, %d, %d", MaxAnnounceBytes, MaxLookupBytes, MaxShardBytes, MaxReplyBytes)
 	}
+	if MaxAnnounceReplyBytes != 256<<10 {
+		t.Fatalf("MaxAnnounceReplyBytes = %d", MaxAnnounceReplyBytes)
+	}
+	if MaxPullBytes != 1<<20 || MaxPullBatch != 256 {
+		t.Fatalf("MaxPullBytes, MaxPullBatch = %d, %d", MaxPullBytes, MaxPullBatch)
+	}
 	if XorbPathPrefix != "/v1/xorbs/default/" {
 		t.Fatalf("XorbPathPrefix = %q", XorbPathPrefix)
 	}
@@ -44,8 +50,9 @@ func TestWireConstants(t *testing.T) {
 
 func TestPullRequestWire(t *testing.T) {
 	t.Parallel()
-	in := PullRequest{File: "file-hash"}
-	want := `{"file":"file-hash"}`
+	// Unkeyed, so a field added or dropped fails to compile here.
+	in := PullRequest{[]string{"aa"}, []string{"f1"}, true}
+	want := `{"xorbs":["aa"],"shards":["f1"],"seed":true}`
 	encoded, err := json.Marshal(in)
 	if err != nil {
 		t.Fatal(err)
@@ -57,15 +64,15 @@ func TestPullRequestWire(t *testing.T) {
 	if err := json.Unmarshal(encoded, &out); err != nil {
 		t.Fatal(err)
 	}
-	if out != in {
+	if !reflect.DeepEqual(out, in) {
 		t.Fatalf("round trip\n got %+v\nwant %+v", out, in)
 	}
 }
 
-func TestPullRequestSeedWire(t *testing.T) {
+func TestPullRequestBatchWire(t *testing.T) {
 	t.Parallel()
-	in := PullRequest{File: "file-hash", Seed: true}
-	want := `{"file":"file-hash","seed":true}`
+	in := PullRequest{Xorbs: []string{"aa", "bb"}, Shards: []string{"f1"}, Seed: true}
+	want := `{"xorbs":["aa","bb"],"shards":["f1"],"seed":true}`
 	encoded, err := json.Marshal(in)
 	if err != nil {
 		t.Fatal(err)
@@ -77,8 +84,48 @@ func TestPullRequestSeedWire(t *testing.T) {
 	if err := json.Unmarshal(encoded, &out); err != nil {
 		t.Fatal(err)
 	}
-	if out != in {
+	if !reflect.DeepEqual(out, in) {
 		t.Fatalf("round trip\n got %+v\nwant %+v", out, in)
+	}
+}
+
+func TestPullRequestOmitsEmptyFields(t *testing.T) {
+	t.Parallel()
+	for _, in := range []PullRequest{{}, {Xorbs: []string{}, Shards: []string{}}} {
+		encoded, err := json.Marshal(in)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(encoded) != `{}` {
+			t.Fatalf("encoded %+v\n got %s\nwant {}", in, encoded)
+		}
+	}
+}
+
+func TestPeerWire(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		in   Peer
+		want string
+	}{
+		{Peer{ID: "peer-1", URL: "http://peer-1:8080"}, `{"id":"peer-1","url":"http://peer-1:8080"}`},
+		{Peer{ID: "peer-1", URL: "http://peer-1:8080", Upstream: true}, `{"id":"peer-1","url":"http://peer-1:8080","upstream":true}`},
+	}
+	for _, c := range cases {
+		got, err := json.Marshal(c.in)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(got) != c.want {
+			t.Fatalf("encoded\n got %s\nwant %s", got, c.want)
+		}
+		var out Peer
+		if err := json.Unmarshal(got, &out); err != nil {
+			t.Fatal(err)
+		}
+		if out != c.in {
+			t.Fatalf("round trip\n got %+v\nwant %+v", out, c.in)
+		}
 	}
 }
 
@@ -128,16 +175,19 @@ func TestAnnounceRequestWire(t *testing.T) {
 	}
 }
 
-func TestAnnounceRequestFilesWire(t *testing.T) {
+func TestAnnounceRequestEveryFieldWire(t *testing.T) {
 	t.Parallel()
+	// Unkeyed, so a field added or dropped fails to compile here.
 	in := AnnounceRequest{
-		Peer:        Peer{ID: "peer-1", URL: "http://peer-1:8080"},
-		Epoch:       "epoch-1",
-		Add:         []string{"aa"},
-		AddFiles:    []File{{Hash: "f1", SHA256: "s1"}},
-		RemoveFiles: []string{"f2"},
+		Peer{ID: "peer-1", URL: "http://peer-1:8080", Upstream: true},
+		"epoch-1",
+		true,
+		[]string{"aa"},
+		[]string{"cc"},
+		[]File{{Hash: "f1", SHA256: "s1"}},
+		[]string{"f2"},
 	}
-	want := `{"peer":{"id":"peer-1","url":"http://peer-1:8080"},"epoch":"epoch-1","add":["aa"],"add_files":[{"hash":"f1","sha256":"s1"}],"remove_files":["f2"]}`
+	want := `{"peer":{"id":"peer-1","url":"http://peer-1:8080","upstream":true},"epoch":"epoch-1","full":true,"add":["aa"],"remove":["cc"],"add_shards":[{"hash":"f1","sha256":"s1"}],"remove_shards":["f2"]}`
 	got, err := json.Marshal(in)
 	if err != nil {
 		t.Fatal(err)
@@ -151,6 +201,44 @@ func TestAnnounceRequestFilesWire(t *testing.T) {
 	}
 	if !reflect.DeepEqual(out, in) {
 		t.Fatalf("round trip\n got %+v\nwant %+v", out, in)
+	}
+}
+
+func TestAnnounceRequestShardsWire(t *testing.T) {
+	t.Parallel()
+	in := AnnounceRequest{
+		Peer:         Peer{ID: "peer-1", URL: "http://peer-1:8080"},
+		Epoch:        "epoch-1",
+		AddShards:    []File{{Hash: "f1", SHA256: "s1"}},
+		RemoveShards: []string{"f2"},
+	}
+	want := `{"peer":{"id":"peer-1","url":"http://peer-1:8080"},"epoch":"epoch-1","add_shards":[{"hash":"f1","sha256":"s1"}],"remove_shards":["f2"]}`
+	got, err := json.Marshal(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != want {
+		t.Fatalf("encoded\n got %s\nwant %s", got, want)
+	}
+	var out AnnounceRequest
+	if err := json.Unmarshal(got, &out); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(out, in) {
+		t.Fatalf("round trip\n got %+v\nwant %+v", out, in)
+	}
+}
+
+func TestAnnounceRequestOmitsEmptyShards(t *testing.T) {
+	t.Parallel()
+	in := AnnounceRequest{Peer: Peer{ID: "peer-1", URL: "http://peer-1:8080"}, Epoch: "epoch-1", AddShards: []File{}, RemoveShards: []string{}}
+	want := `{"peer":{"id":"peer-1","url":"http://peer-1:8080"},"epoch":"epoch-1"}`
+	got, err := json.Marshal(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != want {
+		t.Fatalf("encoded\n got %s\nwant %s", got, want)
 	}
 }
 
@@ -199,6 +287,11 @@ func TestAnnounceResponseWire(t *testing.T) {
 		{AnnounceResponse{TTL: 30}, `{"ttl":30}`},
 		{AnnounceResponse{Resync: true, TTL: 30}, `{"resync":true,"ttl":30}`},
 		{AnnounceResponse{TTL: 30, MinSeeds: 2}, `{"ttl":30,"min_seeds":2}`},
+		// Upstreams keep the order given: sorting them is the tracker's job.
+		{
+			AnnounceResponse{TTL: 30, Upstreams: []Peer{{ID: "p2", URL: "http://p2", Upstream: true}, {ID: "p1", URL: "http://p1", Upstream: true}}},
+			`{"ttl":30,"upstreams":[{"id":"p2","url":"http://p2","upstream":true},{"id":"p1","url":"http://p1","upstream":true}]}`,
+		},
 	}
 	for _, c := range cases {
 		got, err := json.Marshal(c.in)
@@ -212,7 +305,7 @@ func TestAnnounceResponseWire(t *testing.T) {
 		if err := json.Unmarshal(got, &out); err != nil {
 			t.Fatal(err)
 		}
-		if out != c.in {
+		if !reflect.DeepEqual(out, c.in) {
 			t.Fatalf("round trip\n got %+v\nwant %+v", out, c.in)
 		}
 	}
@@ -220,8 +313,14 @@ func TestAnnounceResponseWire(t *testing.T) {
 
 func TestPeersResponseWire(t *testing.T) {
 	t.Parallel()
-	in := PeersResponse{Peers: []PeerStatus{{ID: "peer-1", URL: "http://peer-1:8080", Epoch: "epoch-1", Expiry: time.Date(2026, 9, 23, 14, 0, 0, 0, time.UTC), Holdings: 3, Files: 2}}}
-	want := `{"peers":[{"id":"peer-1","url":"http://peer-1:8080","epoch":"epoch-1","expiry":"2026-09-23T14:00:00Z","holdings":3,"files":2}]}`
+	expiry := time.Date(2026, 9, 23, 14, 0, 0, 0, time.UTC)
+	in := PeersResponse{Peers: []PeerStatus{
+		{ID: "peer-1", URL: "http://peer-1:8080", Upstream: true, Epoch: "epoch-1", Expiry: expiry, Holdings: 3, Shards: 4},
+		{ID: "peer-2", URL: "http://peer-2:8080", Epoch: "epoch-2", Expiry: expiry},
+	}}
+	want := `{"peers":[` +
+		`{"id":"peer-1","url":"http://peer-1:8080","upstream":true,"epoch":"epoch-1","expiry":"2026-09-23T14:00:00Z","holdings":3,"shards":4},` +
+		`{"id":"peer-2","url":"http://peer-2:8080","epoch":"epoch-2","expiry":"2026-09-23T14:00:00Z","holdings":0,"shards":0}]}`
 	got, err := json.Marshal(in)
 	if err != nil {
 		t.Fatal(err)

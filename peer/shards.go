@@ -15,7 +15,7 @@ import (
 	"github.com/wzshiming/xet/storage"
 )
 
-// shardCache keeps the shards fetched from complete holders under dir, named by the SHA-256 of their bytes, with the files they describe indexed in memory.
+// shardCache keeps the shards fetched from the peers holding them under dir, named by the SHA-256 of their bytes, with the files they describe indexed in memory.
 type shardCache struct {
 	dir string
 

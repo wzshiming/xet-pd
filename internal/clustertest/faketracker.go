@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 
@@ -34,7 +35,7 @@ type holding struct {
 	file apis.File
 }
 
-// FakeTracker records announces and lookups in arrival order and answers them, lookups from what Hold and HoldFile programmed; any other path is 404.
+// FakeTracker records announces and lookups in arrival order and answers them, lookups from what Hold and HoldShard programmed; any other path is 404.
 type FakeTracker struct {
 	*httptest.Server
 	// Secret, when set before the first request, is the bearer token announces and lookups must carry.
@@ -43,9 +44,10 @@ type FakeTracker struct {
 	mu        sync.Mutex
 	announces []Announce
 	reply     func(http.ResponseWriter, *http.Request, apis.AnnounceRequest) (int, apis.AnnounceResponse)
+	upstreams []apis.Peer // sorted by ID
 	lookups   []Lookup
 	answer    func(apis.LookupRequest) (int, apis.LookupResponse)
-	holdings  []holding // in Hold and HoldFile call order
+	holdings  []holding // in Hold and HoldShard call order
 }
 
 // NewFakeTracker serves apis.AnnouncePath and apis.LookupPath until the test ends.
@@ -72,8 +74,9 @@ func (f *FakeTracker) serveAnnounce(w http.ResponseWriter, r *http.Request) {
 	i := len(f.announces)
 	f.announces = append(f.announces, Announce{Req: req, Header: r.Header.Clone()})
 	reply := f.reply
+	upstreams := f.upstreams
 	f.mu.Unlock()
-	code, resp := http.StatusOK, apis.AnnounceResponse{TTL: 30}
+	code, resp := http.StatusOK, apis.AnnounceResponse{TTL: 30, Upstreams: upstreams}
 	if reply != nil {
 		code, resp = reply(w, r, req)
 	}
@@ -87,10 +90,18 @@ func (f *FakeTracker) serveAnnounce(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(resp)
 }
 
-// SetReply answers later announces through fn, which may block; nil restores 200 with a 30s TTL.
+// SetReply answers later announces through fn, which may block; nil restores 200 with a 30s TTL and the SetUpstreams peers.
 func (f *FakeTracker) SetReply(fn func(http.ResponseWriter, *http.Request, apis.AnnounceRequest) (int, apis.AnnounceResponse)) {
 	f.mu.Lock()
 	f.reply = fn
+	f.mu.Unlock()
+}
+
+// SetUpstreams makes later replies without a SetReply hook carry peers, sorted by ID, as Upstreams; no peers clears them.
+func (f *FakeTracker) SetUpstreams(peers ...apis.Peer) {
+	sorted := slices.SortedFunc(slices.Values(peers), func(a, b apis.Peer) int { return strings.Compare(a.ID, b.ID) })
+	f.mu.Lock()
+	f.upstreams = sorted
 	f.mu.Unlock()
 }
 
@@ -197,21 +208,21 @@ func (f *FakeTracker) Hold(p apis.Peer, xorbs ...xet.XorbHash) {
 	}
 }
 
-// HoldFile programs p as a complete holder of file, answered under both its SHA-256 and its hash.
-func (f *FakeTracker) HoldFile(p apis.Peer, file apis.File) {
+// HoldShard programs p as a holder of file's shard, answered under both its SHA-256 and its hash after the holders programmed before it.
+func (f *FakeTracker) HoldShard(p apis.Peer, file apis.File) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.holdings = append(f.holdings, holding{key: "sha256:" + file.SHA256, peer: p, file: file}, holding{key: "file:" + file.Hash, peer: p, file: file})
 }
 
-// Forget removes the peer with ID id from everything Hold and HoldFile programmed.
+// Forget removes the peer with ID id from everything Hold and HoldShard programmed.
 func (f *FakeTracker) Forget(id string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.holdings = slices.DeleteFunc(f.holdings, func(h holding) bool { return h.peer.ID == id })
 }
 
-// SetLookup answers later lookups through fn; nil restores answers from Hold and HoldFile.
+// SetLookup answers later lookups through fn; nil restores answers from Hold and HoldShard.
 func (f *FakeTracker) SetLookup(fn func(apis.LookupRequest) (int, apis.LookupResponse)) {
 	f.mu.Lock()
 	f.answer = fn

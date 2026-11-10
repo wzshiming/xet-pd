@@ -12,7 +12,6 @@ import (
 	"fmt"
 	"net/http"
 	"path/filepath"
-	"slices"
 	"sync"
 	"time"
 
@@ -31,8 +30,8 @@ import (
 type Config struct {
 	Advertise     string        // public origin of this peer, scheme://host[:port]; also the hub's external URL
 	Tracker       string        // tracker origin: announces and lookups go there
-	Upstream      string        // origin of the upstream hub the mirror ingests from
-	UpstreamToken string        // optional bearer token for the upstream hub
+	Upstream      string        // origin of the upstream hub the mirror ingests from; empty mirrors through the access peers the tracker lists
+	UpstreamToken string        // optional bearer token for the upstream hub, only with Upstream
 	DataDir       string        // data directory: data/ the local store, spool/ in-flight pulls, mirror/ the hub mirror
 	XorbCacheSize int64         // bytes of committed xorbs to keep, 0 unlimited; spools are extra
 	MaxPulls      int           // parallel pulls from other peers, default 8
@@ -48,7 +47,7 @@ const (
 	DefaultHeartbeat   = 10 * time.Second
 )
 
-// normalize canonicalizes the origins, rejects a missing upstream or data dir and negative values and fills in the defaults.
+// normalize canonicalizes the origins, rejects an upstream token without an upstream, a missing data dir and negative values and fills in the defaults.
 func (c *Config) normalize() error {
 	var err error
 	if c.Advertise, err = apis.Origin(c.Advertise); err != nil {
@@ -57,11 +56,13 @@ func (c *Config) normalize() error {
 	if c.Tracker, err = apis.Origin(c.Tracker); err != nil {
 		return fmt.Errorf("tracker: %w", err)
 	}
-	if c.Upstream == "" {
-		return errors.New("upstream is required")
-	}
-	if c.Upstream, err = apis.Origin(c.Upstream); err != nil {
-		return fmt.Errorf("upstream: %w", err)
+	switch {
+	case c.Upstream != "":
+		if c.Upstream, err = apis.Origin(c.Upstream); err != nil {
+			return fmt.Errorf("upstream: %w", err)
+		}
+	case c.UpstreamToken != "":
+		return errors.New("upstream token needs upstream")
 	}
 	if c.DataDir == "" {
 		return errors.New("data dir is required")
@@ -94,12 +95,11 @@ type Peer struct {
 	wg     sync.WaitGroup
 	once   sync.Once
 
-	mu        sync.Mutex                           // guards xorbs, files, xorbFiles, seeds and warned
-	xorbs     lru.Index[xet.XorbHash, ready]       // committed xorbs
-	files     map[string]fileEntry                 // known files by hash
-	xorbFiles map[xet.XorbHash]map[string]struct{} // hashes of the known files referencing each xorb
-	seeds     map[string]struct{}                  // hashes of the files whose xorbs are seed copies
-	warned    bool                                 // over the cap with nothing evictable, logged once until it fits
+	mu     sync.Mutex                     // guards xorbs, shards, seeds and warned
+	xorbs  lru.Index[xet.XorbHash, ready] // committed xorbs
+	shards map[string]apis.File           // known shards by file hash, never forgotten
+	seeds  map[xet.XorbHash]struct{}      // xorbs whose copies are seed copies
+	warned bool                           // over the cap with nothing evictable, logged once until it fits
 }
 
 // New normalizes cfg, restores the xorbs already in DataDir, starts announcing them to the tracker and serves the hub mirror and CAS over them.
@@ -127,12 +127,35 @@ func New(cfg Config) (*Peer, error) {
 		return nil, err
 	}
 	transport := http.DefaultTransport.(*http.Transport).Clone()
-	mir, err := mirror.NewMirror(mirror.WithStorage(st), mirror.WithCacheDir(filepath.Join(cfg.DataDir, "mirror")), mirror.WithTransport(transport))
+	ctx, cancel := context.WithCancel(context.Background())
+	p := &Peer{
+		cfg:       cfg,
+		id:        id,
+		epoch:     hex.EncodeToString(nonce[:]),
+		st:        st,
+		transport: transport,
+		ctx:       ctx,
+		cancel:    cancel,
+		metrics:   metrics,
+
+		evictions: make(chan struct{}, 1),
+		shards:    map[string]apis.File{},
+		seeds:     map[xet.XorbHash]struct{}{},
+	}
+	p.metrics.reg.MustRegister(peerState{p})
+	p.ann = &announcer{p: p, control: control, wake: make(chan struct{}, 1), full: true}
+	p.ann.minSeeds.Store(1)
+	provider := client.StaticUpstreamProvider(cfg.Upstream, cfg.UpstreamToken)
+	var upstream http.RoundTripper = transport
+	if cfg.Upstream == "" {
+		provider, upstream = &accessUpstream{ann: p.ann}, peerTransport{base: transport, id: id}
+	}
+	mir, err := mirror.NewMirror(mirror.WithStorage(st), mirror.WithCacheDir(filepath.Join(cfg.DataDir, "mirror")), mirror.WithTransport(upstream))
 	if err != nil {
+		cancel()
 		_ = st.Close()
 		return nil, err
 	}
-	provider := client.StaticUpstreamProvider(cfg.Upstream, cfg.UpstreamToken)
 	hub := hf.NewHandler(
 		hf.WithMirror(mir),
 		hf.WithUpstreamProvider(provider),
@@ -145,28 +168,9 @@ func New(cfg Config) (*Peer, error) {
 		})),
 		hf.WithNext(hf.NewUpstreamProxy(provider)),
 	)
-	ctx, cancel := context.WithCancel(context.Background())
-	p := &Peer{
-		cfg:   cfg,
-		id:    id,
-		epoch: hex.EncodeToString(nonce[:]),
-		st:    st,
-		// No authorizer: the CAS serves the clients of its own node.
-		cas:       server.NewHandler(server.WithStorage(st), server.WithNext(hub)),
-		transport: transport,
-		ctx:       ctx,
-		cancel:    cancel,
-		metrics:   metrics,
-
-		evictions: make(chan struct{}, 1),
-		files:     map[string]fileEntry{},
-		xorbFiles: map[xet.XorbHash]map[string]struct{}{},
-		seeds:     map[string]struct{}{},
-	}
-	p.metrics.reg.MustRegister(peerState{p})
-	p.ann = &announcer{p: p, control: control, wake: make(chan struct{}, 1), full: true}
-	p.ann.minSeeds.Store(1)
-	st.onStored, st.onRead, st.onIdle, st.onFile, st.onLost = p.admit, p.touch, p.retryEviction, p.learn, p.lost
+	// No authorizer: the CAS serves the clients of its own node.
+	p.cas = server.NewHandler(server.WithStorage(st), server.WithNext(hub))
+	st.onStored, st.onRead, st.onIdle, st.onShard, st.onLost = p.admit, p.touch, p.retryEviction, p.holdShard, p.lost
 	p.mux = p.routes()
 	if err := p.restore(); err != nil {
 		cancel()
@@ -200,19 +204,13 @@ func (p *Peer) Close() error {
 }
 
 type peerStats struct {
-	bytes                            int64
-	files, entries, pulls, cooldowns int
+	bytes                             int64
+	shards, entries, pulls, cooldowns int
 }
 
 func (p *Peer) stats() peerStats {
 	pulls, cooldowns := p.st.stats()
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	files := 0
-	for _, f := range p.files {
-		if !slices.ContainsFunc(f.Xorbs, func(x xet.XorbHash) bool { return p.xorbs.Get(x) == nil }) {
-			files++
-		}
-	}
-	return peerStats{bytes: p.xorbs.Usage(), files: files, entries: p.xorbs.Len(), pulls: pulls, cooldowns: cooldowns}
+	return peerStats{bytes: p.xorbs.Usage(), shards: len(p.shards), entries: p.xorbs.Len(), pulls: pulls, cooldowns: cooldowns}
 }

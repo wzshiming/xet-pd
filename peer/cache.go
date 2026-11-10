@@ -18,14 +18,14 @@ const lookupTimeout = 5 * time.Second
 // ready is the state of a committed xorb in p.xorbs; the store keeps its pins.
 type ready struct{}
 
-// restore registers the known files, then admits the stored xorbs oldest first, deleting invalid ones; local.Storage only honours ctx in WalkXorbs.
+// restore registers the known shards, then admits the stored xorbs oldest first, deleting invalid ones; local.Storage only honours ctx in WalkXorbs.
 func (p *Peer) restore() error {
-	xorbs, files, err := p.st.inventory(p.ctx)
+	xorbs, shards, err := p.st.inventory(p.ctx)
 	if err != nil {
 		return err
 	}
-	for _, f := range files {
-		p.learn(f.File, f.Xorbs)
+	for _, f := range shards {
+		p.holdShard(f)
 	}
 	valid := xorbs[:0]
 	for _, x := range xorbs {
@@ -77,34 +77,24 @@ func (p *Peer) touch(hash xet.XorbHash) {
 	}
 }
 
-// learn records the xorbs file references as the store reported them, replacing an earlier report.
-func (p *Peer) learn(file apis.File, xorbs []xet.XorbHash) {
+// holdShard records the shard describing file, stored here or fetched.
+func (p *Peer) holdShard(file apis.File) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	for _, h := range p.files[file.Hash].Xorbs {
-		delete(p.xorbFiles[h], file.Hash)
-		if len(p.xorbFiles[h]) == 0 {
-			delete(p.xorbFiles, h)
-		}
-	}
-	p.files[file.Hash] = fileEntry{file, xorbs}
-	for _, h := range xorbs {
-		if p.xorbFiles[h] == nil {
-			p.xorbFiles[h] = map[string]struct{}{}
-		}
-		p.xorbFiles[h][file.Hash] = struct{}{}
-	}
+	p.shards[file.Hash] = file
 	p.ann.kick()
 }
 
-// markSeed makes the copies of the xorbs fileHash references, known now or later, seed copies.
-func (p *Peer) markSeed(fileHash string) {
+// markSeed makes the copies of hashes, stored now or later, seed copies.
+func (p *Peer) markSeed(hashes ...xet.XorbHash) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.seeds[fileHash] = struct{}{}
+	for _, h := range hashes {
+		p.seeds[h] = struct{}{}
+	}
 }
 
-// lost forgets hash once a read found its bytes gone underneath; a copy stored again since that read stays.
+// lost forgets hash and its seed mark once a read found its bytes gone underneath; a copy stored again since that read stays.
 func (p *Peer) lost(hash xet.XorbHash) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -116,6 +106,7 @@ func (p *Peer) lost(hash xet.XorbHash) {
 		return
 	}
 	p.xorbs.Remove(e)
+	delete(p.seeds, hash)
 	p.ann.kick()
 }
 
@@ -186,11 +177,7 @@ func (p *Peer) evict(held map[string][]apis.Peer) []string {
 		if p.fits() {
 			break
 		}
-		var seed bool
-		for f := range p.xorbFiles[e.Key] {
-			_, marked := p.seeds[f]
-			seed = seed || marked
-		}
+		_, seed := p.seeds[e.Key]
 		if h := e.Key.String(); seed && len(held[h]) < minSeeds {
 			seeds = append(seeds, h)
 			continue

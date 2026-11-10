@@ -134,18 +134,27 @@ func (p *Peer) serveXorb(w http.ResponseWriter, r *http.Request) {
 	serveContent(w, r, hash, rs)
 }
 
-// servePull marks the file a seed copy when asked, answers 202 and pulls the file complete in the background.
+// servePull checks a batch of xorbs and shards, marks the xorbs seed copies when asked, answers 202 and pulls the batch in the background.
 func (p *Peer) servePull(w http.ResponseWriter, r *http.Request) {
 	if !apis.Authorize(w, r, p.cfg.Secret) {
 		return
 	}
 	var req apis.PullRequest
-	if !apis.ReadJSON(w, r, apis.MaxReplyBytes, &req) {
+	if !apis.ReadJSON(w, r, apis.MaxPullBytes, &req) {
 		return
 	}
-	hash, err := xet.ParseFileHash(req.File)
-	if err != nil {
-		http.Error(w, "invalid file hash", http.StatusBadRequest)
+	switch n := len(req.Xorbs) + len(req.Shards); {
+	case n == 0:
+		http.Error(w, "empty pull", http.StatusBadRequest)
+		return
+	case n > apis.MaxPullBatch:
+		http.Error(w, "too many entries", http.StatusBadRequest)
+		return
+	}
+	xorbs, xerr := parseAll(req.Xorbs, xet.ParseXorbHash)
+	shards, serr := parseAll(req.Shards, xet.ParseFileHash)
+	if xerr != nil || serr != nil {
+		http.Error(w, "invalid hash", http.StatusBadRequest)
 		return
 	}
 	p.mu.Lock()
@@ -159,21 +168,50 @@ func (p *Peer) servePull(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.Seed {
-		p.markSeed(hash.String())
+		p.markSeed(xorbs...)
 	}
 	w.WriteHeader(http.StatusAccepted)
 	go func() {
 		defer p.wg.Done()
-		p.pullFile(hash.String())
+		p.pullBatch(xorbs, shards)
 	}()
 }
 
-// pullFile makes the file complete here within PullTimeout; a failure is logged unless the peer is closing.
-func (p *Peer) pullFile(hash string) {
+// parseAll parses every entry of list, failing on the first one parse rejects.
+func parseAll[T any](list []string, parse func(string) (T, error)) ([]T, error) {
+	out := make([]T, len(list))
+	for i, s := range list {
+		var err error
+		if out[i], err = parse(s); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
+// pullBatch pulls the xorbs whole and fetches the shards within PullTimeout, each even when another failed; a failure is logged unless the peer is closing.
+func (p *Peer) pullBatch(xorbs []xet.XorbHash, shards []xet.FileHash) {
 	ctx, cancel := context.WithTimeout(p.ctx, p.cfg.PullTimeout)
 	defer cancel()
-	if err := p.st.pullFile(ctx, hash); err != nil && p.ctx.Err() == nil {
-		slog.Warn("peer: pull file", "hash", hash, "err", err)
+	warn := func(kind string, hash any, err error) {
+		if err != nil && p.ctx.Err() == nil {
+			slog.Warn("peer: pull", kind, hash, "err", err)
+		}
+	}
+	pulls := make([]*pull, len(xorbs))
+	for i, h := range xorbs {
+		var err error
+		pulls[i], err = p.st.acquire(h, true)
+		warn("xorb", h, err)
+	}
+	for _, h := range shards {
+		_, err := p.st.ensureShard(ctx, h)
+		warn("shard", h, err)
+	}
+	for i, f := range pulls {
+		if f != nil {
+			warn("xorb", xorbs[i], f.wait(ctx))
+		}
 	}
 }
 

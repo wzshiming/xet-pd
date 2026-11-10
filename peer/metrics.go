@@ -66,7 +66,7 @@ func (m *peerMetrics) handler() http.Handler {
 
 // Descriptors carry no values, so the registries of all peers share them.
 var (
-	descFiles         = prometheus.NewDesc("xetpd_peer_files", "Complete files: known files with every xorb cached, as announces list them.", nil, nil)
+	descShards        = prometheus.NewDesc("xetpd_peer_shards", "Known shards: files whose shard and xorb offsets this peer holds, as announces list them.", nil, nil)
 	descCacheBytes    = prometheus.NewDesc("xetpd_peer_xorb_cache_bytes", "Bytes of committed xorbs.", nil, nil)
 	descCacheEntries  = prometheus.NewDesc("xetpd_peer_xorb_cache_entries", "Committed xorbs.", nil, nil)
 	descCacheLimit    = prometheus.NewDesc("xetpd_peer_xorb_cache_limit_bytes", "Cap on committed xorb bytes, 0 for unlimited.", nil, nil)
@@ -82,7 +82,7 @@ func (s peerState) Describe(ch chan<- *prometheus.Desc) { prometheus.DescribeByC
 func (s peerState) Collect(ch chan<- prometheus.Metric) {
 	stats := s.p.stats()
 	gauge := func(d *prometheus.Desc, v float64) { ch <- prometheus.MustNewConstMetric(d, prometheus.GaugeValue, v) }
-	gauge(descFiles, float64(stats.files))
+	gauge(descShards, float64(stats.shards))
 	gauge(descCacheBytes, float64(stats.bytes))
 	gauge(descCacheEntries, float64(stats.entries))
 	gauge(descCacheLimit, float64(s.p.cfg.XorbCacheSize))

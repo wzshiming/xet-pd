@@ -186,16 +186,11 @@ type storedEvent struct {
 	inserted bool
 }
 
-type fileEvent struct {
-	file  apis.File
-	xorbs []xet.XorbHash
-}
-
 // storeEvents is what a store reported through the hooks watch set.
 type storeEvents struct {
 	mu     sync.Mutex
 	stored []storedEvent
-	files  []fileEvent
+	shards []apis.File
 	reads  []xet.XorbHash
 	idles  int
 }
@@ -208,10 +203,10 @@ func watch(st *store) *storeEvents {
 		defer ev.mu.Unlock()
 		ev.stored = append(ev.stored, storedEvent{hash, size, inserted})
 	}
-	st.onFile = func(file apis.File, xorbs []xet.XorbHash) {
+	st.onShard = func(file apis.File) {
 		ev.mu.Lock()
 		defer ev.mu.Unlock()
-		ev.files = append(ev.files, fileEvent{file, xorbs})
+		ev.shards = append(ev.shards, file)
 	}
 	st.onRead = func(hash xet.XorbHash) {
 		ev.mu.Lock()
@@ -232,10 +227,10 @@ func (ev *storeEvents) storedXorbs() []storedEvent {
 	return slices.Clone(ev.stored)
 }
 
-func (ev *storeEvents) knownFiles() []fileEvent {
+func (ev *storeEvents) knownShards() []apis.File {
 	ev.mu.Lock()
 	defer ev.mu.Unlock()
-	return slices.Clone(ev.files)
+	return slices.Clone(ev.shards)
 }
 
 func (ev *storeEvents) readXorbs() []xet.XorbHash {

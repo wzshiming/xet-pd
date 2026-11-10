@@ -12,7 +12,6 @@ import (
 	"fmt"
 	"net/http"
 	"path/filepath"
-	"slices"
 	"sync"
 	"time"
 
@@ -94,12 +93,11 @@ type Peer struct {
 	wg     sync.WaitGroup
 	once   sync.Once
 
-	mu        sync.Mutex                           // guards xorbs, files, xorbFiles, seeds and warned
-	xorbs     lru.Index[xet.XorbHash, ready]       // committed xorbs
-	files     map[string]fileEntry                 // known files by hash
-	xorbFiles map[xet.XorbHash]map[string]struct{} // hashes of the known files referencing each xorb
-	seeds     map[string]struct{}                  // hashes of the files whose xorbs are seed copies
-	warned    bool                                 // over the cap with nothing evictable, logged once until it fits
+	mu     sync.Mutex                     // guards xorbs, shards, seeds and warned
+	xorbs  lru.Index[xet.XorbHash, ready] // committed xorbs
+	shards map[string]apis.File           // known shards by file hash, never forgotten
+	seeds  map[xet.XorbHash]struct{}      // xorbs whose copies are seed copies
+	warned bool                           // over the cap with nothing evictable, logged once until it fits
 }
 
 // New normalizes cfg, restores the xorbs already in DataDir, starts announcing them to the tracker and serves the hub mirror and CAS over them.
@@ -159,14 +157,13 @@ func New(cfg Config) (*Peer, error) {
 		metrics:   metrics,
 
 		evictions: make(chan struct{}, 1),
-		files:     map[string]fileEntry{},
-		xorbFiles: map[xet.XorbHash]map[string]struct{}{},
-		seeds:     map[string]struct{}{},
+		shards:    map[string]apis.File{},
+		seeds:     map[xet.XorbHash]struct{}{},
 	}
 	p.metrics.reg.MustRegister(peerState{p})
 	p.ann = &announcer{p: p, control: control, wake: make(chan struct{}, 1), full: true}
 	p.ann.minSeeds.Store(1)
-	st.onStored, st.onRead, st.onIdle, st.onFile, st.onLost = p.admit, p.touch, p.retryEviction, p.learn, p.lost
+	st.onStored, st.onRead, st.onIdle, st.onShard, st.onLost = p.admit, p.touch, p.retryEviction, p.holdShard, p.lost
 	p.mux = p.routes()
 	if err := p.restore(); err != nil {
 		cancel()
@@ -200,19 +197,13 @@ func (p *Peer) Close() error {
 }
 
 type peerStats struct {
-	bytes                            int64
-	files, entries, pulls, cooldowns int
+	bytes                             int64
+	shards, entries, pulls, cooldowns int
 }
 
 func (p *Peer) stats() peerStats {
 	pulls, cooldowns := p.st.stats()
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	files := 0
-	for _, f := range p.files {
-		if !slices.ContainsFunc(f.Xorbs, func(x xet.XorbHash) bool { return p.xorbs.Get(x) == nil }) {
-			files++
-		}
-	}
-	return peerStats{bytes: p.xorbs.Usage(), files: files, entries: p.xorbs.Len(), pulls: pulls, cooldowns: cooldowns}
+	return peerStats{bytes: p.xorbs.Usage(), shards: len(p.shards), entries: p.xorbs.Len(), pulls: pulls, cooldowns: cooldowns}
 }

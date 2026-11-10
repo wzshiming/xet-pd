@@ -1,21 +1,27 @@
-# xet-pd on Kubernetes: a stateless tracker Deployment behind Service xet-pd-tracker, and a peer DaemonSet
-# whose pod on each node is the hub endpoint for the pods on that node, on the node's IP, port 8081.
+# xet-pd on Kubernetes: a stateless tracker Deployment behind Service xet-pd-tracker, and two peer DaemonSets
+# that put one peer on each node, the hub endpoint for the pods on that node, on the node's IP, port 8081.
 #   kubectl kustomize deploy/k8s/base   # check the render
 #   kubectl apply -k deploy/k8s/base    # or an overlay listing this directory under resources
 #
 # 1. Secret, required: pods wait in CreateContainerConfigError until xet-pd-secret exists. Create it once, or
 #    generate it in an overlay with a secretGenerator:
 #      kubectl -n xet-pd create secret generic xet-pd-secret --from-literal=XET_PD_SECRET=$(openssl rand -hex 32)
-# 2. Hub token, optional:
+# 2. Access peers: label at least one node
+#      kubectl label node <name> xet-pd/upstream=true
+#    Those nodes run access peers (ds/xet-pd-peer-upstream) that fetch from the hub in the xet-pd-upstream
+#    ConfigMap (and HF_TOKEN if present); every other node runs an internal peer (ds/xet-pd-peer) that fetches
+#    through the access peers. With no access peer online, cold downloads fail with a 5xx while already cached
+#    files keep serving.
+# 3. Hub token of the access peers, optional:
 #      kubectl -n xet-pd create secret generic xet-pd-hf-token --from-literal=HF_TOKEN=<token>
-# 3. Images: :master moves with every push to master; production pins sha-xxxxxxx or a release version
+# 4. Images: :master moves with every push to master; production pins sha-xxxxxxx or a release version
 #    through an images entry with newTag.
-# 4. Upstream: the peers mirror the hub named by HF_ENDPOINT in ConfigMap xet-pd-upstream. Override it in an
-#    overlay configMapGenerator named xet-pd-upstream with behavior: merge and options.disableNameSuffixHash: true,
-#    then run kubectl -n xet-pd rollout restart ds/xet-pd-peer.
-# 5. Tainted nodes get no peer, so their pods have no endpoint; patch the DaemonSet with
+# 5. Upstream: the access peers mirror the hub named by HF_ENDPOINT in ConfigMap xet-pd-upstream. Override it
+#    in an overlay configMapGenerator named xet-pd-upstream with behavior: merge and
+#    options.disableNameSuffixHash: true, then run kubectl -n xet-pd rollout restart ds/xet-pd-peer-upstream.
+# 6. Tainted nodes get no peer, so their pods have no endpoint; patch both DaemonSets with
 #    tolerations: [{operator: Exists}] to cover them.
-# 6. Clients: pods on any node, in any namespace, set HF_ENDPOINT to the peer on their own node:
+# 7. Clients: pods on any node, in any namespace, set HF_ENDPOINT to the peer on their own node:
 #      env:
 #        - name: HOST_IP
 #          valueFrom:
@@ -23,13 +29,13 @@
 #              fieldPath: status.hostIP
 #        - name: HF_ENDPOINT
 #          value: http://$(HOST_IP):8081
-# 7. Port 8081 taken on the nodes: change PEER_PORT and the peer containerPort together, and the clients'
-#    HF_ENDPOINT port.
-# 8. Peer disk: budget hostPath /var/lib/xet-pd/peer for XET_PD_XORB_CACHE_SIZE plus in-flight pull spools plus
-#    the mirror index; deleting the DaemonSet leaves it there.
-# 9. Another instance in the same cluster: with a namePrefix, patch its peers' XET_PD_TRACKER to the prefixed
-#    Service; its peers also need their own PEER_PORT and hostPath.
-# 10. Verify:
+# 8. Port 8081 taken on the nodes: change PEER_PORT and the peer containerPort together in both DaemonSets, and
+#    the clients' HF_ENDPOINT port.
+# 9. Peer disk: budget hostPath /var/lib/xet-pd/peer for XET_PD_XORB_CACHE_SIZE plus in-flight pull spools plus
+#    the mirror index; deleting the DaemonSets leaves it there.
+# 10. Another instance in the same cluster: with a namePrefix, patch its peers' XET_PD_TRACKER to the prefixed
+#     Service; its peers also need their own PEER_PORT and hostPath.
+# 11. Verify:
 #      kubectl -n xet-pd get pods -o wide
 #      kubectl proxy &
 #      curl http://127.0.0.1:8001/api/v1/namespaces/xet-pd/pods/<pod>:8081/proxy/readyz   # 8080 on the tracker pod
@@ -41,6 +47,7 @@ resources:
   - tracker-deployment.yaml
   - tracker-service.yaml
   - peer-daemonset.yaml
+  - peer-upstream-daemonset.yaml
 configMapGenerator:
   - name: xet-pd-upstream
     literals:

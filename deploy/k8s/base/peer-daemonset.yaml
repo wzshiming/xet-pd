@@ -29,6 +29,14 @@ spec:
       automountServiceAccountToken: false
       nodeSelector:
         kubernetes.io/os: linux
+      # Internal peers take every node without the xet-pd/upstream label and fetch through the access peers.
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: xet-pd/upstream
+                    operator: DoesNotExist
       terminationGracePeriodSeconds: 30
       securityContext:
         runAsNonRoot: true
@@ -85,17 +93,6 @@ spec:
               value: http://$(NODE_IP):$(PEER_PORT)
             - name: XET_PD_TRACKER
               value: http://xet-pd-tracker.$(POD_NAMESPACE).svc:8080
-            - name: HF_ENDPOINT
-              valueFrom:
-                configMapKeyRef:
-                  name: xet-pd-upstream
-                  key: HF_ENDPOINT
-            - name: HF_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: xet-pd-hf-token
-                  key: HF_TOKEN
-                  optional: true
             - name: XET_PD_DATA_DIR
               value: /data
             - name: XET_PD_LOG_FORMAT

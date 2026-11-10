@@ -1,4 +1,4 @@
-# Local test cluster: one tracker and two peers.
+# Local test cluster: one tracker, access peer peer-1, which alone reaches the hub, and internal peer peer-2.
 # Peers advertise their service names, so hub clients join this network and use HF_ENDPOINT=http://peer-1:8081.
 name: xet-pd-cluster
 
@@ -46,12 +46,12 @@ services:
       - -listen=:8081
       - -advertise=http://peer-1:8081
       - -tracker=http://tracker:8080
+      - -upstream=${HF_ENDPOINT:-https://huggingface.co}
       - -heartbeat=1s
       - -data-dir=/data
       - -xorb-cache-size=1GiB
     environment:
       <<: *secret
-      HF_ENDPOINT: ${HF_ENDPOINT:-https://huggingface.co}
       HF_TOKEN: ${HF_TOKEN:-}
     extra_hosts:
       - host.docker.internal:host-gateway
@@ -75,12 +75,7 @@ services:
       - -heartbeat=1s
       - -data-dir=/data
       - -xorb-cache-size=1GiB
-    environment:
-      <<: *secret
-      HF_ENDPOINT: ${HF_ENDPOINT:-https://huggingface.co}
-      HF_TOKEN: ${HF_TOKEN:-}
-    extra_hosts:
-      - host.docker.internal:host-gateway
+    environment: *secret
     depends_on:
       tracker:
         condition: service_healthy
